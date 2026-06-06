@@ -16,5 +16,9 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    // Integration specs (`*.integration.test.ts`) require a LIVE PocketBase
+    // and run via vitest.integration.config.ts — keep them out of the default
+    // unit suite so it stays backend-free.
+    exclude: ["**/node_modules/**", "**/dist/**", "src/**/*.integration.*"],
   },
 });

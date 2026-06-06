@@ -58,19 +58,26 @@ public actor APIClient {
     /// Current JWT auth token, set after a successful ``authWithPassword(email:password:)``.
     private(set) var authToken: String?
 
+    /// - Parameters:
+    ///   - baseURL: PocketBase base URL.
+    ///   - session: URLSession used for all requests.
+    ///   - encoder: JSON encoder for request bodies. Defaults to a
+    ///     PocketBase-configured encoder (datetimes in PocketBase wire format).
+    ///   - decoder: JSON decoder for response bodies. Defaults to a
+    ///     PocketBase-configured decoder. Note: PocketBase serializes datetimes
+    ///     as `"yyyy-MM-dd HH:mm:ss.SSSZ"` (space separator, not `.iso8601`),
+    ///     and represents unset datetimes as `""`; ``send(_:)`` sanitizes
+    ///     empty-string datetime values to `null` before decoding so optional
+    ///     `Date?` fields decode to `nil`.
     public init(
         baseURL: URL,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        encoder: JSONEncoder = PocketBaseDate.makeEncoder(),
+        decoder: JSONDecoder = PocketBaseDate.makeDecoder()
     ) {
         self.baseURL = baseURL
         self.session = session
-
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
         self.encoder = encoder
-
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
         self.decoder = decoder
     }
 
@@ -231,6 +238,16 @@ public actor APIClient {
     }
 
     private func sendRaw(_ request: URLRequest) async throws -> Data {
+        try await performRaw(request)
+    }
+
+    /// Send a prepared request through the client's own `URLSession`, applying
+    /// the standard HTTP status-code check, and return the raw body.
+    ///
+    /// Exposed `internal` so focused extensions (e.g. the file/image endpoints in
+    /// `APIClient+Files`) reuse the injected session — important so they route
+    /// through the same stubbed session in tests rather than `URLSession.shared`.
+    func performRaw(_ request: URLRequest) async throws -> Data {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw APIClientError.nonHTTPResponse
@@ -243,6 +260,10 @@ public actor APIClient {
 
     private func send<T: Decodable>(_ request: URLRequest) async throws -> T {
         let data = try await sendRaw(request)
-        return try decoder.decode(T.self, from: data)
+        // PocketBase encodes unset datetimes as "". A custom date-decoding
+        // strategy cannot map a present empty string to nil for optional Date?
+        // fields, so sanitize empty-string datetime values to JSON null first.
+        let sanitized = (try? PocketBaseDate.sanitizeEmptyDatetimes(in: data)) ?? data
+        return try decoder.decode(T.self, from: sanitized)
     }
 }

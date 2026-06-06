@@ -37,11 +37,37 @@ logic lives in a Swift Package (see §2.3).
 
 For each milestone:
 1. Agent implements all tasks, self-verifying everything in its capability (🤖 / 🟡).
-2. Agent writes a **handoff note**: what was built, what the agent verified, and the
+2. Agent runs the **milestone gauntlet** (see below) — a non-skippable review + test gate.
+3. Agent writes a **handoff note**: what was built, what the agent verified, and the
    exact steps for the developer to verify the 👤 items.
-3. Developer builds/runs, reports back.
-4. Agent fixes fallout. Milestone closes when the developer signs off.
-5. Move to the next milestone.
+4. Developer builds/runs, reports back.
+5. Agent fixes fallout. Milestone closes when the developer signs off.
+6. Move to the next milestone.
+
+### The milestone gauntlet (mandatory gate before commit)
+
+Parallel-generated code produces plausible-but-compiles bugs that self-review misses
+(M1's critical `owner`-missing-on-create — which 400'd *every* deck create — was caught
+only here). So every milestone runs a standardized gauntlet, implemented as the reusable
+workflow `.claude/workflows/milestone-gauntlet.js`:
+
+1. **Adversarial review** — parallel hostile lenses (correctness, spec-conformance,
+   security, react/async) try to *break* the diff.
+2. **Independent refutation** — each finding is cross-examined by a separate skeptic whose
+   default position is "false positive"; only findings proven against the real code survive.
+3. **Auto-fix** — **every** confirmed finding of **all** severities is fixed (decided
+   2026-06-06), each with a **regression test** that fails before and passes after.
+4. **Test layers (all four required each milestone):**
+   - **Component** (RTL + vitest, mocked backend)
+   - **Integration** (vitest against a live ephemeral PocketBase — API rules, soft-delete,
+     visibility, cascade)
+   - **E2E** (Playwright — full browser flows)
+   - **Regression** (one per confirmed finding, from step 3)
+5. **Re-verify** — build + test + lint green, then handoff report.
+
+Layers that genuinely can't execute in this environment (e.g. Playwright without a
+browser, iOS without a device) are *scaffolded* and marked SKIPPED with the exact blocker
+for the developer — never silently dropped.
 
 ---
 
@@ -203,8 +229,12 @@ Legend: 🤖 agent-full · 🟡 agent-compile-only · 👤 dev-verify
 
 1. All 🤖 tasks self-verified by the agent (builds + runs + tests green).
 2. All 🟡 tasks compile cleanly.
-3. Handoff note written.
-4. Developer signs off on 👤 items.
-5. Code committed (per-component commits in the monorepo).
+3. **Milestone gauntlet passed:** adversarial review run, **0 unaddressed confirmed
+   findings** (all severities auto-fixed with regression tests), and the four test layers
+   present (component + integration + e2e + regression) — each green or SKIPPED with a
+   documented blocker.
+4. Handoff note written.
+5. Developer signs off on 👤 items.
+6. Code committed (per-component commits in the monorepo).
 
-— end Project Plan v1.0 —
+— end Project Plan v1.1 —

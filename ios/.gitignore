@@ -9,5 +9,10 @@ DerivedData/
 *.xcscmblueprint
 xcuserdata/
 
+# Generated Xcode project. The PoseDeck app project is generated from
+# PoseDeck/project.yml by xcodegen — never edit or commit the .xcodeproj.
+# Regenerate with: cd ios/PoseDeck && xcodegen generate
+PoseDeck/PoseDeck.xcodeproj/
+
 # macOS
 .DS_Store

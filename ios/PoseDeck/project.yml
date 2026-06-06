@@ -1,0 +1,86 @@
+name: PoseDeck
+
+options:
+  bundleIdPrefix: dev.posedeck
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+# Local Swift package: the testable logic core (Codable models, APIClient,
+# outbox). Linked into the app target below.
+packages:
+  PoseDeckCore:
+    path: ../PoseDeckCore
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Surface the xcconfig-defined API base URL to build settings so it can be
+    # substituted into Info.plist via $(API_BASE_URL).
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  PoseDeck:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+    configFiles:
+      Debug: Config/Config.xcconfig
+      Release: Config/Config.xcconfig
+    info:
+      path: Config/Info.plist
+      properties:
+        CFBundleDisplayName: Pose Deck
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        # App Transport Security: allow cleartext HTTP to the local dev
+        # PocketBase backend (http://localhost:8090). Dev-only convenience.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # Pulled from Config.xcconfig (API_BASE_URL) and read at runtime via
+        # Bundle.main.object(forInfoDictionaryKey:).
+        APIBaseURL: $(API_BASE_URL)
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.posedeck.app
+        GENERATE_INFOPLIST_FILE: false
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_EMIT_LOC_STRINGS: true
+        ENABLE_USER_SCRIPT_SANDBOXING: true
+    dependencies:
+      - package: PoseDeckCore
+        product: PoseDeckCore
+
+  PoseDeckTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: PoseDeck
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.posedeck.app.tests
+        GENERATE_INFOPLIST_FILE: true
+
+schemes:
+  PoseDeck:
+    build:
+      targets:
+        PoseDeck: all
+        PoseDeckTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - PoseDeckTests

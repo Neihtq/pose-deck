@@ -1,0 +1,15 @@
+// Build configuration for the PoseDeck app.
+//
+// API_BASE_URL is the base URL of the PocketBase backend. It is surfaced into
+// Info.plist (key `APIBaseURL` via $(API_BASE_URL)) and read at runtime by
+// AppConfig.apiBaseURL.
+//
+// NOTE: xcconfig treats `//` as a comment everywhere, including inside values.
+// A bare `http://localhost:8090` would have everything from the `//` stripped,
+// yielding `http:`. Work around this by splitting the scheme's slashes into a
+// separate variable and recombining — a standard xcconfig idiom.
+SLASH = /
+API_BASE_URL = http:$(SLASH)$(SLASH)localhost:8090
+
+// To point at a LAN backend (e.g. TrueNAS), override locally, e.g.:
+//   API_BASE_URL = http:$(SLASH)$(SLASH)192.168.1.50:8090

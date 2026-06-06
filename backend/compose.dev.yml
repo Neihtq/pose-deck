@@ -1,0 +1,47 @@
+# Local development stack for Pose Deck backend.
+#
+#   docker compose -f compose.dev.yml up
+#
+#   PocketBase admin UI: http://localhost:8090/_/
+#   PocketBase API:      http://localhost:8090
+#   Anisette server:     http://localhost:6969
+#
+# Migrations in ./pb_migrations are applied automatically on start.
+# The DEV-ONLY seed migration (1700000010_dev_seed.js) creates two
+# users + a sample deck. It is idempotent and no-ops outside dev.
+#
+# This file PUBLISHES ports to localhost (unlike the prod stack which
+# only exposes them to an external reverse-proxy network).
+
+services:
+  pocketbase:
+    image: ghcr.io/muchobien/pocketbase:0.39.1
+    container_name: posedeck-pb-dev
+    restart: unless-stopped
+    # POSEDECK_DEV gates the seed migration so it only runs in dev.
+    environment:
+      POSEDECK_DEV: "true"
+    command:
+      - serve
+      - --http=0.0.0.0:8090
+      - --dir=/pb_data
+      - --migrationsDir=/pb_migrations
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./pb_data:/pb_data
+      - ./pb_migrations:/pb_migrations:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  anisette:
+    image: dadoum/anisette-v3-server:latest
+    container_name: posedeck-anisette-dev
+    restart: unless-stopped
+    ports:
+      - "6969:6969"
+    volumes:
+      - ./anisette:/home/Alcoholic/.config/anisette-v3

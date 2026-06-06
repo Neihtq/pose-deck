@@ -1,0 +1,58 @@
+# Production stack for Pose Deck — deployed to TrueNAS Scale.
+# Mirrors ARCHITECTURE.md §9.
+#
+# Lives at /mnt/tank/shotdeck/docker-compose.yml on the NAS.
+# All three services join the pre-existing external reverse-proxy
+# network; the proxy terminates TLS and routes by hostname. Services
+# only EXPOSE ports to that network — they never PUBLISH to the host.
+#
+# Reverse proxy routes (configured in the existing proxy, not here):
+#   app.shotdeck.<domain>      -> posedeck-web:80
+#   api.shotdeck.<domain>      -> posedeck-pb:8090
+#   anisette.shotdeck.<domain> -> posedeck-anisette:6969
+#
+# The seed migration is gated on POSEDECK_DEV and is intentionally
+# NOT set here, so it never runs in production.
+
+services:
+  pocketbase:
+    image: ghcr.io/muchobien/pocketbase:0.39.1
+    container_name: posedeck-pb
+    restart: unless-stopped
+    command:
+      - serve
+      - --http=0.0.0.0:8090
+      - --dir=/pb_data
+      - --migrationsDir=/pb_migrations
+    volumes:
+      - ./pb_data:/pb_data
+      - ./pb_migrations:/pb_migrations:ro
+    networks: [reverse-proxy]
+    expose: ["8090"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  web:
+    image: ghcr.io/qthienng/posedeck-web:latest
+    container_name: posedeck-web
+    restart: unless-stopped
+    depends_on:
+      - pocketbase
+    networks: [reverse-proxy]
+    expose: ["80"]
+
+  anisette:
+    image: dadoum/anisette-v3-server:latest
+    container_name: posedeck-anisette
+    restart: unless-stopped
+    volumes:
+      - ./anisette:/home/Alcoholic/.config/anisette-v3
+    networks: [reverse-proxy]
+    expose: ["6969"]
+
+networks:
+  reverse-proxy:
+    external: true

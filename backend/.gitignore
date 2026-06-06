@@ -1,0 +1,16 @@
+# PocketBase runtime data + uploaded files (never commit).
+pb_data/
+
+# Anisette server keychain/state.
+anisette/
+
+# Downloaded PocketBase binary (when running the bare binary locally).
+pocketbase
+pocketbase.exe
+
+# SQLite databases / artifacts.
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3

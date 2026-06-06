@@ -80,3 +80,46 @@ export function fileUrl(
 ): string {
   return pb.files.getURL(record, filename, queryParams);
 }
+
+/**
+ * Short-lived file token cache.
+ *
+ * Files in collections with a non-empty view rule (e.g. `card_images`) are
+ * **protected**: `GET /api/files/...` requires a `?token=` query param and
+ * ignores the Authorization header. The token is short-lived, so we cache it
+ * briefly and refresh on expiry. See ARCHITECTURE.md §5.
+ */
+let cachedFileToken: { token: string; expiresAt: number } | null = null;
+
+/** How long to trust a minted file token before refreshing (PocketBase issues ~2 min tokens; we refresh well before). */
+const FILE_TOKEN_TTL_MS = 90_000;
+
+/** Get a (cached) file access token for protected file URLs. */
+export async function getFileToken(): Promise<string> {
+  const now = Date.now();
+  if (cachedFileToken && cachedFileToken.expiresAt > now) {
+    return cachedFileToken.token;
+  }
+  const token = await pb.files.getToken();
+  cachedFileToken = { token, expiresAt: now + FILE_TOKEN_TTL_MS };
+  return token;
+}
+
+/** Clear the cached file token (e.g. on sign-out). */
+export function clearFileToken(): void {
+  cachedFileToken = null;
+}
+
+/**
+ * Build an absolute file URL carrying a short-lived access `token`, so
+ * protected files load in `<img src>`. Async because minting the token may hit
+ * the server. Prefer this over {@link fileUrl} for any protected collection.
+ */
+export async function fileUrlWithToken(
+  record: { id: string; collectionId?: string; collectionName?: string },
+  filename: string,
+  queryParams?: Record<string, unknown>,
+): Promise<string> {
+  const token = await getFileToken();
+  return pb.files.getURL(record, filename, { ...queryParams, token });
+}

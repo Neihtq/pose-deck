@@ -1,0 +1,224 @@
+/**
+ * Component tests for DeckListPage (route: "/", DESIGN.md §3.3).
+ *
+ * Covers the page-level behaviours: initial loading state, load error + retry,
+ * the empty state, rendering + date-grouping of decks, the name search filter,
+ * the "New deck" dialog (validation + create → navigate), and the optimistic
+ * duplicate / delete flows that refetch the list and toast.
+ *
+ * All data-access modules (`deckApi`, `cardApi`, `imageApi`) and the auth
+ * 401-handler are mocked, so no PocketBase SDK or network is touched. The real
+ * `deckGrouping` is kept so we exercise the actual grouping/search logic.
+ * `useNavigate` is spied through a partial react-router-dom mock.
+ */
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { Deck } from "@/lib/types";
+
+const navigate = vi.fn();
+vi.mock("react-router-dom", async () => {
+  const actual =
+    await vi.importActual<typeof import("react-router-dom")>(
+      "react-router-dom",
+    );
+  return { ...actual, useNavigate: () => navigate };
+});
+
+const listDecks = vi.fn();
+const createDeck = vi.fn();
+const duplicateDeck = vi.fn();
+const softDeleteDeck = vi.fn();
+const renameDeck = vi.fn();
+vi.mock("@/features/decks/deckApi", () => ({
+  listDecks: (...a: unknown[]) => listDecks(...a),
+  createDeck: (...a: unknown[]) => createDeck(...a),
+  duplicateDeck: (...a: unknown[]) => duplicateDeck(...a),
+  softDeleteDeck: (...a: unknown[]) => softDeleteDeck(...a),
+  renameDeck: (...a: unknown[]) => renameDeck(...a),
+}));
+
+// Thumbnails are best-effort; stub them to resolve to nothing so the page's
+// thumbnail effect never hits a real backend.
+vi.mock("@/features/cards/cardApi", () => ({ listCards: vi.fn(async () => []) }));
+vi.mock("@/features/images/imageApi", () => ({
+  listCardImages: vi.fn(async () => []),
+  imageDisplayUrl: vi.fn(async () => null),
+}));
+
+vi.mock("@/features/auth/AuthContext", () => ({
+  clearAuthOnUnauthorized: vi.fn(() => false),
+}));
+
+const toast = vi.fn();
+vi.mock("@/components/ui/use-toast", () => ({
+  toast: (...a: unknown[]) => toast(...a),
+}));
+
+import DeckListPage from "@/features/decks/DeckListPage";
+
+function makeDeck(overrides: Partial<Deck> & { id: string; name: string }): Deck {
+  return {
+    owner: "u1",
+    shoot_date: "",
+    client_updated_at: "",
+    created: "",
+    updated: "",
+    deleted_at: "",
+    ...overrides,
+  };
+}
+
+function renderPage() {
+  return render(
+    <MemoryRouter>
+      <DeckListPage />
+    </MemoryRouter>,
+  );
+}
+
+// Two days in the future / past, relative to the test run, as ISO strings so
+// grouping (Upcoming / Past) is deterministic regardless of when tests run.
+function isoOffsetDays(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString();
+}
+
+beforeEach(() => {
+  navigate.mockReset();
+  listDecks.mockReset();
+  createDeck.mockReset();
+  duplicateDeck.mockReset();
+  softDeleteDeck.mockReset();
+  renameDeck.mockReset();
+  toast.mockReset();
+});
+
+describe("DeckListPage", () => {
+  it("shows a loading state, then renders decks grouped by date", async () => {
+    listDecks.mockResolvedValue([
+      makeDeck({ id: "u", name: "Future Shoot", shoot_date: isoOffsetDays(2) }),
+      makeDeck({ id: "n", name: "No Date Shoot" }),
+      makeDeck({ id: "p", name: "Old Shoot", shoot_date: isoOffsetDays(-5) }),
+    ]);
+
+    renderPage();
+    expect(screen.getByText("Loading decks…")).toBeInTheDocument();
+
+    await screen.findByText("Future Shoot");
+    expect(screen.getByText("No Date Shoot")).toBeInTheDocument();
+    expect(screen.getByText("Old Shoot")).toBeInTheDocument();
+    // Section headers from grouping.
+    expect(screen.getByText("Upcoming")).toBeInTheDocument();
+    expect(screen.getByText("Undated")).toBeInTheDocument();
+    expect(screen.getByText("Past")).toBeInTheDocument();
+  });
+
+  it("renders the empty state when there are no decks", async () => {
+    listDecks.mockResolvedValue([]);
+    renderPage();
+    await screen.findByText(/no decks yet/i);
+  });
+
+  it("shows a load error with a Retry that refetches", async () => {
+    listDecks.mockRejectedValueOnce(new Error("boom"));
+    renderPage();
+
+    await screen.findByText(/could not load your decks/i);
+
+    listDecks.mockResolvedValueOnce([makeDeck({ id: "d1", name: "Recovered" })]);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await screen.findByText("Recovered");
+  });
+
+  it("filters decks by the search query", async () => {
+    listDecks.mockResolvedValue([
+      makeDeck({ id: "a", name: "Smith Wedding" }),
+      makeDeck({ id: "b", name: "Jones Portraits" }),
+    ]);
+    renderPage();
+    await screen.findByText("Smith Wedding");
+
+    fireEvent.change(screen.getByLabelText("Search decks by name"), {
+      target: { value: "jones" },
+    });
+
+    expect(screen.queryByText("Smith Wedding")).not.toBeInTheDocument();
+    expect(screen.getByText("Jones Portraits")).toBeInTheDocument();
+  });
+
+  it("shows a no-match message when the search filters everything out", async () => {
+    listDecks.mockResolvedValue([makeDeck({ id: "a", name: "Smith Wedding" })]);
+    renderPage();
+    await screen.findByText("Smith Wedding");
+
+    fireEvent.change(screen.getByLabelText("Search decks by name"), {
+      target: { value: "zzz" },
+    });
+    expect(screen.getByText(/no decks match/i)).toBeInTheDocument();
+  });
+
+  it("creates a deck via the dialog and navigates into it", async () => {
+    listDecks.mockResolvedValue([]);
+    createDeck.mockResolvedValue(makeDeck({ id: "new1", name: "Beach Shoot" }));
+    renderPage();
+    await screen.findByText(/no decks yet/i);
+
+    // Open the dialog from the header button.
+    fireEvent.click(
+      screen.getAllByRole("button", { name: /new deck/i })[0],
+    );
+
+    const nameInput = await screen.findByLabelText("Name");
+    const dialog = nameInput.closest("form") as HTMLFormElement;
+    const submit = within(dialog).getByRole("button", { name: "Create deck" });
+
+    // Validation: submit is disabled while the name is empty.
+    expect(submit).toBeDisabled();
+
+    fireEvent.change(nameInput, { target: { value: "Beach Shoot" } });
+    expect(submit).toBeEnabled();
+
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(createDeck).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "Beach Shoot" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(navigate).toHaveBeenCalledWith("/decks/new1"),
+    );
+  });
+
+  it("optimistically deletes a deck: refetches and toasts", async () => {
+    listDecks
+      .mockResolvedValueOnce([makeDeck({ id: "d1", name: "Doomed Deck" })])
+      .mockResolvedValueOnce([]); // after delete, list is empty
+    softDeleteDeck.mockResolvedValue(undefined);
+
+    renderPage();
+    await screen.findByText("Doomed Deck");
+
+    // Open the deck's actions dropdown and click Delete → confirm in the dialog.
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Deck actions for Doomed Deck" }),
+      new window.PointerEvent("pointerdown", { button: 0, bubbles: true }),
+    );
+    const menu = await screen.findByRole("menu");
+    fireEvent.click(within(menu).getByText("Delete"));
+
+    const confirm = await screen.findByRole("alertdialog");
+    fireEvent.click(within(confirm).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(softDeleteDeck).toHaveBeenCalledWith("d1"));
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Deck moved to Trash" }),
+      ),
+    );
+  });
+});

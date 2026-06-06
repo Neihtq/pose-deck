@@ -1,0 +1,41 @@
+# iOS CI — STUB.
+#
+# Implements ARCHITECTURE.md §10 (iOS) only partially for now. Today this builds
+# and tests the pure-logic Swift Package (PoseDeckCore) on a macOS runner — the
+# part the agent (and CI) can fully verify without a device or signing.
+#
+# TODO: once the Xcode app target (ios/PoseDeck/PoseDeck.xcodeproj) exists, add a
+# job that runs `xcodebuild archive` + `xcodebuild -exportArchive` to produce an
+# unsigned .ipa, then uploads it to a GitHub Release / AltStore source manifest
+# (ARCHITECTURE.md §10 steps 2-4, PROJECT_PLAN.md M7). The app target is not built
+# here yet because the simulator/signing flow is device/dev-only.
+name: ios
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+jobs:
+  core-tests:
+    name: PoseDeckCore (swift test)
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ios/PoseDeckCore
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test

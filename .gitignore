@@ -1,0 +1,30 @@
+# Root-level ignores only.
+# Per-component ignores (node_modules, dist/, .build/, DerivedData, pb_data, etc.)
+# live in each component's own .gitignore (backend/, web/, ios/).
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs / temp
+*.log
+.cache/
+tmp/

@@ -6,6 +6,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0a0a0a" />
     <title>Pose Deck</title>
+    <script>
+      // Apply the persisted theme before first paint to avoid a flash of the
+      // wrong theme. Mirrors src/components/theme/ThemeProvider.tsx.
+      (function () {
+        try {
+          var stored = localStorage.getItem("pose-deck-theme");
+          var prefersDark = window.matchMedia(
+            "(prefers-color-scheme: dark)",
+          ).matches;
+          var dark = stored === "dark" || ((!stored || stored === "system") && prefersDark);
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

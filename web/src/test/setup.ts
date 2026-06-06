@@ -32,4 +32,19 @@ if (typeof window !== "undefined") {
   if (!Element.prototype.scrollIntoView) {
     Element.prototype.scrollIntoView = () => {};
   }
+  // jsdom lacks matchMedia, which ThemeProvider uses to read the OS color
+  // scheme. Provide a stub that reports "light" and ignores listeners.
+  if (typeof window.matchMedia !== "function") {
+    window.matchMedia = (query: string): MediaQueryList =>
+      ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+        dispatchEvent: () => false,
+      }) as unknown as MediaQueryList;
+  }
 }

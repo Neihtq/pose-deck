@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 
 import App from "./App.tsx";
 import { AuthProvider } from "@/features/auth/AuthContext";
+import { ThemeProvider } from "@/components/theme/ThemeProvider";
 import "./globals.css";
 
 const rootEl = document.getElementById("root");
@@ -13,10 +14,12 @@ if (!rootEl) {
 
 createRoot(rootEl).render(
   <StrictMode>
-    <BrowserRouter>
-      <AuthProvider>
-        <App />
-      </AuthProvider>
-    </BrowserRouter>
+    <ThemeProvider>
+      <BrowserRouter>
+        <AuthProvider>
+          <App />
+        </AuthProvider>
+      </BrowserRouter>
+    </ThemeProvider>
   </StrictMode>,
 );

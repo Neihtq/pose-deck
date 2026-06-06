@@ -35,6 +35,7 @@ import {
   softDeleteDeck,
 } from "@/features/decks/deckApi";
 import { DeckCard } from "@/features/decks/DeckCard";
+import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { groupDecks, searchDecks } from "@/features/decks/deckGrouping";
 import { listCards } from "@/features/cards/cardApi";
 import { imageDisplayUrl, listCardImages } from "@/features/images/imageApi";
@@ -365,6 +366,7 @@ export default function DeckListPage(): React.JSX.Element {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <ThemeToggle />
           <Link
             to="/trash"
             className={cn(buttonVariants({ variant: "outline" }))}

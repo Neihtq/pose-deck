@@ -25,11 +25,13 @@ vi.mock("react-router-dom", async () => {
 const getDeck = vi.fn();
 const listCards = vi.fn();
 const createCard = vi.fn();
+const softDeleteCard = vi.fn();
 const softDeleteDeck = vi.fn();
 vi.mock("@/features/cards/cardApi", () => ({
   listCards: (...a: unknown[]) => listCards(...a),
   reorderCards: vi.fn(),
   createCard: (...a: unknown[]) => createCard(...a),
+  softDeleteCard: (...a: unknown[]) => softDeleteCard(...a),
 }));
 vi.mock("@/features/decks/deckApi", () => ({
   getDeck: (...a: unknown[]) => getDeck(...a),
@@ -94,6 +96,7 @@ beforeEach(() => {
   getDeck.mockReset();
   listCards.mockReset();
   createCard.mockReset();
+  softDeleteCard.mockReset();
   softDeleteDeck.mockReset();
   toast.mockReset();
 });
@@ -169,6 +172,37 @@ describe("DeckDetailPage", () => {
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("/"));
     expect(toast).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Deck moved to trash" }),
+    );
+  });
+
+  it("deletes a card inline from the list (confirm) without opening it", async () => {
+    getDeck.mockResolvedValue(DECK);
+    listCards.mockResolvedValue([
+      makeCard("c1", "First look", 1000),
+      makeCard("c2", "Family group", 2000),
+    ]);
+    softDeleteCard.mockResolvedValue(undefined);
+    renderPage();
+    await screen.findByText("First look");
+
+    // Click the row's delete button (no navigation into the card).
+    fireEvent.click(
+      screen.getByRole("button", { name: /Delete First look/i }),
+    );
+
+    // Confirm in the alert dialog.
+    const confirm = await screen.findByRole("alertdialog");
+    fireEvent.click(within(confirm).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(softDeleteCard).toHaveBeenCalledWith("c1"));
+    // Row is removed from the list; we never navigated to the card editor.
+    await waitFor(() =>
+      expect(screen.queryByText("First look")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("Family group")).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalledWith("/decks/deck1/cards/c1");
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Card deleted" }),
     );
   });
 });

@@ -47,6 +47,7 @@ vi.mock("@/components/ui/use-toast", () => ({
 }));
 
 import DeckListPage from "@/features/decks/DeckListPage";
+import { ThemeProvider } from "@/components/theme/ThemeProvider";
 
 function makeDeck(id: string, name: string): Deck {
   return {
@@ -84,9 +85,11 @@ function makeImage(id: string, card: string, position: number): CardImage {
 
 function renderPage() {
   return render(
-    <MemoryRouter>
-      <DeckListPage />
-    </MemoryRouter>,
+    <ThemeProvider>
+      <MemoryRouter>
+        <DeckListPage />
+      </MemoryRouter>
+    </ThemeProvider>,
   );
 }
 

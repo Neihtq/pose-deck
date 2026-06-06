@@ -18,6 +18,7 @@
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { Trash2 } from "lucide-react";
 
 import {
   DndContext,
@@ -76,6 +77,7 @@ import {
   createCard,
   listCards,
   reorderCards,
+  softDeleteCard,
 } from "@/features/cards/cardApi";
 import { duplicateDeck, getDeck, renameDeck, softDeleteDeck } from "@/features/decks/deckApi";
 import { imageDisplayUrl, listCardImages } from "@/features/images/imageApi";
@@ -125,6 +127,13 @@ export default function DeckDetailPage(): React.JSX.Element {
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [creating, setCreating] = React.useState(false);
+
+  // The card pending delete-confirmation (inline from the list), plus the
+  // in-flight flag for that delete.
+  const [cardToDelete, setCardToDelete] = React.useState<CardRecord | null>(
+    null,
+  );
+  const [deletingCard, setDeletingCard] = React.useState(false);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -377,6 +386,35 @@ export default function DeckDetailPage(): React.JSX.Element {
     [id, navigate],
   );
 
+  // Soft-delete a card directly from the list (after confirmation), removing it
+  // from local state on success. Never hard-deletes (DESIGN.md soft-delete model).
+  const handleDeleteCard = React.useCallback(async () => {
+    if (!cardToDelete) {
+      return;
+    }
+    setDeletingCard(true);
+    try {
+      await softDeleteCard(cardToDelete.id);
+      setCards((prev) => prev.filter((c) => c.id !== cardToDelete.id));
+      setThumbnails((prev) => {
+        const next = { ...prev };
+        delete next[cardToDelete.id];
+        return next;
+      });
+      toast({ title: "Card deleted" });
+      setCardToDelete(null);
+    } catch (err) {
+      clearAuthOnUnauthorized(err);
+      toast({
+        variant: "destructive",
+        title: "Delete failed",
+        description: "Couldn't delete this card. Please try again.",
+      });
+    } finally {
+      setDeletingCard(false);
+    }
+  }, [cardToDelete]);
+
   if (loading) {
     return (
       <div className="mx-auto w-full max-w-3xl px-4 py-10">
@@ -471,6 +509,7 @@ export default function DeckDetailPage(): React.JSX.Element {
                   thumbnail={thumbnails[card.id] ?? null}
                   onThumbnailError={handleThumbnailError}
                   onOpen={openCard}
+                  onDelete={setCardToDelete}
                   dragDisabled={reordering}
                 />
               ))}
@@ -542,6 +581,41 @@ export default function DeckDetailPage(): React.JSX.Element {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Card delete confirmation (inline from the list) */}
+      <AlertDialog
+        open={cardToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletingCard) {
+            setCardToDelete(null);
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this card?</AlertDialogTitle>
+            <AlertDialogDescription>
+              "{cardToDelete?.title.trim() || "Untitled card"}" will be removed
+              from the deck.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingCard}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={deletingCard}
+              onClick={(e) => {
+                e.preventDefault();
+                void handleDeleteCard();
+              }}
+            >
+              {deletingCard ? "Deleting…" : "Delete"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -553,6 +627,8 @@ interface SortableCardRowProps {
   /** Re-mints the thumbnail URL when its <img> fails to load (expired token). */
   onThumbnailError: (cardId: string, image: CardImage) => void;
   onOpen: (cardId: string) => void;
+  /** Request inline deletion of this card (opens a confirmation). */
+  onDelete: (card: CardRecord) => void;
   /** Disables the drag handle while a reorder is being persisted. */
   dragDisabled?: boolean;
 }
@@ -566,6 +642,7 @@ function SortableCardRow({
   thumbnail,
   onThumbnailError,
   onOpen,
+  onDelete,
   dragDisabled = false,
 }: SortableCardRowProps): React.JSX.Element {
   const {
@@ -641,6 +718,15 @@ function SortableCardRow({
             </p>
           ) : null}
         </div>
+      </button>
+
+      <button
+        type="button"
+        onClick={() => onDelete(card)}
+        className="shrink-0 rounded p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+        aria-label={`Delete ${card.title.trim() || "card"}`}
+      >
+        <Trash2 className="h-4 w-4" />
       </button>
     </li>
   );

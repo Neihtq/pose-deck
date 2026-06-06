@@ -57,6 +57,7 @@ vi.mock("@/components/ui/use-toast", () => ({
 }));
 
 import DeckListPage from "@/features/decks/DeckListPage";
+import { ThemeProvider } from "@/components/theme/ThemeProvider";
 
 function makeDeck(overrides: Partial<Deck> & { id: string; name: string }): Deck {
   return {
@@ -72,9 +73,11 @@ function makeDeck(overrides: Partial<Deck> & { id: string; name: string }): Deck
 
 function renderPage() {
   return render(
-    <MemoryRouter>
-      <DeckListPage />
-    </MemoryRouter>,
+    <ThemeProvider>
+      <MemoryRouter>
+        <DeckListPage />
+      </MemoryRouter>
+    </ThemeProvider>,
   );
 }
 

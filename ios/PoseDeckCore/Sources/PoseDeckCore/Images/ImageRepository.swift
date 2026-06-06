@@ -8,6 +8,41 @@ public enum ImageRepositoryError: Error, Sendable, Equatable {
     case invalidFileURL
 }
 
+/// Result of the client-side "may I begin uploading another image now?" check
+/// run synchronously by a view model before it suspends to compress/upload.
+///
+/// The cap check (`atImageLimit`) is count-based and goes stale across the
+/// upload `await`, so on its own it lets two concurrently-dispatched uploads
+/// (e.g. a paste + a file-pick) both pass a check-then-act test and transiently
+/// exceed the cap. ``ImageUploadGate/evaluate(isUploading:atImageLimit:)``
+/// folds an explicit in-flight guard in front of the cap check so callers reject
+/// the second request while the first is still in flight — mirroring the web
+/// `inFlight` ref in `useImageUpload.ts`.
+public enum ImageUploadGate: Equatable, Sendable {
+    /// No upload may begin: one is already in flight.
+    case busy
+    /// No upload may begin: the card is already at the image cap.
+    case atLimit
+    /// An upload may begin.
+    case allowed
+
+    /// Decide whether a new upload may begin given the synchronous state a view
+    /// model can observe before it suspends.
+    ///
+    /// - Parameters:
+    ///   - isUploading: whether an upload is already in flight.
+    ///   - atImageLimit: whether the card is already at its image cap
+    ///     (count-based; only authoritative while no upload is in flight).
+    /// - Returns: `.busy` if an upload is in flight (checked first, since the
+    ///   in-flight guard is what closes the check-then-act race), `.atLimit` if
+    ///   the card is full, otherwise `.allowed`.
+    public static func evaluate(isUploading: Bool, atImageLimit: Bool) -> ImageUploadGate {
+        if isUploading { return .busy }
+        if atImageLimit { return .atLimit }
+        return .allowed
+    }
+}
+
 /// The `card_images` operations the app needs (ARCHITECTURE.md §3.4, §5).
 ///
 /// A protocol so views/tests can use a fake without the network.
@@ -79,9 +114,10 @@ public struct ImageRepository: ImageRepositing {
     }
 
     public func listCardImages(cardId: String) async throws -> [CardImage] {
-        // PocketBase filter values must be quoted/escaped; ids are server-issued
-        // alphanumerics so a simple quoted equality is safe here.
-        let filter = "card = \"\(cardId)\""
+        // PocketBase filter values must be quoted/escaped. Ids are server-issued
+        // alphanumerics today, but routing through PocketBaseFilter.quoted keeps
+        // the value inside the quoted literal regardless of caller-supplied text.
+        let filter = "card = \(PocketBaseFilter.quoted(cardId))"
         let response: ListResponse<CardImage> = try await client.list(
             collection: Self.collection,
             page: 1,

@@ -13,6 +13,11 @@ public enum APIClientError: Error, Sendable {
     case httpError(status: Int, body: Data)
     /// A request requiring authentication was attempted with no auth token set.
     case notAuthenticated
+    /// A documented-but-unimplemented endpoint was called (e.g. realtime
+    /// ``APIClient/subscribe(collection:)`` before the M3 sync work lands).
+    /// Throwing this — rather than `fatalError` — keeps a premature call
+    /// recoverable instead of aborting the process.
+    case notImplemented
 }
 
 /// Minimal PocketBase auth response shape for the password auth endpoint.
@@ -144,6 +149,47 @@ public actor APIClient {
         return try await send(request)
     }
 
+    /// List *every* matching record across all pages, mirroring the web SDK's
+    /// `getFullList`.
+    ///
+    /// A single ``list(_:collection:page:perPage:filter:sort:)`` call returns at
+    /// most one page, so callers that must process the full result set (e.g.
+    /// duplicating a deck's cards) would silently drop anything beyond the first
+    /// page. This walks pages `1..totalPages`, accumulating items, so no records
+    /// are lost regardless of count.
+    ///
+    /// - Parameter perPage: page size used for each underlying request (larger
+    ///   pages mean fewer round-trips). Defaults to 200 to match the existing
+    ///   single-page call sites.
+    public func listAll<T: Codable & Sendable>(
+        _ type: T.Type = T.self,
+        collection: String,
+        perPage: Int = 200,
+        filter: String? = nil,
+        sort: String? = nil
+    ) async throws -> [T] {
+        var items: [T] = []
+        var page = 1
+        while true {
+            let response = try await list(
+                T.self,
+                collection: collection,
+                page: page,
+                perPage: perPage,
+                filter: filter,
+                sort: sort
+            )
+            items.append(contentsOf: response.items)
+            // Stop once we've fetched the last reported page, or defensively if a
+            // page comes back empty (guards against a 0/short totalPages).
+            if page >= response.totalPages || response.items.isEmpty {
+                break
+            }
+            page += 1
+        }
+        return items
+    }
+
     /// Create a record in a collection.
     public func create<Body: Encodable & Sendable, T: Codable & Sendable>(
         collection: String,
@@ -195,7 +241,9 @@ public actor APIClient {
     /// with backoff, and the event-decoding pipeline land with the M3 sync work.
     public func subscribe(collection: String) async throws {
         // Intentionally unimplemented: documented stub for the M3 realtime layer.
-        fatalError("Realtime subscription not implemented yet (see ARCHITECTURE.md §4.4).")
+        // Throw a catchable error rather than `fatalError` so a premature call
+        // is recoverable instead of crashing the process.
+        throw APIClientError.notImplemented
     }
 
     // MARK: - Request plumbing

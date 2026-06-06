@@ -35,15 +35,18 @@ public struct DeckRepository: Sendable {
     /// The PocketBase `listRule` already scopes results to owner/guest decks; we
     /// only filter out soft-deleted ones here. Page-level grouping/sorting
     /// happens in ``DeckGrouping``.
+    ///
+    /// Fetches *every* matching deck across all pages (mirrors the web
+    /// `getFullList`); a single-page `list` call would silently drop decks beyond
+    /// the first page for users with many decks.
     public func listDecks() async throws -> [Deck] {
-        let response = try await client.list(
+        return try await client.listAll(
             Deck.self,
             collection: collection,
             perPage: 200,
             filter: "deleted_at = \"\"",
             sort: "-updated"
         )
-        return response.items
     }
 
     /// Fetch a single non-soft-deleted deck by id.
@@ -55,7 +58,7 @@ public struct DeckRepository: Sendable {
             Deck.self,
             collection: collection,
             perPage: 1,
-            filter: "id = \"\(id)\" && deleted_at = \"\""
+            filter: "id = \(PocketBaseFilter.quoted(id)) && deleted_at = \"\""
         )
         guard let deck = response.items.first else {
             throw DeckRepositoryError.notFound(id: id)
@@ -65,15 +68,17 @@ public struct DeckRepository: Sendable {
 
     /// List the current user's soft-deleted decks (the trash view),
     /// most-recently-deleted first.
+    ///
+    /// Fetches *every* matching deck across all pages (mirrors the web
+    /// `getFullList`) so a trash view with many decks is not truncated.
     public func listTrashedDecks() async throws -> [Deck] {
-        let response = try await client.list(
+        return try await client.listAll(
             Deck.self,
             collection: collection,
             perPage: 200,
             filter: "deleted_at != \"\"",
             sort: "-deleted_at"
         )
-        return response.items
     }
 
     // MARK: - Write
@@ -151,17 +156,19 @@ public struct DeckRepository: Sendable {
             ownerId: ownerId
         )
 
-        // Fetch non-deleted source cards in order.
-        let cardsResponse = try await client.list(
+        // Fetch *all* non-deleted source cards in order, paginating across every
+        // page (mirrors the web `getFullList`). A single-page `list` call would
+        // silently drop cards beyond the first page for decks with many cards.
+        let sourceCards = try await client.listAll(
             Card.self,
             collection: cardsCollection,
             perPage: 200,
-            filter: "deck = \"\(id)\" && deleted_at = \"\"",
+            filter: "deck = \(PocketBaseFilter.quoted(id)) && deleted_at = \"\"",
             sort: "position"
         )
 
         var position = Self.positionGap
-        for card in cardsResponse.items {
+        for card in sourceCards {
             let body = DuplicateCardBody(
                 deck: copy.id,
                 position: position,

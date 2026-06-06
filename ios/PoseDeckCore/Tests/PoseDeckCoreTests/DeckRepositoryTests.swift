@@ -129,6 +129,114 @@ final class DeckRepositoryTests: XCTestCase {
         XCTAssertTrue(cardBodies.contains { ($0["notes"] as? String) == "n1" })
     }
 
+    /// Regression (CORR-1): a source deck with more cards than fit on one page
+    /// must have *every* card copied — `duplicateDeck` paginates rather than
+    /// silently dropping the overflow beyond the first page (web `getFullList`
+    /// parity). Here the source has 250 cards spread over two pages of 200.
+    func testDuplicateDeckCopiesCardsAcrossAllPages() async throws {
+        let totalCards = 250
+        let pageSize = 200
+
+        StubURLProtocol.shared.setHandler { request in
+            if request.httpMethod == "GET" {
+                let url = request.url!.absoluteString
+                if url.contains("collections/decks") {
+                    let body = #"{"page":1,"perPage":1,"totalItems":1,"totalPages":1,"items":[{"id":"src","owner":"u","name":"Big","shoot_date":"","deleted_at":""}]}"#
+                    return (200, Data(body.utf8))
+                }
+                // cards list — serve the requested page.
+                let comps = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)
+                let page = Int(comps?.queryItems?.first { $0.name == "page" }?.value ?? "1") ?? 1
+                let totalPages = (totalCards + pageSize - 1) / pageSize
+                let start = (page - 1) * pageSize
+                let end = min(start + pageSize, totalCards)
+                let items = (start..<end).map { i in
+                    #"{"id":"c\#(i)","deck":"src","position":\#((i + 1) * 1000),"title":"Card \#(i)","deleted_at":""}"#
+                }.joined(separator: ",")
+                let body = #"{"page":\#(page),"perPage":\#(pageSize),"totalItems":\#(totalCards),"totalPages":\#(totalPages),"items":[\#(items)]}"#
+                return (200, Data(body.utf8))
+            }
+            let url = request.url!.absoluteString
+            if url.contains("collections/decks") {
+                return (200, Data(#"{"id":"copy","owner":"u","name":"Big (copy)","deleted_at":""}"#.utf8))
+            }
+            return (200, Data(#"{"id":"newcard","deck":"copy","position":1000,"title":"x","deleted_at":""}"#.utf8))
+        }
+
+        let repo = DeckRepository(client: await makeClient(), now: { Self.fixedNow })
+        let copy = try await repo.duplicateDeck(id: "src", ownerId: "u")
+        XCTAssertEqual(copy.id, "copy")
+
+        // Every one of the 250 source cards must be copied into the new deck,
+        // not just the first page of 200.
+        let cardBodies = try allPostBodies().filter { $0["deck"] as? String == "copy" }
+        XCTAssertEqual(cardBodies.count, totalCards, "all cards across every page must be copied")
+
+        // Copies get fresh, contiguous gap positions 1000..250_000.
+        let positions = cardBodies.compactMap { $0["position"] as? Int }.sorted()
+        XCTAssertEqual(positions, (1...totalCards).map { $0 * 1000 })
+    }
+
+    // MARK: - list pagination (CORR-2 regression)
+
+    /// Regression for CORR-2: a user with more decks than fit on one page must
+    /// not have the list truncated. `listDecks` walks every page via `listAll`
+    /// (web `getFullList` parity) rather than returning only the first 200.
+    func testListDecksFetchesEveryPage() async throws {
+        try await assertListPaginates(
+            filterContains: "deleted_at = \"\"",
+            idPrefix: "d"
+        ) { repo in try await repo.listDecks() }
+    }
+
+    /// Regression for CORR-2: the trash view must likewise fetch every page so a
+    /// user with >200 trashed decks sees all of them.
+    func testListTrashedDecksFetchesEveryPage() async throws {
+        try await assertListPaginates(
+            filterContains: "deleted_at != \"\"",
+            idPrefix: "t"
+        ) { repo in try await repo.listTrashedDecks() }
+    }
+
+    /// Drives a list method against a 3-page (450-deck) stub and asserts every
+    /// record is returned and one GET is issued per page.
+    private func assertListPaginates(
+        filterContains: String,
+        idPrefix: String,
+        _ call: (DeckRepository) async throws -> [Deck]
+    ) async throws {
+        let perPage = 200
+        let total = 450
+        let totalPages = 3
+
+        StubURLProtocol.shared.setHandler { request in
+            guard request.httpMethod == "GET" else { return (200, Data("{}".utf8)) }
+            let comps = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)
+            let page = Int(comps?.queryItems?.first { $0.name == "page" }?.value ?? "1") ?? 1
+            let start = (page - 1) * perPage
+            let end = min(start + perPage, total)
+            let items = (start..<end).map { i in
+                #"{"id":"\#(idPrefix)\#(i)","owner":"u","name":"Deck \#(i)","deleted_at":""}"#
+            }.joined(separator: ",")
+            let body = #"{"page":\#(page),"perPage":\#(perPage),"totalItems":\#(total),"totalPages":\#(totalPages),"items":[\#(items)]}"#
+            return (200, Data(body.utf8))
+        }
+
+        let repo = DeckRepository(client: await makeClient(), now: { Self.fixedNow })
+        let decks = try await call(repo)
+
+        XCTAssertEqual(decks.count, total, "all decks across every page must be returned, not just the first 200")
+        XCTAssertEqual(decks.first?.id, "\(idPrefix)0")
+        XCTAssertEqual(decks.last?.id, "\(idPrefix)449", "records beyond the first page must not be dropped")
+
+        let getRequests = StubURLProtocol.shared.requests.filter { $0.httpMethod == "GET" }
+        XCTAssertEqual(getRequests.count, totalPages, "should issue one GET per page")
+        // Sanity: the expected filter was actually used.
+        let url = getRequests.first?.url?.absoluteString ?? ""
+        let decoded = url.removingPercentEncoding ?? url
+        XCTAssertTrue(decoded.contains(filterContains), "filter must be preserved across pagination")
+    }
+
     // MARK: - helpers
 
     private func lastBody() throws -> [String: Any] {

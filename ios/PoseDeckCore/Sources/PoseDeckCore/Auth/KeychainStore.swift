@@ -46,6 +46,16 @@ public struct KeychainStore: KeychainStoring {
     /// The `kSecAttrService` namespace for all items written by this store.
     private let service: String
 
+    /// The `kSecAttrAccessible` class applied to every item written by this store.
+    ///
+    /// `…ThisDeviceOnly` is deliberate: the values held here are device-bound
+    /// session secrets (a bearer JWT and the encoded user record). The
+    /// `ThisDeviceOnly` qualifier keeps them out of encrypted/unencrypted device
+    /// backups and prevents restore onto a different device. There is no UX cost
+    /// because the session is per-device and re-established on relaunch via
+    /// `AuthService.restore()`.
+    static var accessibility: CFString { kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly }
+
     public init(service: String = "com.posedeck.core.auth") {
         self.service = service
     }
@@ -65,7 +75,7 @@ public struct KeychainStore: KeychainStoring {
 
         var attributes = baseQuery(for: key)
         attributes[kSecValueData as String] = data
-        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        attributes[kSecAttrAccessible as String] = Self.accessibility
 
         let status = SecItemAdd(attributes as CFDictionary, nil)
         guard status == errSecSuccess else {

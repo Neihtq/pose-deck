@@ -127,4 +127,83 @@ final class AuthServiceTests: XCTestCase {
         XCTAssertFalse(service.isAuthenticated)
         XCTAssertNil(service.currentUser)
     }
+
+    // SEC-2 regression: a token present in the keychain with no matching user
+    // record (an orphaned JWT) must be purged by restore(), not left behind. The
+    // token must also never be applied to the client.
+    func testRestoreWithTokenButNoUserPurgesOrphanedToken() async throws {
+        let keychain = InMemoryKeychainStore()
+        try keychain.saveString("orphaned-jwt", for: AuthService.Keys.token)
+        // No user record was persisted.
+
+        let client = MockAuthClient(result: .failure(FakeAuthError.invalidCredentials))
+        let service = AuthService(client: client, keychain: keychain)
+
+        await service.restore()
+
+        XCTAssertFalse(service.isAuthenticated)
+        XCTAssertNil(service.currentUser)
+        // The orphaned token is invalidated client-side, not persisted indefinitely.
+        XCTAssertNil(try keychain.readString(AuthService.Keys.token))
+        XCTAssertNil(try keychain.read(AuthService.Keys.user))
+        // And it was never presented to the client.
+        let token = await client.currentToken
+        XCTAssertNil(token)
+    }
+
+    // SEC-2 regression: a token paired with an undecodable user blob must also be
+    // purged rather than leaving a dangling token.
+    func testRestoreWithUndecodableUserPurgesBothKeys() async throws {
+        let keychain = InMemoryKeychainStore()
+        try keychain.saveString("orphaned-jwt", for: AuthService.Keys.token)
+        try keychain.save(Data("not-a-user".utf8), for: AuthService.Keys.user)
+
+        let client = MockAuthClient(result: .failure(FakeAuthError.invalidCredentials))
+        let service = AuthService(client: client, keychain: keychain)
+
+        await service.restore()
+
+        XCTAssertFalse(service.isAuthenticated)
+        XCTAssertNil(try keychain.readString(AuthService.Keys.token))
+        XCTAssertNil(try keychain.read(AuthService.Keys.user))
+        let token = await client.currentToken
+        XCTAssertNil(token)
+    }
+
+    // SEC-2 regression: signIn writes token + user atomically. If the user record
+    // cannot be persisted, the token must not be left orphaned in the keychain.
+    func testSignInRollsBackTokenWhenUserPersistFails() async {
+        let keychain = FailOnUserSaveKeychain()
+        let client = MockAuthClient(result: .success(makeResponse(token: "jwt-abc")))
+        let service = AuthService(client: client, keychain: keychain)
+
+        do {
+            try await service.signIn(email: "owner@posedeck.test", password: "changeme123")
+            XCTFail("Expected sign-in to throw when the user record cannot be persisted")
+        } catch {
+            // expected
+        }
+
+        // No orphaned token left behind.
+        XCTAssertNil(try? keychain.readString(AuthService.Keys.token))
+        XCTAssertNil(try? keychain.read(AuthService.Keys.user))
+        XCTAssertFalse(service.isAuthenticated)
+        XCTAssertNil(service.currentUser)
+    }
+}
+
+/// A keychain fake that fails when persisting the user record, used to exercise
+/// the SEC-2 atomic-write rollback path in `signIn`.
+private final class FailOnUserSaveKeychain: KeychainStoring, @unchecked Sendable {
+    private let inner = InMemoryKeychainStore()
+
+    func save(_ data: Data, for key: String) throws {
+        if key == AuthService.Keys.user {
+            throw KeychainError.unexpectedStatus(-1)
+        }
+        try inner.save(data, for: key)
+    }
+
+    func read(_ key: String) throws -> Data? { try inner.read(key) }
+    func delete(_ key: String) throws { try inner.delete(key) }
 }

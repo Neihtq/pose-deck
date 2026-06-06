@@ -51,6 +51,28 @@ public enum PocketBaseDate {
         return formatter
     }
 
+    /// Fallback formatters for PocketBase datetimes that carry **no** fractional
+    /// seconds (e.g. `2026-06-06 18:44:54Z` or the `T`-separated ISO equivalent).
+    /// PocketBase normally emits 3-digit millis, but a payload variant without
+    /// them must still parse to the real instant rather than silently becoming
+    /// `nil` (which would be misread as "unset"). Tried only after the primary
+    /// millis-bearing formats fail.
+    private static func makeFractionlessFormatter() -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss'Z'"
+        return formatter
+    }
+
+    private static func makeFractionlessISOFormatter() -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
+        return formatter
+    }
+
     /// Parse a PocketBase datetime string into a `Date`.
     ///
     /// Returns `nil` for the empty string (unset). Throws-free: an unparseable
@@ -60,8 +82,13 @@ public enum PocketBaseDate {
         if string.isEmpty { return nil }
         if let date = makeFormatter().date(from: string) { return date }
         // Tolerate a couple of common variations so fixtures and re-encoded
-        // values still decode: the `T`-separated ISO form, and a Z-less suffix.
+        // values still decode: the `T`-separated ISO form, and datetimes with no
+        // fractional seconds (`...:ssZ`). Without the fractionless fallbacks a
+        // millis-less PocketBase datetime would fail every formatter and decode
+        // to `nil`, which callers misread as "unset".
         if let date = makeISOFormatter().date(from: string) { return date }
+        if let date = makeFractionlessFormatter().date(from: string) { return date }
+        if let date = makeFractionlessISOFormatter().date(from: string) { return date }
         return nil
     }
 

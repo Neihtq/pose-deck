@@ -44,6 +44,46 @@ final class ImageRepositoryTests: XCTestCase {
         }
     }
 
+    // MARK: - Synchronous upload gate (SWIFT-3 regression)
+
+    func testUploadGateAllowsWhenIdleAndUnderLimit() {
+        XCTAssertEqual(
+            ImageUploadGate.evaluate(isUploading: false, atImageLimit: false),
+            .allowed
+        )
+    }
+
+    func testUploadGateBlocksWhenAtLimit() {
+        XCTAssertEqual(
+            ImageUploadGate.evaluate(isUploading: false, atImageLimit: true),
+            .atLimit
+        )
+    }
+
+    /// Regression for SWIFT-3: the in-flight guard must win even when the
+    /// count-based `atImageLimit` is still stale (false), so a second upload
+    /// dispatched while the first is suspended is rejected before it can append
+    /// and transiently exceed the cap. Mirrors the web `inFlight` ref.
+    func testUploadGateBlocksConcurrentUploadWhileFirstInFlight() {
+        // First upload is in flight; its append has not landed yet so the
+        // count-based limit check still reads "not at limit".
+        XCTAssertEqual(
+            ImageUploadGate.evaluate(isUploading: true, atImageLimit: false),
+            .busy,
+            "a second upload must be rejected while the first is in flight, "
+                + "even though the stale count check says there is room"
+        )
+    }
+
+    func testUploadGateInFlightGuardTakesPriorityOverLimit() {
+        // When both conditions hold, the in-flight guard is reported first:
+        // it is the guard that actually closes the check-then-act race.
+        XCTAssertEqual(
+            ImageUploadGate.evaluate(isUploading: true, atImageLimit: true),
+            .busy
+        )
+    }
+
     func testDefaultMaxIsFive() {
         // Build with a dummy client; we only read the configured cap.
         let client = APIClient(baseURL: URL(string: "http://127.0.0.1:8090")!)

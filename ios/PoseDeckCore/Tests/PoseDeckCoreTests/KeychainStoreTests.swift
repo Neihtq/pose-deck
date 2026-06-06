@@ -39,4 +39,26 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertEqual(try store.readString("greeting"), "hello")
         XCTAssertNil(try store.readString("missing"))
     }
+
+#if canImport(Security)
+    /// Regression for SEC-1: keychain items (JWT + encoded user record) must be
+    /// device-bound. They must use the `…ThisDeviceOnly` accessibility class so
+    /// the session token cannot escape the device via encrypted/unencrypted
+    /// backups or be restored onto a different device.
+    func testAccessibilityIsDeviceOnly() {
+        XCTAssertEqual(
+            KeychainStore.accessibility,
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            "Session secrets must be stored ThisDeviceOnly so they are excluded "
+                + "from device backups and cannot be restored to another device."
+        )
+        // Guard explicitly against the backup/restore-eligible variant that
+        // SEC-1 flagged, in case the constant identity ever changes.
+        XCTAssertNotEqual(
+            KeychainStore.accessibility,
+            kSecAttrAccessibleAfterFirstUnlock,
+            "Must not use the backup/restore-eligible accessibility class."
+        )
+    }
+#endif
 }

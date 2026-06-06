@@ -39,7 +39,9 @@ struct TrashView: View {
     @ViewBuilder
     private var content: some View {
         switch model.state {
-        case .idle, .loading where model.decks.isEmpty:
+        case .idle:
+            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .loading where model.decks.isEmpty:
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
         case .failed(let message) where model.decks.isEmpty:
             ContentUnavailableView {

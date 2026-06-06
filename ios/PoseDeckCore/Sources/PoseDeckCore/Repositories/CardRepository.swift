@@ -63,15 +63,18 @@ public struct CardRepository: Sendable {
     // MARK: - Read
 
     /// List a deck's non-soft-deleted cards, ordered by `position`.
+    ///
+    /// Fetches *every* matching card across all pages (mirrors the web
+    /// `getFullList`); a single-page `list` call would silently drop cards beyond
+    /// the first page for decks with many cards.
     public func listCards(deckId: String) async throws -> [Card] {
-        let response = try await client.list(
+        return try await client.listAll(
             Card.self,
             collection: collection,
             perPage: 200,
-            filter: "deck = \"\(deckId)\" && deleted_at = \"\"",
+            filter: "deck = \(PocketBaseFilter.quoted(deckId)) && deleted_at = \"\"",
             sort: "position"
         )
-        return response.items
     }
 
     // MARK: - Position math (pure, testable)
@@ -93,6 +96,38 @@ public struct CardRepository: Sendable {
         orderedIds.enumerated().map { index, id in
             (id: id, position: (index + 1) * positionGap)
         }
+    }
+
+    /// Revert an optimistically-reordered card list back to its pre-drag state.
+    ///
+    /// Used when `reorderCards` fails partway through: a partial server write
+    /// leaves a mix of new and old `position` values, so reloading from the
+    /// server surfaces a neither-old-nor-new ordering. Rather than trust that
+    /// state, callers re-apply the captured pre-drag positions locally.
+    ///
+    /// Each card's `position` is restored from `originalPositions` (cards absent
+    /// from the map keep their current position), then the list is re-sorted by
+    /// position so the array order matches what `listCards` would have returned
+    /// before the drag. A stable sort on ties keeps a deterministic result.
+    public static func restoredOrder(
+        of cards: [Card],
+        to originalPositions: [String: Int]
+    ) -> [Card] {
+        let restored = cards.map { card -> Card in
+            guard let original = originalPositions[card.id] else { return card }
+            var copy = card
+            copy.position = original
+            return copy
+        }
+        return restored
+            .enumerated()
+            .sorted { lhs, rhs in
+                if lhs.element.position != rhs.element.position {
+                    return lhs.element.position < rhs.element.position
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
     }
 
     // MARK: - Write

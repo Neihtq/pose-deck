@@ -92,10 +92,19 @@ public final class AuthService: AuthSession {
     public func signIn(email: String, password: String) async throws {
         let response = try await client.authWithPassword(email: email, password: password)
         // Persist before publishing state so a crash mid-flight can't leave an
-        // observable session with nothing in the keychain.
-        try keychain.saveString(response.token, for: Keys.token)
-        if let userData = try? encoder.encode(response.record) {
+        // observable session with nothing in the keychain. Token + user are
+        // written atomically: encode the user up front and treat its persistence
+        // as required, so we never end up with a token that has no matching user
+        // (an orphaned JWT restore()/signOut() could never reach). On any failure
+        // after the token is written, delete it so nothing dangling remains.
+        do {
+            let userData = try encoder.encode(response.record)
+            try keychain.saveString(response.token, for: Keys.token)
             try keychain.save(userData, for: Keys.user)
+        } catch {
+            try? keychain.delete(Keys.token)
+            try? keychain.delete(Keys.user)
+            throw error
         }
         currentUser = response.record
     }
@@ -110,10 +119,23 @@ public final class AuthService: AuthSession {
     public func restore() async {
         guard
             let token = try? keychain.readString(Keys.token),
-            !token.isEmpty,
+            !token.isEmpty
+        else {
+            // No usable token: clear any stray user record so the two keys stay
+            // consistent, then bail.
+            try? keychain.delete(Keys.user)
+            return
+        }
+        guard
             let userData = try? keychain.read(Keys.user),
             let user = try? decoder.decode(User.self, from: userData)
         else {
+            // A token is present but it can't be paired with a stored user
+            // (missing or undecodable). Purge both keys so the orphaned token is
+            // invalidated client-side rather than persisting indefinitely, and
+            // never apply it to the client.
+            try? keychain.delete(Keys.token)
+            try? keychain.delete(Keys.user)
             return
         }
         await client.setAuthToken(token)

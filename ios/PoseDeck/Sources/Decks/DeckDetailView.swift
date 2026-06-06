@@ -117,7 +117,10 @@ struct DeckDetailView: View {
     @ViewBuilder
     private var content: some View {
         switch model.state {
-        case .idle, .loading where model.isEmpty:
+        case .idle:
+            ProgressView("Loading cards…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .loading where model.isEmpty:
             ProgressView("Loading cards…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .failed(let message) where model.isEmpty:
@@ -147,7 +150,11 @@ struct DeckDetailView: View {
                 Section {
                     ForEach(model.cards) { card in
                         Button { cardRoute = .existing(card) } label: {
-                            CardRowView(card: card, thumbnailURL: model.thumbnailURLs[card.id])
+                            CardRowView(
+                                card: card,
+                                thumbnailURL: model.thumbnailURLs[card.id],
+                                onThumbnailFailure: { await model.refreshThumbnail(for: card) }
+                            )
                         }
                         .buttonStyle(.plain)
                     }
@@ -157,6 +164,10 @@ struct DeckDetailView: View {
                     .onMove { source, dest in
                         Task { await model.moveCards(from: source, to: dest) }
                     }
+                    // Disable drag while a reorder is being persisted so a new
+                    // drop can't stack on an unconfirmed one (mirrors the web
+                    // `dragDisabled={reordering}`). The model also guards this.
+                    .moveDisabled(model.isReordering)
                 }
                 Section {
                     Button { cardRoute = .new } label: {
@@ -175,6 +186,9 @@ struct DeckDetailView: View {
 struct CardRowView: View {
     let card: Card
     let thumbnailURL: URL?
+    /// Called when the thumbnail's `AsyncImage` reports `.failure` so the owner
+    /// can re-mint an expired file token (defaults to a no-op for previews).
+    var onThumbnailFailure: () async -> Void = {}
 
     private var summary: String? {
         let parts = [card.timeSlot, card.subjects]
@@ -214,6 +228,11 @@ struct CardRowView: View {
                         image.resizable().scaledToFill()
                     case .failure:
                         placeholder
+                            // Most commonly an expired short-lived file
+                            // `?token=` on a long-lived detail screen — ask the
+                            // owner to re-mint it (mirrors the editor's
+                            // `CardImagesSection` `.failure` → `refreshURL`).
+                            .task { await onThumbnailFailure() }
                     default:
                         ProgressView()
                     }

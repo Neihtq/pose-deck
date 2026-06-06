@@ -80,9 +80,23 @@ final class CardImagesViewModel {
 
     /// Compress and upload a picked photo, enforcing the per-card cap.
     func addImage(data: Data) async {
-        guard !atImageLimit else {
+        // Synchronous gate run before the upload suspends. An upload suspends at
+        // compress/upload before `images.append` lands, so `atImageLimit` (a
+        // stale count-based check) cannot see in-flight work. Without an
+        // in-flight guard, a concurrent paste + file-pick could both pass the
+        // check-then-act cap check and transiently exceed the cap client-side.
+        // `addImage` is @MainActor and there is no `await` between this check and
+        // `isUploading = true`, so the pair is atomic and closes the window
+        // (mirrors the web `inFlight` ref in useImageUpload.ts).
+        switch ImageUploadGate.evaluate(isUploading: isUploading, atImageLimit: atImageLimit) {
+        case .busy:
+            errorMessage = "Please wait for the current upload to finish."
+            return
+        case .atLimit:
             errorMessage = "A card can have at most \(maxImagesPerCard) images."
             return
+        case .allowed:
+            break
         }
         isUploading = true
         errorMessage = nil

@@ -141,7 +141,10 @@ struct DeckListView: View {
     @ViewBuilder
     private var content: some View {
         switch model.state {
-        case .idle, .loading where model.isEmpty:
+        case .idle:
+            ProgressView("Loading decks…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .loading where model.isEmpty:
             ProgressView("Loading decks…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .failed(let message) where model.isEmpty:

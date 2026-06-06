@@ -31,5 +31,13 @@ let package = Package(
             name: "PoseDeckCoreTests",
             dependencies: ["PoseDeckCore"]
         ),
+        // Integration tests that exercise the repositories against a LIVE
+        // PocketBase. Every test is gated behind the POSEDECK_INTEGRATION=1 env
+        // var (see IntegrationEnvironment.skipIfDisabled), so the default
+        // `swift test` run stays fully offline/green when no backend is present.
+        .testTarget(
+            name: "PoseDeckCoreIntegrationTests",
+            dependencies: ["PoseDeckCore"]
+        ),
     ]
 )

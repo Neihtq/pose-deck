@@ -29,6 +29,13 @@ final class DeckDetailViewModel {
     /// Set when the deck itself was soft-deleted from the header — the view pops.
     private(set) var didDelete = false
 
+    /// Serializes optimistic reorders so a second `.onMove` (each fired in its
+    /// own `Task` from the view) cannot stack on top of an unconfirmed reorder
+    /// while the first is suspended at `await`. Mirrors the web `reordering`
+    /// flag. `isReordering` is bound by the view to disable drag while busy.
+    private var reorderGate = ReorderGate()
+    var isReordering: Bool { reorderGate.isBusy }
+
     init(
         deck: Deck,
         deckRepo: DeckRepositoring,
@@ -89,6 +96,26 @@ final class DeckDetailViewModel {
         thumbnailURLs = resolved
     }
 
+    /// Re-mint a single card's thumbnail URL after its `AsyncImage` failed to
+    /// load — most commonly an expired short-lived file `?token=` on a
+    /// long-lived deck-detail session. Re-resolves the card's first image's
+    /// display URL and adopts it only when it actually changed, to avoid an
+    /// infinite reload loop on a genuine 404. Mirrors ``CardImagesViewModel``'s
+    /// `refreshURL` and the web `DeckDetailPage` thumbnail `onError` handler.
+    func refreshThumbnail(for card: Card) async {
+        do {
+            let images = try await imageRepo.listCardImages(cardId: card.id)
+            guard let first = images.first else { return }
+            let fresh = try await imageRepo.fileURL(for: first)
+            if ThumbnailRefresh.shouldApply(fresh: fresh, current: thumbnailURLs[card.id]) {
+                thumbnailURLs[card.id] = fresh
+            }
+        } catch {
+            // Best-effort: a failed re-mint leaves the existing (broken)
+            // thumbnail in place rather than surfacing an error.
+        }
+    }
+
     // MARK: - Card actions
 
     func deleteCard(at offsets: IndexSet) async {
@@ -106,6 +133,14 @@ final class DeckDetailViewModel {
     /// Reorder cards locally then persist restriped positions (skipping cards
     /// whose position is unchanged so a reorder doesn't clobber concurrent edits).
     func moveCards(from source: IndexSet, to destination: Int) async {
+        // Serialize: drop this move if a reorder is already being persisted.
+        // Without this guard a second `.onMove` (its own Task) could run its
+        // optimistic `cards.move` on the first move's server-unconfirmed array
+        // and launch a second interleaving PATCH loop. Mirrors the web
+        // early-return in `handleDragEnd`.
+        guard reorderGate.begin() else { return }
+        defer { reorderGate.finish() }
+
         let before = currentPositions
         cards.move(fromOffsets: source, toOffset: destination)
         let orderedIds = cards.map(\.id)
@@ -118,15 +153,25 @@ final class DeckDetailViewModel {
             await load()
         } catch {
             actionError = DeckListViewModel.message(for: error)
-            await load()
+            // A mid-loop reorder failure leaves a partial server write (some cards
+            // restriped, some not), so re-fetching via load() would surface a
+            // neither-old-nor-new ordering. Restore the captured pre-drag order
+            // locally instead, then refresh thumbnails without re-sorting from the
+            // corrupted server state.
+            cards = CardRepository.restoredOrder(of: cards, to: before)
+            await loadThumbnails()
         }
     }
 
     // MARK: - Deck actions
 
     func renameDeck(to name: String) async {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        // Skip the write when the name is empty or unchanged: a no-op rename
+        // would re-stamp `client_updated_at` and could clobber a concurrent edit
+        // under last-write-wins (ARCHITECTURE.md §4.3). Mirrors the deck-LIST
+        // path and the web `handleRename` early-return, and matches `editDate`'s
+        // unchanged-value skip below.
+        guard let trimmed = DeckEdits.renameTarget(proposed: name, current: deck.name) else { return }
         do {
             deck = try await deckRepo.renameDeck(id: deck.id, name: trimmed)
         } catch {

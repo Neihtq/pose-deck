@@ -22,7 +22,34 @@ import {
   pb,
 } from "@/lib/pocketbase";
 import { startSync, stopSync } from "@/sync";
+import { toast } from "@/components/ui/use-toast";
 import type { User } from "@/lib/types";
+
+/**
+ * Start sync, surfacing a sign-in-time hydrate/subscribe failure to the user.
+ *
+ * `startSync()` subscribes to realtime and runs the initial server hydrate. If
+ * that rejects (e.g. the network is down or the server is unreachable right
+ * after sign-in), the app would otherwise show an empty/stale deck list with no
+ * explanation — the M3 live-query reads never "fail" like a fetch, so the only
+ * place this error exists is the bootstrap. A 401 is handled by
+ * `clearAuthOnUnauthorized` (which routes back to /login); anything else gets a
+ * non-blocking toast so the failure is visible, not silent. Local-first data
+ * (if any) still renders from Dexie.
+ */
+function startSyncWithErrorSurface(): void {
+  void startSync().catch((error) => {
+    if (clearAuthOnUnauthorized(error)) {
+      return;
+    }
+    toast({
+      variant: "destructive",
+      title: "Couldn't sync your decks",
+      description:
+        "We couldn't reach the server. Showing any saved data; we'll keep retrying.",
+    });
+  });
+}
 
 /** Value exposed by {@link useAuth}. */
 export interface AuthContextValue {
@@ -75,7 +102,7 @@ export function AuthProvider({
     // onChange, not inline in those callers.
     let wasAuthed = initial.isAuthenticated;
     if (wasAuthed) {
-      void startSync();
+      startSyncWithErrorSurface();
     }
 
     // Keep React state in lock-step with the PocketBase auth store. The
@@ -85,7 +112,7 @@ export function AuthProvider({
       const next = readAuthState();
       setState(next);
       if (next.isAuthenticated && !wasAuthed) {
-        void startSync();
+        startSyncWithErrorSurface();
       } else if (!next.isAuthenticated && wasAuthed) {
         void stopSync();
       }

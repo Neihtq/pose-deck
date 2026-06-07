@@ -289,6 +289,22 @@ describe("ShareDeckDialog — revoke states and errors", () => {
   });
 });
 
+describe("ShareDeckDialog — a11y (M8)", () => {
+  it("exposes a dialog role labelled by its title", async () => {
+    renderDialog();
+    const dialog = await screen.findByRole("dialog");
+    // Radix wires aria-labelledby → the DialogTitle, so the dialog has an
+    // accessible name.
+    expect(dialog).toHaveAccessibleName("Share deck");
+  });
+
+  it("labels the email input", async () => {
+    renderDialog();
+    await screen.findByText("Not shared with anyone yet.");
+    expect(screen.getByLabelText("Email")).toBeInTheDocument();
+  });
+});
+
 describe("ShareDeckDialog — multiple guests", () => {
   it("renders a revoke button per guest and revokes the chosen one", async () => {
     await db.deck_guests.put(makeGuest("g1", "alice-id"));

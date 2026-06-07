@@ -676,6 +676,8 @@ function SortableCardRow({
     .map((s) => s.trim())
     .filter(Boolean);
 
+  const cardLabel = card.title.trim() || "Untitled card";
+
   return (
     <li
       ref={setNodeRef}
@@ -689,7 +691,13 @@ function SortableCardRow({
         type="button"
         disabled={dragDisabled}
         className="shrink-0 cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-accent active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-50"
-        aria-label="Drag to reorder"
+        // Name the handle by its target card. The keyboard alternative to the
+        // pointer drag is fully handled by dnd-kit's KeyboardSensor: spreading
+        // `attributes` adds `aria-roledescription="sortable"` and an
+        // `aria-describedby` pointing at dnd-kit's built-in screen-reader
+        // instructions ("press space bar to pick up…, arrow keys to move…"), so
+        // we don't supply our own — `attributes` is spread last so it wins.
+        aria-label={`Reorder ${cardLabel}`}
         {...attributes}
         {...listeners}
       >
@@ -740,7 +748,7 @@ function SortableCardRow({
         type="button"
         onClick={() => onDelete(card)}
         className="shrink-0 rounded p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-        aria-label={`Delete ${card.title.trim() || "card"}`}
+        aria-label={`Delete ${cardLabel}`}
       >
         <Trash2 className="h-4 w-4" />
       </button>

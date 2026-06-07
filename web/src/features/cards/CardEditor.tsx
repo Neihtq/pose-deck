@@ -426,7 +426,14 @@ export default function CardEditor(): JSX.Element {
               <>
                 {images.length > 0 ? (
                   <ul className="grid grid-cols-3 gap-3 sm:grid-cols-4">
-                    {images.map((image) => (
+                    {images.map((image, index) => {
+                      // Meaningful alt: in the editor the image IS the content
+                      // (reference photos), so name it by position + card. This
+                      // also names the adjacent "Remove image" button's target.
+                      const imageLabel = `Image ${index + 1} of ${
+                        titleTrimmed || "this card"
+                      }`;
+                      return (
                       <li
                         key={image.id}
                         className="group relative aspect-square overflow-hidden rounded-md border bg-muted"
@@ -435,6 +442,7 @@ export default function CardEditor(): JSX.Element {
                           image={image}
                           thumb="300x300"
                           networkUrl={imageDisplayUrl}
+                          alt={imageLabel}
                           className="h-full w-full object-cover"
                           loading="lazy"
                           fallback={
@@ -443,14 +451,15 @@ export default function CardEditor(): JSX.Element {
                         />
                         <button
                           type="button"
-                          aria-label="Remove image"
+                          aria-label={`Remove ${imageLabel}`}
                           className="absolute right-1 top-1 rounded-full bg-background/80 p-1 text-foreground opacity-0 shadow transition-opacity hover:bg-background focus:opacity-100 group-hover:opacity-100"
                           onClick={() => void handleDeleteImage(image)}
                         >
                           <Trash2 className="h-4 w-4" />
                         </button>
                       </li>
-                    ))}
+                      );
+                    })}
                   </ul>
                 ) : null}
 
@@ -460,6 +469,7 @@ export default function CardEditor(): JSX.Element {
                     type="file"
                     accept="image/*"
                     multiple
+                    aria-label="Add images to this card"
                     className="hidden"
                     onChange={(e) => {
                       handleFilesSelected(e.target.files);

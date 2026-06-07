@@ -92,6 +92,13 @@ vi.mock("@/sync", () => ({
   stopSync: () => stopSync(),
 }));
 
+// M8: a sign-in-time hydrate/subscribe failure must surface (toast), not be
+// silently swallowed. Mock the toast so we can assert it fires.
+const toast = vi.fn();
+vi.mock("@/components/ui/use-toast", () => ({
+  toast: (...a: unknown[]) => toast(...a),
+}));
+
 // Import after the mock is registered so the context binds to the fake.
 import { clearFileToken } from "@/lib/pocketbase";
 
@@ -108,8 +115,10 @@ beforeEach(() => {
   fakeAuthStore.clear();
   authWithPassword.mockClear();
   clearFileTokenMock.mockClear();
-  startSync.mockClear();
+  startSync.mockReset();
+  startSync.mockImplementation(async () => {});
   stopSync.mockClear();
+  toast.mockClear();
 });
 
 describe("AuthProvider / useAuth", () => {
@@ -170,6 +179,44 @@ describe("AuthProvider / useAuth", () => {
       result.current.signOut();
     });
     await waitFor(() => expect(stopSync).toHaveBeenCalled());
+  });
+
+  it("surfaces a toast when sign-in-time sync (hydrate) fails (M8)", async () => {
+    // The realtime subscribe / initial hydrate rejects (e.g. server down right
+    // after sign-in). The live-query reads never "fail", so this bootstrap is
+    // the only place the error exists — it must not be swallowed.
+    startSync.mockRejectedValueOnce(new Error("network down"));
+
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.signIn("owner@posedeck.test", "changeme123");
+    });
+
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: "destructive" }),
+      ),
+    );
+    // The session is NOT cleared for a generic (non-401) failure — local data
+    // still renders; sync keeps retrying.
+    expect(result.current.isAuthenticated).toBe(true);
+  });
+
+  it("clears the session (no toast) when sign-in-time sync fails with a 401 (M8)", async () => {
+    startSync.mockRejectedValueOnce(new ClientResponseError({ status: 401 }));
+
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.signIn("owner@posedeck.test", "changeme123");
+    });
+
+    // A 401 routes back to login via clearAuthOnUnauthorized; no error toast.
+    await waitFor(() => expect(result.current.isAuthenticated).toBe(false));
+    expect(toast).not.toHaveBeenCalled();
   });
 
   it("reflects external store changes (e.g. cross-tab / token refresh)", async () => {

@@ -159,10 +159,11 @@ test.describe("M1 prep flow", () => {
     await expect(rows.nth(0)).toContainText("Card Alpha");
     await expect(rows.nth(2)).toContainText("Card Charlie");
 
-    // Drag the first card's grip handle down past the third row.
+    // Drag the first card's grip handle down past the third row. The handle is
+    // now named per-card ("Reorder <card title>") after the M8 a11y pass.
     const firstHandle = rows
       .nth(0)
-      .getByRole("button", { name: "Drag to reorder" });
+      .getByRole("button", { name: "Reorder Card Alpha" });
     const thirdRow = rows.nth(2);
 
     const handleBox = await firstHandle.boundingBox();

@@ -142,6 +142,7 @@ export default function DeckDetailPage(): React.JSX.Element {
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [creating, setCreating] = React.useState(false);
+  const [exporting, setExporting] = React.useState(false);
 
   // The card pending delete-confirmation (inline from the list), plus the
   // in-flight flag for that delete.
@@ -279,6 +280,38 @@ export default function DeckDetailPage(): React.JSX.Element {
     }
   }, [deck, navigate]);
 
+  // Export the deck to a downloaded PDF (M6). The heavy `@react-pdf/renderer`
+  // module is loaded ONLY here, via dynamic import, so it is code-split out of
+  // the initial app chunk (most sessions never export). `exportDeckPdf` reads
+  // from Dexie (local-first), so a pinned deck exports offline. A fail-soft
+  // resolver may drop unreachable images; we surface that count in the toast.
+  const handleExport = React.useCallback(async () => {
+    if (!deck) {
+      return;
+    }
+    setExporting(true);
+    try {
+      const { exportDeckPdf } = await import("@/features/export/exportDeckPdf");
+      const { droppedImages } = await exportDeckPdf(deck.id, { db });
+      toast({
+        title: "PDF exported",
+        description:
+          droppedImages > 0
+            ? `${droppedImages} ${droppedImages === 1 ? "image" : "images"} unavailable and omitted.`
+            : deck.name,
+      });
+    } catch (err) {
+      clearAuthOnUnauthorized(err);
+      toast({
+        variant: "destructive",
+        title: "Export failed",
+        description: "Couldn't export this deck. Please try again.",
+      });
+    } finally {
+      setExporting(false);
+    }
+  }, [deck]);
+
   const handleDelete = React.useCallback(async () => {
     if (!deck) {
       return;
@@ -410,6 +443,19 @@ export default function DeckDetailPage(): React.JSX.Element {
               <DropdownMenuItem onSelect={openRename}>Rename</DropdownMenuItem>
               <DropdownMenuItem onSelect={handleDuplicate} disabled={busy}>
                 Duplicate
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                aria-label="Export PDF"
+                data-testid="export-pdf"
+                onSelect={(e) => {
+                  // Keep the menu's default close behaviour but run the async
+                  // export off the event tick; `disabled` guards double-fire.
+                  e.preventDefault();
+                  void handleExport();
+                }}
+                disabled={exporting}
+              >
+                {exporting ? "Exporting…" : "Export as PDF"}
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem

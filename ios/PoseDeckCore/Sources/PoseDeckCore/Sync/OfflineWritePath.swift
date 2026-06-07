@@ -25,6 +25,12 @@ public struct OfflineWritePath: Sendable {
     private let now: @Sendable () -> Date
     private let newId: @Sendable () -> String
     private let encoder: JSONEncoder
+    /// Test-only fault injector invoked inside ``enqueue(_:entity:body:)`` just
+    /// before the entry is appended, so a test can simulate the (narrow but real)
+    /// case where an enqueue fails mid-loop — payload encode error or a persistent
+    /// outbox save error — and assert the mirror rolls back. Always `nil` in
+    /// production. `[CORR-2]`
+    private let enqueueFault: (@Sendable (_ cardId: String) async throws -> Void)?
 
     public init(
         store: any LocalStore,
@@ -37,6 +43,24 @@ public struct OfflineWritePath: Sendable {
         self.now = now
         self.newId = newId
         self.encoder = PocketBaseDate.makeEncoder()
+        self.enqueueFault = nil
+    }
+
+    /// Test-only initializer that wires a fault injector into the enqueue path.
+    /// `[CORR-2]`
+    init(
+        store: any LocalStore,
+        outbox: OutboxQueue,
+        now: @escaping @Sendable () -> Date,
+        newId: @escaping @Sendable () -> String,
+        enqueueFault: @escaping @Sendable (_ cardId: String) async throws -> Void
+    ) {
+        self.store = store
+        self.outbox = outbox
+        self.now = now
+        self.newId = newId
+        self.encoder = PocketBaseDate.makeEncoder()
+        self.enqueueFault = enqueueFault
     }
 
     // MARK: - Decks
@@ -201,25 +225,56 @@ public struct OfflineWritePath: Sendable {
     ///
     /// Returns the ids enqueued (the moved subset), so a caller that needs to
     /// re-derive a consistent restripe on a partial 4xx can do so.
+    ///
+    /// [CORR-2] Atomic over the mirror: every moved card's optimistic upsert is
+    /// paired with its outbox enqueue inside the loop, so a mid-loop throw (e.g.
+    /// an `enqueue` whose payload fails to encode or whose persistent save
+    /// errors) would otherwise leave the store in a neither-old-nor-new restripe
+    /// that a later `load()`/`refresh()` re-surfaces — the view-model's in-memory
+    /// revert (``CardRepository/restoredOrder``) does NOT undo the store. To keep
+    /// the local mirror all-or-nothing, we capture each card's original
+    /// `(position, clientUpdatedAt)` before mutating it; on a thrown error we
+    /// re-upsert the captured originals (in reverse order) before rethrowing, so
+    /// the store ends in the exact pre-reorder state.
     @discardableResult
     public func reorderCards(deckId: String, orderedIds: [String]) async throws -> [String] {
         let stamp = now()
         let stampString = PocketBaseDate.string(from: stamp)
         var enqueued: [String] = []
-        for (id, position) in CardRepository.computeReorderedPositions(orderedIds: orderedIds) {
-            guard let card = await store.card(id: id) else { continue }
-            if card.position == position { continue } // unmoved → skip
-            var moved = card
-            moved.position = position
-            moved.clientUpdatedAt = stamp
-            await store.upsertCard(moved)
-            let body = CardReorderWire(
-                id: id,
-                position: position,
-                client_updated_at: stampString
-            )
-            try await enqueue(.update, entity: "cards", body: body)
-            enqueued.append(id)
+        // Captured originals (newest-applied last) so a mid-loop failure can roll
+        // the mirror back to its exact pre-reorder state.
+        var applied: [Card] = []
+        do {
+            for (id, position) in CardRepository.computeReorderedPositions(orderedIds: orderedIds) {
+                guard let card = await store.card(id: id) else { continue }
+                if card.position == position { continue } // unmoved → skip
+                var moved = card
+                moved.position = position
+                moved.clientUpdatedAt = stamp
+                await store.upsertCard(moved)
+                applied.append(card) // capture the pre-mutation row for rollback
+                // [CORR-2] Test-only fault point: simulate an enqueue that fails
+                // *after* this card's optimistic store write landed.
+                try await enqueueFault?(id)
+                let body = CardReorderWire(
+                    id: id,
+                    position: position,
+                    client_updated_at: stampString
+                )
+                try await enqueue(.update, entity: "cards", body: body)
+                enqueued.append(id)
+            }
+        } catch {
+            // Roll the mirror back to the pre-reorder snapshot before rethrowing so
+            // the catch path's in-memory revert and the persisted store agree.
+            // restoreCard (not upsertCard) is required: each moved row in the store
+            // now carries a fresher reorder clock, so re-applying the older original
+            // through the LWW upsert would be rejected and the partial restripe would
+            // survive. Reverse order is immaterial (ids are distinct).
+            for original in applied.reversed() {
+                await store.restoreCard(original)
+            }
+            throw error
         }
         return enqueued
     }

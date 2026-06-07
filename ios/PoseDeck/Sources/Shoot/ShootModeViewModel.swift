@@ -94,6 +94,11 @@ final class ShootModeViewModel {
     /// Hydrate prior progress (done/skipped state) on load, seeding the session,
     /// then prefetch the current + next card images.
     func load() async {
+        // Re-arm the scheduler in case a prior disappear latched it (`onDisappear`
+        // → `cancelPendingWork()` → `scheduler.cancelAll()`). `load()` runs on
+        // every appear, so a reused view model instance can schedule work again
+        // instead of silently dropping all persists/prefetches.
+        scheduler.resume()
         let cardIds = cards.map(\.id)
         let prior = (try? await completionRepo.completions(forCardIds: cardIds, userId: userId)) ?? []
         // Only seed if the user hasn't already acted (no undo history) and we

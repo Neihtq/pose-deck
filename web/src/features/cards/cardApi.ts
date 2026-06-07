@@ -24,6 +24,21 @@ import type { Card, ISODateString } from "@/lib/types";
 /** Integer gap between adjacent card positions. */
 export const POSITION_GAP = 1000;
 
+/**
+ * Product cap for card titles: DESIGN.md §3.1 specifies "≤60 chars". The DB
+ * ceiling (ARCHITECTURE.md §3, max 200) is only headroom — the *product*
+ * constraint is 60. The CardEditor enforces this in the UI, but we also clamp
+ * here so any non-editor / programmatic caller of createCard/updateCard cannot
+ * persist a title that exceeds the product limit (defense-in-depth). Do NOT
+ * raise this to the DB max.
+ */
+export const TITLE_MAX = 60;
+
+/** Clamp a title to the product limit so no write path can exceed it. */
+function clampTitle(title: string): string {
+  return title.length > TITLE_MAX ? title.slice(0, TITLE_MAX) : title;
+}
+
 /** Current wall-clock time as an ISO 8601 string. */
 function nowIso(): ISODateString {
   return new Date().toISOString();
@@ -68,11 +83,12 @@ export async function createCard(
   const existing = (await db.cards.where("deck").equals(deckId).toArray())
     .filter((c) => c.deleted_at === "");
   const stamp = nowIso();
+  const title = clampTitle(fields.title);
   const card: Card = {
     id: newClientId(),
     deck: deckId,
     position: nextPosition(existing),
-    title: fields.title,
+    title,
     time_slot: fields.time_slot ?? "",
     subjects: fields.subjects ?? "",
     direction: fields.direction ?? "",
@@ -115,7 +131,7 @@ export async function updateCard(
   const patch: Partial<Card> & { client_updated_at: ISODateString } = {
     client_updated_at: stamp,
   };
-  if (fields.title !== undefined) patch.title = fields.title;
+  if (fields.title !== undefined) patch.title = clampTitle(fields.title);
   if (fields.time_slot !== undefined) patch.time_slot = fields.time_slot;
   if (fields.subjects !== undefined) patch.subjects = fields.subjects;
   if (fields.direction !== undefined) patch.direction = fields.direction;

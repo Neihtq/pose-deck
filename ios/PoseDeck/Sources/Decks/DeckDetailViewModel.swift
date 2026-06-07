@@ -33,6 +33,18 @@ final class DeckDetailViewModel {
     /// First-image display URL per card id (nil = none / not yet resolved).
     private(set) var thumbnailURLs: [String: URL] = [:]
 
+    /// Monotonic generation for `loadThumbnails()` passes (SWIFT-3). Bumped at the
+    /// start of each pass; a pass whose generation is no longer current when it
+    /// finishes is stale and discards its result. Also lets `loadThumbnails()`
+    /// detect a per-card `refreshThumbnail()` that landed *during* its in-flight
+    /// resolve (via `refreshedDuringLoad`) so the wholesale write-back doesn't
+    /// clobber the newer re-mint. `@MainActor` serializes all mutation of these.
+    private var thumbnailLoadGeneration = 0
+    /// Card ids whose thumbnail was re-minted by `refreshThumbnail()` since the
+    /// current `loadThumbnails()` pass began. Such entries must survive the pass's
+    /// write-back (their live URL is at least as fresh as the pass's own).
+    private var refreshedDuringLoad: Set<String> = []
+
     /// Current guests of this deck (M5 sharing), oldest grant first. Re-read on
     /// the ticker bump so a realtime grant/revoke reflects live in the share UI.
     private(set) var guests: [DeckGuest] = []
@@ -115,18 +127,50 @@ final class DeckDetailViewModel {
     /// URL. Best-effort: failures leave a card without a thumbnail rather than
     /// surfacing an error.
     private func loadThumbnails() async {
-        var resolved: [String: URL] = [:]
-        for card in cards {
-            do {
-                let images = try await imageRepo.listCardImages(cardId: card.id)
-                if let first = images.first {
-                    resolved[card.id] = try await imageRepo.fileURL(for: first)
-                }
-            } catch {
-                continue
-            }
+        // SWIFT-3: this pass resolves every card across many suspending `await`s
+        // (a mirror round-trip + a token mint per card). A newer `loadThumbnails`
+        // or a per-card `refreshThumbnail` re-mint can land in those gaps. Tag the
+        // pass with a generation and reset the "refreshed mid-pass" set so we can
+        // (a) discard a stale pass and (b) merge rather than clobber a re-mint.
+        thumbnailLoadGeneration &+= 1
+        let generation = thumbnailLoadGeneration
+        refreshedDuringLoad.removeAll()
+
+        // swift-mirror-image-network-per-read: fan the per-card resolve out
+        // CONCURRENTLY (one batch of round-trips, not N serialized ones) and let
+        // it bail on cancellation, matching the web reference's `Promise.all`.
+        // The earlier `for card in cards { await … }` loop paid N back-to-back
+        // network round-trips per refresh, and a refresh fires on every ticker
+        // bump / editor return. `imageRepo` is `@MainActor`, so each child task
+        // hops back to the main actor to touch it — the win is overlapping the
+        // network latency, not parallel CPU. `ThumbnailResolver` checks
+        // `Task.isCancelled`, so a pass superseded by a newer trigger (SwiftUI's
+        // `.task(id:)` cancels the prior one on a revision change) stops early
+        // instead of running every remaining round-trip to completion.
+        let cardIds = cards.map(\.id)
+        let imageRepo = imageRepo
+        let resolved = await ThumbnailResolver.resolveAll(ids: cardIds) { cardId in
+            guard let first = try? await imageRepo.listCardImages(cardId: cardId).first else { return nil }
+            return try? await imageRepo.fileURL(for: first)
         }
-        thumbnailURLs = resolved
+
+        // The pass was cancelled mid-flight (newer trigger / screen teardown) —
+        // discard the partial result rather than writing a half-resolved map.
+        guard !Task.isCancelled else { return }
+
+        // A newer pass started while we were suspended — discard ours so the older,
+        // slower resolve can't overwrite the newer one.
+        guard !ThumbnailMap.isStale(passGeneration: generation, current: thumbnailLoadGeneration) else { return }
+
+        // Merge: prune cards no longer present (keys absent from `resolved`) but
+        // preserve any per-card re-mint that landed during this pass, whose live
+        // URL is at least as fresh as the one this pass just resolved.
+        thumbnailURLs = ThumbnailMap.merge(
+            existing: thumbnailURLs,
+            resolved: resolved,
+            keep: refreshedDuringLoad
+        )
+        refreshedDuringLoad.removeAll()
     }
 
     /// Re-mint a single card's thumbnail URL after its `AsyncImage` failed to
@@ -142,6 +186,10 @@ final class DeckDetailViewModel {
             let fresh = try await imageRepo.fileURL(for: first)
             if ThumbnailRefresh.shouldApply(fresh: fresh, current: thumbnailURLs[card.id]) {
                 thumbnailURLs[card.id] = fresh
+                // Mark this card so an in-flight `loadThumbnails()` pass (SWIFT-3)
+                // preserves this newer re-mint instead of clobbering it on
+                // write-back. Harmless when no load pass is in flight.
+                refreshedDuringLoad.insert(card.id)
             }
         } catch {
             // Best-effort: a failed re-mint leaves the existing (broken)
@@ -274,12 +322,20 @@ final class DeckDetailViewModel {
         guard !trimmed.isEmpty else { return }
         do {
             let resolved = try await guestRepo.grantGuest(deckId: deck.id, email: trimmed)
-            // Pre-check duplicate locally (the server 400 is also handled as a
-            // no-op, but a local guard gives an immediate, friendly message).
-            if guests.contains(where: { $0.user == resolved.user && $0.id != resolved.id }) {
+            // Reload the mirror FIRST, then decide duplicate against the fresh
+            // list. The earlier order (check against `guests`, then reload) read a
+            // pre-grant snapshot: if a second grant for the same email is issued
+            // concurrently (the Share button and the field's `.onSubmit` can each
+            // spawn a Task), the second Task's synchronous check could run before
+            // the first's reload had folded its row into `guests`, observing a
+            // stale array and skipping the friendly message
+            // (`swift-grantGuest-dup-check-stale`). Reloading first makes the
+            // check see both rows. The server composite-unique 400 is also handled
+            // as an idempotent no-op, so this guard is UX-only either way.
+            await loadGuests()
+            if GuestGrant.isDuplicate(resolved: resolved, in: guests) {
                 actionError = "This deck is already shared with that user."
             }
-            await loadGuests()
         } catch DeckGuestRepositoringError.userNotFound {
             actionError = "No user with that email."
         } catch {

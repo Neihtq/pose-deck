@@ -112,6 +112,20 @@ public protocol LocalStore: Sendable {
     /// never soft-deleted them, so it would never re-deliver them with a fresh
     /// clock that could overturn the local hidden row).
     func unhideCard(id: String) async
+    /// Force-restore a card row to an exact prior snapshot, **bypassing LWW**
+    /// (`[CORR-2]`).
+    ///
+    /// Used solely to roll the local mirror back after a mid-loop reorder
+    /// failure. ``OfflineWritePath/reorderCards(deckId:orderedIds:)`` upserts each
+    /// moved card with a *fresh* `clientUpdatedAt` before its outbox enqueue; if an
+    /// enqueue throws partway through, the already-applied rows must be reverted to
+    /// their captured pre-reorder snapshot. A plain ``upsertCard(_:)`` cannot do
+    /// this — the moved row in the store now carries a newer clock, so re-applying
+    /// the (older) original loses the LWW comparison and the partial restripe
+    /// survives. This seam writes the snapshot verbatim (position *and* the
+    /// original `clientUpdatedAt`), so the mirror ends in the exact pre-drag state
+    /// the view-model's in-memory revert assumes. No-op if the row is absent.
+    func restoreCard(_ card: Card) async
 
     // Card images (no LWW; hard delete)
     func upsertCardImage(_ image: CardImage) async
@@ -207,6 +221,14 @@ public actor InMemoryLocalStore: LocalStore {
         guard var card = cards[id] else { return }
         card.deletedAt = nil
         cards[id] = card
+    }
+
+    public func restoreCard(_ card: Card) async {
+        // [CORR-2] LWW-bypassing rollback: write the captured snapshot verbatim so
+        // a partial reorder restripe is undone even though the in-store row now
+        // carries a newer clock than the original being restored. No-op if absent.
+        guard cards[card.id] != nil else { return }
+        cards[card.id] = card
     }
 
     public func cards(deckId: String) async -> [Card] {

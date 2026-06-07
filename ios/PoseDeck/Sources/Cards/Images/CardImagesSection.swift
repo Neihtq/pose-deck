@@ -218,7 +218,9 @@ struct CardImagesSection: View {
         ZStack(alignment: .topTrailing) {
             Group {
                 if let url = model.imageURLs[image.id] {
-                    AsyncImage(url: url) { phase in
+                    // Protected token-bearing URL — load via the non-persisting
+                    // session so private bytes don't land in URLCache.shared (SEC-IOS-B).
+                    ProtectedAsyncImage(url: url) { phase in
                         switch phase {
                         case .success(let img):
                             img.resizable().scaledToFill()

@@ -146,6 +146,58 @@ describe("<OfflineImage> (M3)", () => {
     );
   });
 
+  it("revokes the re-resolved pinned blob on unmount when a NETWORK <img> errors into the cache (no blob leak)", async () => {
+    // Initial resolve: a NETWORK url (release is a no-op). While viewing, the
+    // deck gets pinned, so the error-retry re-resolves into a CACHED blob whose
+    // release REVOKES an object URL. That release must be owned by the component
+    // so unmount revokes it — otherwise the object URL leaks.
+    const cachedRelease = vi.fn();
+    resolveImage
+      .mockResolvedValueOnce(handle("https://pb/file?token=stale", false))
+      .mockResolvedValueOnce(handle("blob:re-pinned", true, cachedRelease));
+
+    const { unmount } = render(<OfflineImage image={IMAGE} />);
+    const img = await findImg();
+    expect(img).toHaveAttribute("src", "https://pb/file?token=stale");
+
+    // The network <img> fails (expired token); retry resolves a pinned blob.
+    img.dispatchEvent(new Event("error"));
+    await waitFor(() =>
+      expect(document.querySelector("img")).toHaveAttribute(
+        "src",
+        "blob:re-pinned",
+      ),
+    );
+
+    // Unmount must revoke the now-live cached blob URL.
+    unmount();
+    expect(cachedRelease).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not setState or leak if a NETWORK <img> errors and re-resolves AFTER unmount", async () => {
+    const lateRelease = vi.fn();
+    let resolveRetry!: (h: ImageHandle) => void;
+    resolveImage
+      .mockResolvedValueOnce(handle("https://pb/file?token=stale", false))
+      .mockReturnValueOnce(
+        new Promise<ImageHandle>((res) => {
+          resolveRetry = res;
+        }),
+      );
+
+    const { unmount } = render(<OfflineImage image={IMAGE} />);
+    const img = await findImg();
+
+    // Kick off the retry, then unmount before it resolves.
+    img.dispatchEvent(new Event("error"));
+    unmount();
+
+    // The retry lands post-unmount: it must self-release (no leak) and must not
+    // setState on the dead component.
+    resolveRetry(handle("blob:late-pinned", true, lateRelease));
+    await waitFor(() => expect(lateRelease).toHaveBeenCalledTimes(1));
+  });
+
   it("revokes the cached object URL on unmount (no blob leak)", async () => {
     const release = vi.fn();
     resolveImage.mockResolvedValue(handle("blob:cached-1", true, release));

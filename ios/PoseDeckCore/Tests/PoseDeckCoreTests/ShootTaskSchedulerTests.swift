@@ -96,4 +96,51 @@ final class ShootTaskSchedulerTests: XCTestCase {
         XCTAssertEqual(scheduler.pendingPersistCount, 0)
         XCTAssertFalse(scheduler.hasPendingPrefetch)
     }
+
+    /// Regression for `swift-shoot-cancelAll-permanent`: `cancelAll()` must not
+    /// permanently latch the scheduler. After `resume()` (driven from the shoot
+    /// view model's `load()` on every appear), a reused session must be able to
+    /// schedule persist + prefetch work again — instead of silently dropping every
+    /// subsequent `done()`/`skip()`/`undo()` while the UI keeps mutating session
+    /// state. This models the SwiftUI footgun where `onDisappear` (→ `cancelAll()`)
+    /// fires without destroying the view's `@State` (tab switch / offscreen lazy
+    /// row), then the same view model instance reappears.
+    func testResumeReArmsAfterCancel() async {
+        let scheduler = ShootTaskScheduler()
+
+        // First "session": schedule, then disappear (cancelAll latches).
+        scheduler.cancelAll()
+        XCTAssertTrue(scheduler.isCancelled)
+
+        // Sanity: while latched, scheduling is a no-op (the bug's symptom).
+        var ranWhileLatched = false
+        scheduler.persist { ranWhileLatched = true }
+        for _ in 0..<5 { await Task.yield() }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+        XCTAssertFalse(ranWhileLatched, "scheduling while latched must remain a no-op")
+
+        // Reappear: load() re-arms the scheduler.
+        scheduler.resume()
+        XCTAssertFalse(scheduler.isCancelled)
+
+        // Now persist + prefetch must actually run again.
+        let persistRan = expectation(description: "persist ran after resume")
+        let prefetchRan = expectation(description: "prefetch ran after resume")
+        scheduler.persist { persistRan.fulfill() }
+        scheduler.coalesce { prefetchRan.fulfill() }
+        await fulfillment(of: [persistRan, prefetchRan], timeout: 2.0)
+    }
+
+    /// `resume()` is idempotent and harmless when the scheduler was never
+    /// cancelled (it runs on every `load()`, including the first appear).
+    func testResumeIsHarmlessWhenNotCancelled() async {
+        let scheduler = ShootTaskScheduler()
+        XCTAssertFalse(scheduler.isCancelled)
+        scheduler.resume()
+        XCTAssertFalse(scheduler.isCancelled)
+
+        let ran = expectation(description: "persist ran")
+        scheduler.persist { ran.fulfill() }
+        await fulfillment(of: [ran], timeout: 2.0)
+    }
 }

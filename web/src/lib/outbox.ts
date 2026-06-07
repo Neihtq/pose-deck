@@ -66,22 +66,31 @@ export async function enqueue(
 /**
  * The next entry eligible to send, or `undefined` if none.
  *
- * Eligible = lowest `id` among entries that are not `inflight` and whose
- * `next_attempt_at` has passed. Honors FIFO by `id`.
+ * Strict head-of-line: only the lowest-`id` non-`inflight` entry (the FIFO
+ * head) is ever considered. It is returned only if its `next_attempt_at` has
+ * passed; if the head is backed off into the future, the WHOLE queue blocks
+ * behind it (return `undefined`) rather than skipping ahead to a later
+ * eligible entry. Skipping the backed-off head would let a dependent
+ * successor (e.g. a card create) be sent before the entry it depends on (e.g.
+ * its parent deck create), violating the ordering the drain loop relies on
+ * (`syncEngine.ts`) and risking silent data loss (CORR-1).
+ *
+ * `inflight` rows are excluded because they are mid-send in this runtime; an
+ * orphaned `inflight` row from a dead runtime is re-armed to `pending` by
+ * `requeueInflight` at engine start, so it cannot wedge the head permanently.
  */
 export async function peekFifo(
   db: PoseDeckDB,
   now: () => number = () => Date.now(),
 ): Promise<OutboxEntry | undefined> {
   const nowMs = now();
-  // Scan in id order and return the first eligible entry. The queue is small
-  // (pending user mutations), so an ordered scan is cheaper than maintaining a
-  // compound index, and it keeps strict head-of-line FIFO semantics.
+  // Scan in id order. The queue is small (pending user mutations), so an
+  // ordered scan is cheaper than maintaining a compound index.
   const ordered = await db.outbox.orderBy("id").toArray();
-  return ordered.find(
-    (e) =>
-      e.status !== "inflight" && (e.next_attempt_at ?? 0) <= nowMs,
-  );
+  // Take ONLY the FIFO head (lowest-id non-inflight entry) and return it only
+  // if it is eligible — never skip past a backed-off head.
+  const head = ordered.find((e) => e.status !== "inflight");
+  return head && (head.next_attempt_at ?? 0) <= nowMs ? head : undefined;
 }
 
 /** All pending entries in FIFO order (oldest id first). */

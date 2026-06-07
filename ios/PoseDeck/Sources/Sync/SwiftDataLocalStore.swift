@@ -113,6 +113,19 @@ actor SwiftDataLocalStore: LocalStore {
         try? context.save()
     }
 
+    func restoreCard(_ card: Card) async {
+        // [CORR-2] LWW-bypassing rollback for a failed reorder: re-apply the
+        // captured pre-reorder snapshot (position + original client_updated_at)
+        // verbatim. A plain upsertCard would lose LWW because the in-store row
+        // already carries the fresher reorder clock. No-op if the row is absent.
+        let id = card.id
+        guard let existing = try? context.fetch(
+            FetchDescriptor<LocalCard>(predicate: #Predicate { $0.id == id })
+        ).first else { return }
+        existing.apply(card)
+        try? context.save()
+    }
+
     func cards(deckId: String) async -> [Card] {
         let descriptor = FetchDescriptor<LocalCard>(
             predicate: #Predicate { $0.deck == deckId },

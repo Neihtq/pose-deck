@@ -81,4 +81,17 @@ public final class ShootTaskScheduler {
         for task in persistTasks.values { task.cancel() }
         persistTasks.removeAll()
     }
+
+    /// Re-arm the scheduler after a prior ``cancelAll()`` so a reused session can
+    /// schedule work again. Without this the ``isCancelled`` latch is permanent:
+    /// a view model whose view disappears (which calls ``cancelAll()``) and then
+    /// reappears on the *same* instance — possible under tab switches or offscreen
+    /// lazy rows, where SwiftUI fires `onDisappear` without destroying the view's
+    /// `@State` — would silently drop every subsequent persist + prefetch while
+    /// the UI keeps mutating the session. Driven from the shoot view model's
+    /// `load()`, which runs on every appear. Idempotent and safe to call when not
+    /// cancelled. Does not resurrect already-cancelled tasks; only future work.
+    public func resume() {
+        isCancelled = false
+    }
 }

@@ -288,7 +288,8 @@ struct CardRowView: View {
         let size: CGFloat = 52
         Group {
             if let thumbnailURL {
-                AsyncImage(url: thumbnailURL) { phase in
+                // Protected token-bearing URL — non-persisting session (SEC-IOS-B).
+                ProtectedAsyncImage(url: thumbnailURL) { phase in
                     switch phase {
                     case .success(let image):
                         image.resizable().scaledToFill()

@@ -10,6 +10,7 @@ vi.mock("@/sync", () => ({ wakeSync: vi.fn() }));
 
 import {
   POSITION_GAP,
+  TITLE_MAX,
   computeReorderedPositions,
   createCard,
   nextPosition,
@@ -106,6 +107,30 @@ describe("createCard (local-first)", () => {
     // Max live position is 1000, so the next is 2000 (the trashed 9000 ignored).
     expect(card.position).toBe(2000);
   });
+
+  // SPEC-1 regression: the 60-char product title cap (DESIGN.md §3.1) must be
+  // enforced in the data layer, not only in the CardEditor UI, so no
+  // programmatic caller can persist a >60-char title (the DB ceiling is 200).
+  it("clamps a >60-char title to the product limit on both the row and the outbox", async () => {
+    const longTitle = "x".repeat(TITLE_MAX + 40); // 100 chars, under DB max 200
+
+    const card = await createCard("deck1", { title: longTitle });
+
+    expect(TITLE_MAX).toBe(60);
+    expect(card.title).toHaveLength(TITLE_MAX);
+    const stored = await db.cards.get(card.id);
+    expect(stored?.title).toHaveLength(TITLE_MAX);
+
+    const entries = await db.outbox.where("recordId").equals(card.id).toArray();
+    const payload = decodeOutboxPayload<{ title: string }>(entries[0]);
+    expect(payload.title).toHaveLength(TITLE_MAX);
+  });
+
+  it("leaves a title at exactly 60 chars untouched", async () => {
+    const exact = "y".repeat(TITLE_MAX);
+    const card = await createCard("deck1", { title: exact });
+    expect(card.title).toBe(exact);
+  });
 });
 
 describe("updateCard (local-first)", () => {
@@ -125,6 +150,21 @@ describe("updateCard (local-first)", () => {
     expect(payload.title).toBe("Renamed");
     // Untouched fields are not in the patch.
     expect("notes" in payload).toBe(false);
+  });
+
+  // SPEC-1 regression: updateCard must also clamp the title to the product cap.
+  it("clamps a >60-char title on update for both the row and the outbox", async () => {
+    await db.cards.put(makeCard("c1", 1000));
+    const longTitle = "z".repeat(TITLE_MAX + 40);
+
+    await updateCard("c1", { title: longTitle });
+
+    const stored = await db.cards.get("c1");
+    expect(stored?.title).toHaveLength(TITLE_MAX);
+
+    const entries = await db.outbox.where("recordId").equals("c1").toArray();
+    const payload = decodeOutboxPayload<{ title: string }>(entries[0]);
+    expect(payload.title).toHaveLength(TITLE_MAX);
   });
 });
 

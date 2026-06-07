@@ -192,4 +192,32 @@ final class ShootSessionTests: XCTestCase {
         XCTAssertEqual(s.currentCardId, "a")
         XCTAssertFalse(s.isComplete)
     }
+
+    // MARK: - [FIX-CORR-1] done card ahead of the cursor must not inflate N
+
+    /// Regression for CORR-1: on a hydrated session the working order keeps done
+    /// cards in position order (they are not relocated), so a done card can sit
+    /// *ahead* of the cursor. Such a card has not been passed yet and must not
+    /// count toward "Card N of M". The first card shown must read "Card 1 of M",
+    /// never higher.
+    func testProgressDoesNotCountDoneCardsAheadOfCursor() {
+        // workingOrder = ["a","b","c"], "b" done but ahead of the cursor; current
+        // is "a" at index 0. Before the fix this reported position 2 (0 + done
+        // count 1 + 1).
+        let s = ShootSession(cardIds: ["a", "b", "c"], doneIds: ["b"], skippedActiveIds: [])
+        XCTAssertEqual(s.currentCardId, "a", "cursor sits on the first not-yet-done card")
+        XCTAssertEqual(s.progress.position, 1, "the first card shown is Card 1, not inflated by the done card ahead of it")
+        XCTAssertEqual(s.progress.total, 3)
+    }
+
+    /// Once the cursor advances past the done-ahead card, N counts it (it is now
+    /// behind the cursor): position tracks cursor depth monotonically.
+    func testProgressAdvancesPastDoneAheadCard() {
+        var s = ShootSession(cardIds: ["a", "b", "c"], doneIds: ["b"], skippedActiveIds: [])
+        XCTAssertEqual(s.progress.position, 1)
+        s.markDone()                       // done "a" → cursor skips done "b" → current "c"
+        XCTAssertEqual(s.currentCardId, "c", "cursor skips the already-done card ahead")
+        XCTAssertEqual(s.progress.position, 3, "both 'a' (just done) and 'b' (done, now behind) are passed")
+        XCTAssertEqual(s.progress.total, 3)
+    }
 }

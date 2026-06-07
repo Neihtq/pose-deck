@@ -97,7 +97,8 @@ struct ShootModeView: View {
     @ViewBuilder
     private var cardImage: some View {
         if let url = model.currentImageURL {
-            AsyncImage(url: url) { phase in
+            // Protected token-bearing URL — non-persisting session (SEC-IOS-B).
+            ProtectedAsyncImage(url: url) { phase in
                 switch phase {
                 case .success(let image): image.resizable().scaledToFit()
                 case .failure: imagePlaceholder
@@ -251,7 +252,8 @@ private struct CardDetailSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let imageURL {
-                        AsyncImage(url: imageURL) { phase in
+                        // Protected token-bearing URL — non-persisting session (SEC-IOS-B).
+                        ProtectedAsyncImage(url: imageURL) { phase in
                             if case .success(let image) = phase {
                                 image.resizable().scaledToFit()
                             } else {

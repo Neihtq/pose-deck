@@ -108,22 +108,29 @@ public struct ShootSession: Sendable, Equatable {
 
     /// Progress for the "Card N of M" indicator (DESIGN.md §4.2).
     ///
-    /// `[FIX-M2a]` **cursor-position model** (test-pinned): `position` counts the
-    /// cards already acted-on or currently in front of you — i.e. done cards plus
-    /// the count of not-yet-done cards ahead of the current one — so a **skip
-    /// advances N** (you have moved forward in the deck even though the card
+    /// `[FIX-M2a]` **cursor-position model** (test-pinned): `position` counts how
+    /// far through the deck the current card sits — every card at-or-before the
+    /// cursor (done *or* skipped-ahead survivor) plus 1 for the current card — so a
+    /// **skip advances N** (you have moved forward in the deck even though the card
     /// returns later). `total` = `workingOrder.count`. When complete, `position`
     /// equals `total`.
+    ///
+    /// `[FIX-CORR-1]`: count only done cards **at-or-before the cursor**, not all
+    /// done cards. A done card sitting *ahead* of the cursor (the normal hydrated
+    /// shape from `init(cardIds:doneIds:…)`, which leaves done cards in position
+    /// order) has not been passed yet, so it must not inflate N. Previously the
+    /// first card of a hydrated session with a later done card could read e.g.
+    /// "Card 2 of 3", reporting progress past the card actually shown.
     public var progress: (position: Int, total: Int) {
         let total = workingOrder.count
         guard let current = currentCardId,
               let currentIdx = workingOrder.firstIndex(of: current) else {
             return (total, total)
         }
-        // Non-done cards strictly before the cursor (skipped-ahead survivors) +
-        // all done cards + 1 for the current card.
-        let nonDoneBefore = workingOrder[0..<currentIdx].filter { !doneIds.contains($0) }.count
-        let position = nonDoneBefore + doneIds.count + 1
+        // Every card strictly before the cursor has been passed (it is either done
+        // or a skipped-ahead survivor), so count them all + 1 for the current card.
+        // Done cards positioned *after* the cursor are not yet reached.
+        let position = currentIdx + 1
         return (position, total)
     }
 

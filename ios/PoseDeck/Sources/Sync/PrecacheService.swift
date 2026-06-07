@@ -23,13 +23,22 @@ actor PrecacheService {
     /// Downloads bytes for a resolved file URL. Injectable for tests.
     private let download: @Sendable (URL) async throws -> Data
 
+    /// A dedicated, non-persisting session for protected `card_images` fetches.
+    /// Holding it for the service's lifetime keeps the download closure backed by
+    /// one session rather than spinning up a new one per image.
+    private static let protectedSession = ProtectedImageSession.make()
+
     init(
         container: ModelContainer,
         deckRepo: DeckRepository,
         cardRepo: CardRepository,
         imageRepo: ImageRepository,
+        // Default fetches protected token-bearing image URLs through a dedicated
+        // ephemeral/no-cache session (SEC-IOS-B) so decrypted private bytes are
+        // never written to the process-global `URLCache.shared` on-disk store —
+        // never relying on a sign-out-time purge to avoid cross-user remanence.
         download: @escaping @Sendable (URL) async throws -> Data = { url in
-            try await URLSession.shared.data(from: url).0
+            try await PrecacheService.protectedSession.data(from: url).0
         }
     ) {
         self.container = container

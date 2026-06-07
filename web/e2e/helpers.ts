@@ -9,6 +9,8 @@ import { expect, type Page } from "@playwright/test";
  */
 export const OWNER_EMAIL = process.env.E2E_EMAIL ?? "owner@posedeck.test";
 export const OWNER_PASSWORD = process.env.E2E_PASSWORD ?? "changeme123";
+export const GUEST_EMAIL = process.env.E2E_GUEST_EMAIL ?? "guest@posedeck.test";
+export const GUEST_PASSWORD = process.env.E2E_GUEST_PASSWORD ?? "changeme123";
 
 /** Generate a unique deck name so parallel/repeat runs never collide. */
 export function uniqueDeckName(prefix = "E2E Deck"): string {
@@ -19,16 +21,74 @@ export function uniqueDeckName(prefix = "E2E Deck"): string {
  * Sign in via the real /login form and wait until the deck list ("Decks")
  * is shown. Asserts on the way so a backend/auth misconfiguration fails loud.
  */
-export async function signIn(page: Page): Promise<void> {
+export async function signIn(
+  page: Page,
+  email: string = OWNER_EMAIL,
+  password: string = OWNER_PASSWORD,
+): Promise<void> {
   await page.goto("/login");
-  await page.getByLabel("Email").fill(OWNER_EMAIL);
-  await page.getByLabel("Password").fill(OWNER_PASSWORD);
+  await page.getByLabel("Email").fill(email);
+  await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
 
   // RequireAuth redirects to "/" → DeckListPage renders an <h1>Decks</h1>.
   await expect(
     page.getByRole("heading", { name: "Decks", level: 1 }),
   ).toBeVisible();
+}
+
+/** Sign in as the seed guest account (guest@posedeck.test). */
+export async function signInAsGuest(page: Page): Promise<void> {
+  await signIn(page, GUEST_EMAIL, GUEST_PASSWORD);
+}
+
+/**
+ * Poll for a condition by reloading the page between checks.
+ *
+ * Cross-user propagation (an owner's grant/revoke reaching the guest's client)
+ * arrives via realtime push OR via the post-reload `hydrateFromServer`. Relying
+ * on the realtime socket alone is timing-flaky on a shared live backend, so we
+ * reload and re-check: each reload re-hydrates the guest's deck list from the
+ * server, making "guest eventually sees X" deterministic without depending on
+ * socket delivery latency. `check` should return true once the desired state is
+ * observed on the freshly loaded page.
+ */
+export async function pollWithReload(
+  page: Page,
+  check: () => Promise<boolean>,
+  opts: { timeout?: number; reloadEvery?: number; interval?: number } = {},
+): Promise<void> {
+  const timeout = opts.timeout ?? 30_000;
+  // How long to keep polling AFTER each reload before reloading again. The
+  // guest's post-reload `hydrateFromServer` is async (subscribe → getFullList
+  // per entity → merge into Dexie → the live query re-renders), so the desired
+  // state only appears a few hundred ms AFTER the "Decks" heading mounts.
+  // Checking once immediately after reload — then reloading again — would wipe
+  // the just-hydrated Dexie state before the live query ever rendered it, so we
+  // poll within each reload window instead.
+  const reloadEvery = opts.reloadEvery ?? 3_000;
+  const interval = opts.interval ?? 250;
+  const deadline = Date.now() + timeout;
+  // First check without a reload (the state may already be present).
+  if (await check()) {
+    return;
+  }
+  while (Date.now() < deadline) {
+    await page.reload();
+    await expect(
+      page.getByRole("heading", { name: "Decks", level: 1 }),
+    ).toBeVisible();
+    // Poll for up to `reloadEvery` ms after this reload, giving the async
+    // re-hydrate time to land before we reload (and wipe Dexie) again.
+    const windowEnd = Math.min(Date.now() + reloadEvery, deadline);
+    while (Date.now() < windowEnd) {
+      if (await check()) {
+        return;
+      }
+      await page.waitForTimeout(interval);
+    }
+  }
+  throw new Error(`pollWithReload: condition not met within ${timeout}ms`);
 }
 
 /**

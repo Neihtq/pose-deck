@@ -58,6 +58,35 @@ describe("outbox enqueue + FIFO", () => {
     expect(next?.recordId).toBe("d2");
   });
 
+  it("blocks the whole queue behind a backed-off head (strict head-of-line, CORR-1)", async () => {
+    // Head: a deck create. Successor: a card create that depends on it
+    // (payload.deck points at the head's record).
+    const headId = await enqueue(db, {
+      type: "create",
+      entity: "decks",
+      recordId: "deck1",
+      payload: {},
+    });
+    await enqueue(db, {
+      type: "create",
+      entity: "cards",
+      recordId: "card1",
+      payload: { deck: "deck1" },
+    });
+
+    // The head is transiently failed and backed off into the future, while the
+    // successor stays eligible (default next_attempt_at = 0).
+    await db.outbox.update(headId, { next_attempt_at: 10_000 });
+
+    // BEFORE-fix behavior was to skip the head and return the eligible
+    // successor (card1) — breaking ordering and risking silent data loss. The
+    // queue must instead block: peekFifo returns undefined, never card1.
+    expect(await peekFifo(db, () => 5_000)).toBeUndefined();
+
+    // Once the head's backoff elapses, it (the deck create) is sent first.
+    expect((await peekFifo(db, () => 20_000))?.recordId).toBe("deck1");
+  });
+
   it("peekFifo honors next_attempt_at backoff", async () => {
     const id = await enqueue(db, {
       type: "create",

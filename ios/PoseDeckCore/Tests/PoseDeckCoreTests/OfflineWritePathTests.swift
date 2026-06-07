@@ -235,6 +235,66 @@ final class OfflineWritePathTests: XCTestCase {
         XCTAssertTrue(pending.isEmpty)
     }
 
+    /// Regression (CORR-2): a mid-loop enqueue failure must leave the local
+    /// mirror in the EXACT pre-reorder order, not a neither-old-nor-new partial
+    /// restripe. `OfflineWritePath.reorderCards` upserts each moved card's new
+    /// position into the store *before* its outbox enqueue; the view-model's
+    /// catch path only reverts the in-memory `cards` array
+    /// (`CardRepository.restoredOrder`) and never touches the store, so without
+    /// an atomic rollback here a partial store write survives and a later
+    /// `load()`/`refresh()` (which reads the store sorted by position)
+    /// re-surfaces the corrupted order. This drives a failure on the 2nd moved
+    /// card and asserts (a) the call rethrows, (b) every card's stored position
+    /// AND `clientUpdatedAt` are back to their pre-drag values, and (c) the
+    /// store sorted by position yields the original ordering.
+    func testReorderRollsBackMirrorOnMidLoopEnqueueFailure() async throws {
+        let store = InMemoryLocalStore()
+        let originalStamp = fixedNow.addingTimeInterval(-3600)
+        // a@1000, b@2000, c@3000
+        await store.upsertCard(Card(id: "a", deck: "d", position: 1000, title: "a", clientUpdatedAt: originalStamp))
+        await store.upsertCard(Card(id: "b", deck: "d", position: 2000, title: "b", clientUpdatedAt: originalStamp))
+        await store.upsertCard(Card(id: "c", deck: "d", position: 3000, title: "c", clientUpdatedAt: originalStamp))
+        let outbox = InMemoryOutbox()
+
+        // Fail on the SECOND card the loop tries to enqueue, so at least one card
+        // (the first) has already had its new position written to the store —
+        // exactly the partial-restripe window CORR-2 describes.
+        let failCounter = Counter()
+        struct InjectedEnqueueError: Error {}
+        let now = fixedNow
+        let path = OfflineWritePath(
+            store: store,
+            outbox: outbox,
+            now: { now },
+            newId: { "unused" },
+            enqueueFault: { _ in
+                if failCounter.bump() == 2 { throw InjectedEnqueueError() }
+            }
+        )
+
+        // New order c,a,b → all three cards move, so the loop reaches a 2nd card.
+        do {
+            _ = try await path.reorderCards(deckId: "d", orderedIds: ["c", "a", "b"])
+            XCTFail("reorderCards should rethrow the injected enqueue failure")
+        } catch is InjectedEnqueueError {
+            // expected
+        }
+
+        // The mirror is back in the exact pre-reorder state: positions AND the
+        // LWW clock are untouched for every card (no half-applied restripe, no
+        // bumped client_updated_at on the one card that was optimistically moved).
+        for (id, pos) in [("a", 1000), ("b", 2000), ("c", 3000)] {
+            let card = await store.card(id: id)
+            XCTAssertEqual(card?.position, pos, "\(id) position rolled back to pre-reorder")
+            XCTAssertEqual(card?.clientUpdatedAt, originalStamp, "\(id) LWW clock not bumped by the failed reorder")
+        }
+
+        // listCards (store sorted by position) yields the original order — a
+        // later load()/refresh() will NOT re-surface a corrupted ordering.
+        let stored = await store.cards(deckId: "d")
+        XCTAssertEqual(stored.map(\.id), ["a", "b", "c"], "mirror order is the pre-drag order")
+    }
+
     func testDeleteCardImageHardRemovesAndEnqueuesDelete() async throws {
         let store = InMemoryLocalStore()
         let img = CardImage(id: "i1", card: "c", position: 1, file: "x.jpg")
@@ -263,6 +323,18 @@ final class OfflineWritePathTests: XCTestCase {
         let pending = await outbox.pending()
         XCTAssertEqual(pending.first?.type, .delete)
         XCTAssertEqual(pending.first?.entity, "deck_guests")
+    }
+}
+
+/// Thread-safe monotonic counter for fault-injection tests (returns the
+/// post-increment count, i.e. first call returns 1).
+final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func bump() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        value += 1
+        return value
     }
 }
 

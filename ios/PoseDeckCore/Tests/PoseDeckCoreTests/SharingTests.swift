@@ -252,6 +252,63 @@ final class SharingTests: XCTestCase {
         XCTAssertNil(resolved, "no foreign row → nil (self-share / unknown email)")
     }
 
+    // MARK: - swift-grantGuest-dup-check-stale: GuestGrant.isDuplicate decision
+
+    func testIsDuplicateTrueWhenPriorGrantForSameUserExists() {
+        // A prior grant for the same user (different id) is in the mirror →
+        // duplicate. This is the case the friendly "already shared" message
+        // covers. Each real grant mints a fresh id (OfflineWritePath), so two
+        // rows for the same user differ only by id.
+        let prior = DeckGuest(id: "g-old", deck: "deck1", user: "userB", grantedAt: fixedNow)
+        let resolved = DeckGuest(id: "g-new", deck: "deck1", user: "userB", grantedAt: fixedNow)
+        XCTAssertTrue(
+            GuestGrant.isDuplicate(resolved: resolved, in: [prior, resolved]),
+            "a prior grant for the same user (different id) is a duplicate"
+        )
+    }
+
+    func testIsDuplicateFalseWhenOnlyTheJustWrittenRowIsPresent() {
+        // First-ever grant: the only row for this user is the one we just wrote,
+        // excluded by id → not a duplicate (the grant should succeed quietly).
+        let resolved = DeckGuest(id: "g-new", deck: "deck1", user: "userB", grantedAt: fixedNow)
+        XCTAssertFalse(
+            GuestGrant.isDuplicate(resolved: resolved, in: [resolved]),
+            "the just-written row alone is not a duplicate of itself"
+        )
+    }
+
+    func testIsDuplicateFalseForADifferentUser() {
+        let other = DeckGuest(id: "g-other", deck: "deck1", user: "userC", grantedAt: fixedNow)
+        let resolved = DeckGuest(id: "g-new", deck: "deck1", user: "userB", grantedAt: fixedNow)
+        XCTAssertFalse(
+            GuestGrant.isDuplicate(resolved: resolved, in: [other, resolved]),
+            "a grant for a different user is not a duplicate"
+        )
+    }
+
+    func testIsDuplicateFalseAgainstStalePreGrantSnapshotIsTheBug() {
+        // ROOT CAUSE of swift-grantGuest-dup-check-stale: the OLD code checked the
+        // duplicate against `guests` BEFORE reloading the mirror. Under a
+        // concurrent double-grant, that snapshot can lack the first grant's row,
+        // so the check misses the duplicate. Modeled here: the resolved row is a
+        // duplicate, but a stale snapshot that omits the prior row returns false —
+        // exactly why the fix reloads the mirror FIRST and then decides against
+        // the fresh list (which DOES contain the prior row, asserted above).
+        let resolved = DeckGuest(id: "g-new", deck: "deck1", user: "userB", grantedAt: fixedNow)
+        let stalePreGrantSnapshot: [DeckGuest] = []  // prior grant not yet folded in
+        XCTAssertFalse(
+            GuestGrant.isDuplicate(resolved: resolved, in: stalePreGrantSnapshot),
+            "a stale pre-grant snapshot misses the duplicate — the fix must decide against a reloaded mirror"
+        )
+        // The fresh mirror (post-reload) contains BOTH the prior and just-written
+        // rows, so the same decision now correctly fires.
+        let prior = DeckGuest(id: "g-old", deck: "deck1", user: "userB", grantedAt: fixedNow)
+        XCTAssertTrue(
+            GuestGrant.isDuplicate(resolved: resolved, in: [prior, resolved]),
+            "deciding against the reloaded mirror correctly detects the duplicate"
+        )
+    }
+
     func testGuestDeleteWithAbsentDeckIsNoOp() async {
         let store = InMemoryLocalStore()
         await store.upsertDeckGuest(DeckGuest(id: "g1", deck: "deckGone", user: "me", grantedAt: Date()))

@@ -2,11 +2,19 @@
  * Typed PocketBase client wrapper.
  *
  * Wraps the official `pocketbase` JS SDK. Reads the backend base URL from
- * `VITE_API_BASE_URL` (see ARCHITECTURE.md §12 / .env). Auth tokens are
- * persisted by the SDK's default `LocalAuthStore` (localStorage) so sessions
- * survive reloads; auto-refresh on 401 is wired up in M1 auth work.
+ * `VITE_API_BASE_URL` (see ARCHITECTURE.md §12 / .env).
+ *
+ * Auth-token storage (SEC-OBS-2): the SDK default `LocalAuthStore` persists the
+ * session JWT in `localStorage`, where it lives indefinitely and is readable by
+ * any script — so a single XSS can exfiltrate the highest-value secret in the
+ * app. We instead back the store with `sessionStorage` (see
+ * {@link createSessionAuthStore}). The token still survives reloads within the
+ * tab (the documented UX), but it is scoped to the tab's lifetime: it is dropped
+ * when the tab/browser closes, narrowing the XSS exfiltration window and
+ * removing the durable on-disk copy. Auto-refresh on 401 is wired up in M1 auth
+ * work. This is defense-in-depth, not a substitute for output escaping / CSP.
  */
-import PocketBase from "pocketbase";
+import PocketBase, { AsyncAuthStore } from "pocketbase";
 import type { RecordService } from "pocketbase";
 
 import type {
@@ -40,11 +48,46 @@ export interface TypedPocketBase extends PocketBase {
   collection(idOrName: string): RecordService;
 }
 
+/**
+ * sessionStorage key holding the serialized PocketBase auth payload. Distinct
+ * from the SDK's default `pocketbase_auth` localStorage key so a stale token
+ * from an older build can't leak in.
+ */
+export const AUTH_STORAGE_KEY = "pose-deck-auth";
+
+/**
+ * Build an {@link AsyncAuthStore} backed by `sessionStorage` instead of the
+ * SDK default `localStorage`. The token is read back synchronously on
+ * construction (so it survives reloads within the tab) but never written to the
+ * durable `localStorage`, keeping the JWT out of the longest-lived,
+ * always-readable browser store. See SEC-OBS-2 / ARCHITECTURE.md.
+ *
+ * Falls back to an in-memory-only store when `sessionStorage` is unavailable
+ * (SSR / privacy modes), so the client still works without persistence.
+ */
+export function createSessionAuthStore(): AsyncAuthStore {
+  const storage: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null =
+    typeof globalThis !== "undefined" &&
+    typeof globalThis.sessionStorage !== "undefined"
+      ? globalThis.sessionStorage
+      : null;
+
+  return new AsyncAuthStore({
+    save: async (serialized) => {
+      storage?.setItem(AUTH_STORAGE_KEY, serialized);
+    },
+    clear: async () => {
+      storage?.removeItem(AUTH_STORAGE_KEY);
+    },
+    initial: storage?.getItem(AUTH_STORAGE_KEY) ?? undefined,
+  });
+}
+
 /** Create a new typed PocketBase client pointed at the given base URL. */
 export function createPocketBase(
   baseUrl: string = resolveApiBaseUrl(),
 ): TypedPocketBase {
-  return new PocketBase(baseUrl) as TypedPocketBase;
+  return new PocketBase(baseUrl, createSessionAuthStore()) as TypedPocketBase;
 }
 
 /** Shared singleton client for the app. */

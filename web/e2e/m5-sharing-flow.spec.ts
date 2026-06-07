@@ -1,26 +1,35 @@
 import { expect, test } from "@playwright/test";
 
-import { createDeck, signIn, waitForOutboxDrained } from "./helpers";
+import {
+  GUEST_EMAIL,
+  createDeck,
+  pollWithReload,
+  signIn,
+  signInAsGuest,
+  waitForOutboxDrained,
+} from "./helpers";
 
 /**
- * E2E for M5 sharing (owner side).
+ * E2E for M5 sharing.
  *
  * Drives the real app against the live dev backend (POSEDECK_DEV=true so the
- * seed `guest@posedeck.test` exists). Covers the owner-side share/revoke flow,
- * which is single-context and deterministic:
- *   sign in → create deck → Share → grant guest by email → see guest row →
- *   revoke → row disappears.
+ * seed `guest@posedeck.test` exists). Covers:
  *
- * The cross-user "guest sees the shared deck appear live in a SECOND context,
- * then it disappears on revoke" check is scaffolded but SKIPPED: it needs a
- * second authenticated browser context for the guest plus realtime-delivery
- * timing, which is flaky against a shared live backend. The realtime grant-
- * resync / revoke-evict behaviour it would exercise is covered deterministically
- * by the realtimeManager unit tests (FIX #1/#2/#7-web) and by the live-PB
- * integration suite (owner grant → guest reads deck → revoke → guest 404).
+ *  1. owner side (single context): sign in → create deck → Share → grant guest
+ *     by email → see guest row → revoke → row disappears.
+ *  2. cross-user (two contexts): owner grants the guest → guest sees the shared
+ *     deck appear in their list and can open it read-only (no owner affordances)
+ *     → owner revokes → the deck disappears from the guest's list and the open
+ *     detail view shows "Deck not found.".
+ *
+ * The cross-user test uses two independent browser contexts (separate Dexie /
+ * auth / IndexedDB) for the owner and the guest. Propagation to the guest is
+ * asserted via `pollWithReload` (reload → re-hydrate from server) rather than
+ * by waiting on the realtime socket, which is timing-flaky on a shared live
+ * backend. The realtime *push* path (grant-resync / revoke-evict without a
+ * reload) is covered deterministically by the realtimeManager unit tests
+ * (FIX #1/#2/#7-web) and the live-PB integration suite.
  */
-
-const GUEST_EMAIL = process.env.E2E_GUEST_EMAIL ?? "guest@posedeck.test";
 
 test("owner shares a deck by email and can revoke it", async ({ page }) => {
   await signIn(page);
@@ -49,15 +58,92 @@ test("owner shares a deck by email and can revoke it", async ({ page }) => {
   await waitForOutboxDrained(page);
 });
 
-// SKIP (see file docstring): two-context guest-sees-it-live flow is flaky on a
-// shared live backend; the underlying realtime behaviour is covered by unit +
-// integration layers.
-test.skip("guest sees a shared deck appear live, then disappear on revoke", async () => {
-  // Scaffold:
-  //  1. owner context: sign in, create deck, grant guest by email.
-  //  2. guest context: sign in as guest@posedeck.test, assert the deck appears
-  //     in the list (realtime grant-resync hydrates it).
-  //  3. owner context: revoke.
-  //  4. guest context: assert the deck disappears (revoke-evict) and an open
-  //     deck-detail view shows "Deck not found.".
+test("guest sees a shared deck appear, opens it read-only, loses it on revoke", async ({
+  browser,
+}) => {
+  const deckName = `Shared E2E ${Date.now()}-${Math.floor(Math.random() * 10_000)}`;
+
+  // Two independent contexts: separate auth + Dexie + IndexedDB per user.
+  const ownerCtx = await browser.newContext();
+  const guestCtx = await browser.newContext();
+  const ownerPage = await ownerCtx.newPage();
+  const guestPage = await guestCtx.newPage();
+
+  try {
+    // --- Owner: sign in, create the deck, grant the guest by email. ---
+    await signIn(ownerPage);
+    await createDeck(ownerPage, { name: deckName });
+    await waitForOutboxDrained(ownerPage);
+
+    await ownerPage.getByRole("button", { name: "Deck options" }).click();
+    await ownerPage.getByRole("menuitem", { name: "Share" }).click();
+    const shareDialog = ownerPage.getByRole("dialog");
+    await expect(shareDialog.getByText("Share deck")).toBeVisible();
+    await shareDialog.getByLabel("Email").fill(GUEST_EMAIL);
+    await shareDialog.getByRole("button", { name: "Share" }).click();
+    await expect(
+      shareDialog.getByRole("button", { name: "Revoke" }),
+    ).toBeVisible();
+    await waitForOutboxDrained(ownerPage);
+
+    // --- Guest: the shared deck appears in their list (post-hydrate). ---
+    await signInAsGuest(guestPage);
+    await pollWithReload(guestPage, () =>
+      guestPage
+        .getByText(deckName)
+        .first()
+        .isVisible()
+        .catch(() => false),
+    );
+
+    // Open it: a guest views read-only — the owner-only Rename/Share/Delete
+    // menu items are hidden (only the read-only menu, if any, is present).
+    await guestPage.getByText(deckName).first().click();
+    await expect(
+      guestPage.getByRole("heading", { name: deckName, level: 1 }),
+    ).toBeVisible();
+    // The deck-options menu must not expose owner actions to a guest.
+    const optionsBtn = guestPage.getByRole("button", { name: "Deck options" });
+    if (await optionsBtn.isVisible().catch(() => false)) {
+      await optionsBtn.click();
+      await expect(
+        guestPage.getByRole("menuitem", { name: "Share" }),
+      ).toHaveCount(0);
+      await expect(
+        guestPage.getByRole("menuitem", { name: "Rename" }),
+      ).toHaveCount(0);
+      // Close the menu before continuing.
+      await guestPage.keyboard.press("Escape");
+    }
+    // Capture the guest's deck-detail URL so we can revisit it post-revoke.
+    const guestDeckUrl = guestPage.url();
+    expect(guestDeckUrl).toMatch(/\/decks\/[^/]+$/);
+
+    // --- Owner: revoke the grant. ---
+    // The share dialog is still open from the grant above.
+    await shareDialog.getByRole("button", { name: "Revoke" }).click();
+    await expect(
+      shareDialog.getByText("Not shared with anyone yet."),
+    ).toBeVisible();
+    await waitForOutboxDrained(ownerPage);
+
+    // --- Guest: the deck disappears from the list (revoke-evict). ---
+    await pollWithReload(guestPage, async () => {
+      const stillThere = await guestPage
+        .getByText(deckName)
+        .first()
+        .isVisible()
+        .catch(() => false);
+      return !stillThere;
+    });
+
+    // Opening the now-revoked deck detail directly shows "Deck not found.".
+    await guestPage.goto(guestDeckUrl);
+    await expect(guestPage.getByText("Deck not found.")).toBeVisible({
+      timeout: 15_000,
+    });
+  } finally {
+    await ownerCtx.close();
+    await guestCtx.close();
+  }
 });

@@ -62,6 +62,26 @@ final class RealtimeClientTests: XCTestCase {
         XCTAssertFalse(running, "does not loop on a dead token")
     }
 
+    /// swift-4: a 401 from realtime must surface through the session-expiry
+    /// reporter (the seam the app wires to sign-out / re-login) — not vanish
+    /// into a no-op `onAuthFailed` while realtime dies silently.
+    func testAuthFailureRoutesThroughSessionExpiryReporter() async {
+        let transport = StubSSETransport()
+        transport.state.enqueueConnect(chunks: [sseConnectFrame(clientId: "cid")])
+        transport.state.setSubscribeError(APIClientError.httpError(status: 401, body: Data()))
+        let reporter = SessionExpiryReporter()
+        let client = RealtimeClient(
+            transport: transport,
+            subscriptions: ["decks"],
+            authToken: "dead-token",
+            onEvent: { _ in },
+            onAuthFailed: { await reporter.reportExpired() }
+        )
+        await client.run(reconnectDelay: 0, maxReconnects: 5)
+        let expired = await reporter.hasExpired
+        XCTAssertTrue(expired, "the realtime 401 latches a session expiry the app can react to")
+    }
+
     func testStopHaltsTheLoop() async {
         let transport = StubSSETransport()
         let client = RealtimeClient(transport: transport, subscriptions: ["decks"], onEvent: { _ in })

@@ -91,17 +91,37 @@ public actor SyncEngine {
     private func applyDeck(_ event: RealtimeClient.RecordEvent) async -> Bool {
         guard let id = recordId(from: event.recordJSON) else { return false }
         if event.action == "delete" {
-            // Hard delete event on a deck → hide locally + cascade.
-            await cascadeDeckRemoval(deckId: id)
+            // Defensive hard-delete: hide the deck row + cascade to its children.
+            // Decks are soft-delete (no hardDeleteDeck on the protocol), so model a
+            // hard delete with a display tombstone via hideDeck — it stamps
+            // deleted_at (so listDecks excludes it) while preserving
+            // client_updated_at, never poisoning the LWW clock (same contract as
+            // the child cascade). If the row is unknown locally there is nothing
+            // visible to hide, but a cascade is still safe (no-op on no children).
+            let stamp = now()
+            if let deck = await store.deck(id: id), deck.deletedAt == nil {
+                await store.hideDeck(id: id, deletedAt: stamp)
+            }
+            await cascadeDeckRemoval(deckId: id, hideAt: stamp)
             return true
         }
         guard let deck = decode(Deck.self, from: event.recordJSON) else { return false }
         let existing = await store.deck(id: id)
         guard LWW.shouldApply(incoming: deck, over: existing) else { return false }
+        let previousDeletedAt = existing?.deletedAt
         await store.upsertDeck(deck)
-        // Cascade a soft-delete transition: evict the deck's children locally.
-        if deck.deletedAt != nil {
-            await cascadeDeckRemoval(deckId: id, keepDeckRow: true)
+        if let deckDeletedAt = deck.deletedAt {
+            // Cascade a soft-delete transition: hide the deck's children locally,
+            // stamping each child's deleted_at to the deck's own deleted_at.
+            await cascadeDeckRemoval(deckId: id, keepDeckRow: true, hideAt: deckDeletedAt)
+        } else if let previousDeletedAt {
+            // Cascade a restore transition: un-hide ONLY children this cascade hid
+            // (deleted_at == the deck's prior deleted_at), so a card the user
+            // individually trashed stays trashed. The server never soft-deleted
+            // the cards (web parity: restoreDeck clears only the deck row), so
+            // nothing else re-delivers them; the LWW clock was preserved, so this
+            // pure display un-hide is safe.
+            await cascadeDeckRestore(deckId: id, hiddenAt: previousDeletedAt)
         }
         return true
     }
@@ -109,12 +129,18 @@ public actor SyncEngine {
     private func applyCard(_ event: RealtimeClient.RecordEvent) async -> Bool {
         guard let id = recordId(from: event.recordJSON) else { return false }
         if event.action == "delete" {
-            // Defensive hard-delete: evict the card + its images locally.
-            if let card = await store.card(id: id) {
-                await evictCardImages(cardId: card.id)
+            // Defensive hard-delete: evict the card + its images locally and hide
+            // the card row. Cards are soft-delete (no hardDeleteCard on the
+            // protocol), so model a hard delete with a display tombstone via
+            // hideCard — it stamps deleted_at (so listCards excludes it) while
+            // preserving client_updated_at, never poisoning the LWW clock (same
+            // contract as the deck cascade). If the row is unknown locally there is
+            // nothing visible to hide, so report no change.
+            guard let card = await store.card(id: id) else { return false }
+            await evictCardImages(cardId: card.id)
+            if card.deletedAt == nil {
+                await store.hideCard(id: card.id, deletedAt: now())
             }
-            // No hardDeleteCard on the protocol (cards are soft-delete); model a
-            // hard delete by writing a tombstone soft-deleted row so it's hidden.
             return true
         }
         guard let card = decode(Card.self, from: event.recordJSON) else { return false }
@@ -162,19 +188,44 @@ public actor SyncEngine {
     /// A deck was removed/soft-deleted: evict its cards (and their images) from
     /// the local mirror so children don't orphan. With `keepDeckRow`, the deck
     /// row itself is left in place (already soft-deleted by the caller).
-    private func cascadeDeckRemoval(deckId: String, keepDeckRow: Bool = false) async {
+    ///
+    /// `hideAt` is the timestamp stamped into each child card's `deleted_at` to
+    /// hide it for display. It defaults to `now()` for a hard-delete event (no
+    /// deck row to derive from) and is otherwise the deck's own `deleted_at`.
+    /// Crucially, hiding goes through ``LocalStore/hideCard(id:deletedAt:)`` so
+    /// the child's `client_updated_at` (its real LWW clock) is left untouched —
+    /// the server never soft-deletes cards on a deck delete (web parity:
+    /// `deckApi.softDeleteDeck` patches only the deck row), so fabricating a
+    /// fresh clock here would permanently shadow the genuine server card after a
+    /// deck restore re-applies it with its older-but-true timestamp.
+    private func cascadeDeckRemoval(deckId: String, keepDeckRow: Bool = false, hideAt: Date? = nil) async {
+        let hideStamp = hideAt ?? now()
         let cards = await store.cards(deckId: deckId)
         for card in cards {
             await evictCardImages(cardId: card.id)
-            // Soft-hide each child card by stamping deleted_at to match the deck.
-            var hidden = card
-            if hidden.deletedAt == nil {
-                hidden.deletedAt = now()
-                hidden.clientUpdatedAt = now()
-                await store.upsertCard(hidden)
+            if card.deletedAt == nil {
+                await store.hideCard(id: card.id, deletedAt: hideStamp)
             }
         }
         _ = keepDeckRow // deck row handling owned by caller
+    }
+
+    /// A soft-deleted deck was restored: un-hide the children the cascade hid.
+    /// Pairs with ``cascadeDeckRemoval`` — both touch only `deleted_at` for
+    /// display and never the LWW clock, so a restore cleanly reverses a delete.
+    ///
+    /// `hiddenAt` is the deck's prior `deleted_at` (the exact value the cascade
+    /// stamped into each child). Only children carrying that stamp are un-hidden,
+    /// so a card the user individually soft-deleted (a different `deleted_at`)
+    /// stays trashed.
+    private func cascadeDeckRestore(deckId: String, hiddenAt: Date) async {
+        let cards = await store.cards(deckId: deckId)
+        // Shared predicate (also used by the app's optimistic restore path) so the
+        // two can never diverge: un-hide only children carrying the deck's prior
+        // deleted_at; an individually-trashed card stays trashed.
+        for id in DeckCascade.childIdsToUnhideOnRestore(cards: cards, hiddenAt: hiddenAt) {
+            await store.unhideCard(id: id)
+        }
     }
 
     private func evictCardImages(cardId: String) async {

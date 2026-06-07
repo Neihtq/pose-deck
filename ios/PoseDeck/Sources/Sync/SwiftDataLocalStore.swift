@@ -53,6 +53,18 @@ actor SwiftDataLocalStore: LocalStore {
         ((try? context.fetch(FetchDescriptor<LocalDeck>())) ?? []).map(\.asDeck)
     }
 
+    func hideDeck(id: String, deletedAt: Date) async {
+        // Local-only display hide for a hard-delete event: set deleted_at but
+        // leave client_updated_at (the real LWW clock) untouched and bypass LWW,
+        // so a genuine server row that later re-delivers with its true timestamp
+        // is not shadowed. Mirror of hideCard.
+        guard let existing = try? context.fetch(
+            FetchDescriptor<LocalDeck>(predicate: #Predicate { $0.id == id })
+        ).first else { return }
+        existing.deletedAt = deletedAt
+        try? context.save()
+    }
+
     // MARK: - Cards
 
     func upsertCard(_ card: Card) async {
@@ -78,6 +90,27 @@ actor SwiftDataLocalStore: LocalStore {
 
     func card(id: String) async -> Card? {
         (try? context.fetch(FetchDescriptor<LocalCard>(predicate: #Predicate { $0.id == id })).first)?.asCard
+    }
+
+    func hideCard(id: String, deletedAt: Date) async {
+        // Local-only display hide for a cascaded child: set deleted_at but leave
+        // client_updated_at (the real LWW clock) untouched and bypass LWW, so a
+        // later deck restore that re-applies the genuine server card un-hides it.
+        guard let existing = try? context.fetch(
+            FetchDescriptor<LocalCard>(predicate: #Predicate { $0.id == id })
+        ).first else { return }
+        existing.deletedAt = deletedAt
+        try? context.save()
+    }
+
+    func unhideCard(id: String) async {
+        // Local-only display un-hide (mirror of hideCard): clear deleted_at,
+        // preserve client_updated_at, bypass LWW.
+        guard let existing = try? context.fetch(
+            FetchDescriptor<LocalCard>(predicate: #Predicate { $0.id == id })
+        ).first else { return }
+        existing.deletedAt = nil
+        try? context.save()
     }
 
     func cards(deckId: String) async -> [Card] {

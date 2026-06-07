@@ -16,6 +16,10 @@ public struct DeckRepository: Sendable {
     /// Integer gap between duplicated card positions (1000, 2000, …).
     public static let positionGap = CardRepository.positionGap
 
+    /// Max length of a deck `name` — the server rejects >200
+    /// (ARCHITECTURE.md §3.2). Used to clamp the duplicate " (copy)" name.
+    public static let nameMaxLength = 200
+
     private let client: APIClient
     private let collection = "decks"
     private let cardsCollection = "cards"
@@ -150,8 +154,14 @@ public struct DeckRepository: Sendable {
     public func duplicateDeck(id: String, ownerId: String) async throws -> Deck {
         let source = try await getDeck(id: id)
 
+        // Clamp the copy name to the DB ceiling (ARCHITECTURE.md §3.2, max 200):
+        // a source name within 7 chars of 200 would otherwise overflow once the
+        // " (copy)" suffix is appended and the server create would be rejected
+        // (web `deckApi.ts` parity).
+        let suffix = " (copy)"
+        let base = String(source.name.prefix(Self.nameMaxLength - suffix.count))
         let copy = try await createDeck(
-            name: "\(source.name) (copy)",
+            name: base + suffix,
             shootDate: nil,
             ownerId: ownerId
         )

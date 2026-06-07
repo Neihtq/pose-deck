@@ -86,12 +86,35 @@ public struct OfflineWritePath: Sendable {
     /// Soft-delete a deck locally (set `deleted_at`) + enqueue, cascading the
     /// hide to the deck's children in the local mirror (invariant: deck
     /// soft-delete evicts children locally — also enforced by ``SyncEngine``).
+    ///
+    /// The child cascade mirrors ``SyncEngine``'s realtime path: each child
+    /// card's images are hard-removed and the card is display-hidden via
+    /// ``LocalStore/hideCard(id:deletedAt:)`` sharing the deck's own `stamp`.
+    /// Hiding deliberately leaves each child's `client_updated_at` (its real LWW
+    /// clock) untouched — the server never soft-deletes cards on a deck delete
+    /// (web parity: `deckApi.softDeleteDeck` patches only the deck row), so we
+    /// must not fabricate a future client clock for the children. Only the deck
+    /// row is enqueued; the server-side cascade + realtime echo carry the rest.
     public func softDeleteDeck(_ deck: Deck) async throws {
         let stamp = now()
         var updated = deck
         updated.deletedAt = stamp
         updated.clientUpdatedAt = stamp
         await store.upsertDeck(updated)
+
+        // Cascade the hide to children locally (invariant: deck soft-delete
+        // evicts children locally), matching SyncEngine.cascadeDeckRemoval.
+        let children = await store.cards(deckId: deck.id)
+        for card in children {
+            let images = await store.cardImages(cardId: card.id)
+            for image in images {
+                await store.hardDeleteCardImage(id: image.id)
+            }
+            if card.deletedAt == nil {
+                await store.hideCard(id: card.id, deletedAt: stamp)
+            }
+        }
+
         let body = DeckSoftDeleteWire(
             id: deck.id,
             deleted_at: PocketBaseDate.string(from: stamp),

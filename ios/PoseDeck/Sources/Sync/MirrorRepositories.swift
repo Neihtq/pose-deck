@@ -100,11 +100,21 @@ struct MirrorDeckRepository: DeckRepositoring {
     @discardableResult
     func restoreDeck(id: String) async throws -> Deck {
         guard let deck = await store.deck(id: id) else { throw DeckRepositoryError.notFound(id: id) }
+        let priorDeletedAt = deck.deletedAt
         let stamp = now()
         var updated = deck
         updated.deletedAt = nil
         updated.clientUpdatedAt = stamp
         await store.upsertDeck(updated)
+        // Reverse the local cascade hide: un-hide ONLY children the deck cascade
+        // hid (their deleted_at == the deck's prior deleted_at), so a card the
+        // user individually trashed before the deck was trashed stays trashed.
+        // Shares the exact predicate with SyncEngine.cascadeDeckRestore via the
+        // pure DeckCascade helper so the optimistic and realtime paths agree.
+        let children = await store.cards(deckId: id)
+        for childId in DeckCascade.childIdsToUnhideOnRestore(cards: children, hiddenAt: priorDeletedAt) {
+            await store.unhideCard(id: childId)
+        }
         try await outbox.enqueueWireUpdate(entity: "decks", body: DeckRestoreWire(
             id: id, deleted_at: "", client_updated_at: PocketBaseDate.string(from: stamp)
         ), now: now())
@@ -219,12 +229,21 @@ struct MirrorImageRepository: ImageRepositing, CardImageReading {
     }
 
     func listCardImages(cardId: String) async throws -> [CardImage] {
-        // Serve the mirror if it has rows; otherwise hit the network and adopt.
-        let mirrored = await store.cardImages(cardId: cardId)
-        if !mirrored.isEmpty { return mirrored }
-        let remoteImages = (try? await remote.listCardImages(cardId: cardId)) ?? []
-        for image in remoteImages { await store.upsertCardImage(image) }
-        return remoteImages
+        // Reconcile against remote on every read when online (swift-5): card_images
+        // carry no LWW clock and no resync backfills them, so realtime was the only
+        // path that could adopt a remotely-added image or drop a remotely-deleted
+        // one. Short-circuiting on a non-empty mirror left a second device (or a
+        // missed realtime event) serving a stale row — a missing thumbnail or a 404
+        // token URL for a server-deleted image. Always fetch + reconcile here so a
+        // reload converges the mirror onto the server truth.
+        //
+        // If the fetch fails (offline / transient), DO NOT treat it as "remote is
+        // empty" — that would evict every mirrored row. Fall back to serving the
+        // mirror as-is (offline-first, ARCHITECTURE.md §4.1).
+        guard let remoteImages = try? await remote.listCardImages(cardId: cardId) else {
+            return await store.cardImages(cardId: cardId)
+        }
+        return await CardImageReconciler.apply(remote: remoteImages, to: store, cardId: cardId)
     }
 
     @discardableResult

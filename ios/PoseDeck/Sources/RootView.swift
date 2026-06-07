@@ -68,6 +68,14 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             sync.onScenePhase(phase)
         }
+        // A mid-session 401 (realtime or outbox) flips this flag. Mirror the web
+        // `clearAuthOnUnauthorized` behaviour: drop the rejected session so the
+        // auth gate falls back to LoginView instead of silently going stale.
+        .onChange(of: sync.sessionExpired) { _, expired in
+            if expired, auth.isAuthenticated {
+                Task { await auth.signOut() }
+            }
+        }
     }
 
     // MARK: - Authenticated content
@@ -77,6 +85,10 @@ struct RootView: View {
         let model = DeckListViewModel(repo: deckRepo, ownerId: ownerId)
         return DeckListView(
             model: model,
+            // Re-query the mirror when a realtime merge / outbox confirmation
+            // writes it (the ticker debounces a burst into one bump), so remote
+            // changes appear without a manual pull-to-refresh.
+            ticker: sync.ticker,
             detailFactory: { deck in
                 makeDetail(deck: deck, ownerId: ownerId)
             },
@@ -99,6 +111,9 @@ struct RootView: View {
         )
         return DeckDetailView(
             model: detailModel,
+            // Same reactive re-query as the list: a realtime card/deck merge
+            // refreshes this open detail screen without a manual pull.
+            ticker: sync.ticker,
             cardEditorFactory: { card in
                 AnyView(
                     CardEditorHost(

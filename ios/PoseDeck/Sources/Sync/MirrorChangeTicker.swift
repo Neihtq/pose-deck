@@ -1,6 +1,7 @@
 import Foundation
 import SwiftData
 import Observation
+import PoseDeckCore
 
 /// An `@Observable` counter bumped (debounced) whenever the SwiftData mirror
 /// changes, so views that read through the mirror repositories can re-query
@@ -18,7 +19,11 @@ final class MirrorChangeTicker {
 
     /// Bumped (after debounce) on each batch of mirror changes. Views read this
     /// (e.g. in a `.task(id:)` or by referencing it in `body`) to re-query.
-    private(set) var revision = 0
+    var revision: Int { coalescer.revision }
+
+    /// Pure coalescing bookkeeping (revision counter + pending flag), lifted into
+    /// `PoseDeckCore` so the burst-into-one-bump contract is unit-testable.
+    private var coalescer = ChangeTickerCoalescer()
 
     @ObservationIgnored private var observer: NSObjectProtocol?
     @ObservationIgnored private var debounceTask: Task<Void, Never>?
@@ -36,6 +41,7 @@ final class MirrorChangeTicker {
             // The notification is delivered on the main queue; hop onto the main
             // actor to schedule the debounced bump.
             MainActor.assumeIsolated {
+                self?.coalescer.noteChange()
                 self?.scheduleBump()
             }
         }
@@ -54,7 +60,10 @@ final class MirrorChangeTicker {
         debounceTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
-            self?.revision &+= 1
+            // Collapse the whole burst into a single observable bump. The
+            // coalescer no-ops if nothing is pending, so a stray timer can't
+            // churn observing views.
+            self?.coalescer.flush()
         }
     }
 }

@@ -109,6 +109,51 @@ final class ImageRepositoryTests: XCTestCase {
         XCTAssertTrue(text.contains("--BOUND--\r\n"), "closing boundary")
     }
 
+    // MARK: - SEC-3: multipart header parameter escaping
+
+    /// Regression for SEC-3: a CRLF or double-quote in a field `name`/`filename`
+    /// must not be able to close the quoted Content-Disposition parameter or
+    /// inject extra part headers / break the multipart boundary. Mirrors the
+    /// defense-in-depth norm already applied to PocketBase filter interpolation.
+    func testMultipartEscapesQuotesAndCRLFInNameAndFilename() {
+        // A hostile filename: a closing quote + CRLF that would otherwise inject
+        // a forged Content-Type header into the part, plus a stray boundary.
+        let evilFilename = "a\"\r\nContent-Type: text/html\r\n\r\n--BOUND--\r\n.jpg"
+        let evilName = "fi\"eld\r\nX-Injected: 1"
+        let fields: [APIClient.MultipartField] = [
+            .file(name: evilName, filename: evilFilename, mimeType: "image/jpeg", data: Data([0xFF])),
+        ]
+        let body = APIClient.encodeMultipart(fields: fields, boundary: "BOUND")
+        let text = String(decoding: body, as: UTF8.self)
+
+        // The injected header text must not have escaped onto its own line: it is
+        // defanged only if no CRLF precedes it (it stays inside the quoted param).
+        XCTAssertFalse(text.contains("\r\nX-Injected:"),
+                       "field name CRLF must not inject a new header line")
+        XCTAssertFalse(text.contains("\r\nContent-Type: text/html"),
+                       "filename CRLF must not inject a forged Content-Type header")
+        // No raw (unescaped) interior double-quote may appear: every quote in the
+        // value must be backslash-escaped so it can't close the parameter.
+        XCTAssertFalse(text.contains("name=\"fi\"eld"),
+                       "interior quote in name must be escaped")
+        XCTAssertTrue(text.contains("name=\"fi\\\"eld"),
+                      "name's interior quote is backslash-escaped")
+        XCTAssertTrue(text.contains("filename=\"a\\\""),
+                      "filename's interior quote is backslash-escaped")
+        // The exactly one closing boundary is the real one this encoder appends.
+        let occurrences = text.components(separatedBy: "--BOUND--\r\n").count - 1
+        XCTAssertEqual(occurrences, 1,
+                       "a boundary token smuggled via the filename must not produce a second closing boundary line")
+    }
+
+    /// The escaping helper is a no-op for the constant values production passes
+    /// today, so the hardening does not change real upload payloads.
+    func testHeaderParameterEscapeLeavesPlainValuesUnchanged() {
+        XCTAssertEqual(APIClient.escapeHeaderParameter("file"), "file")
+        XCTAssertEqual(APIClient.escapeHeaderParameter("image.jpg"), "image.jpg")
+        XCTAssertEqual(APIClient.escapeHeaderParameter("card"), "card")
+    }
+
     func testFileURLBuilderEmbedsToken() {
         let client = APIClient(baseURL: URL(string: "http://127.0.0.1:8090")!)
         let url = client.fileURL(
@@ -190,6 +235,50 @@ final class ImageRepositoryTests: XCTestCase {
         let repo = ImageRepository(client: await makeClient())
         let images = try await repo.listCardImages(cardId: "c_1")
         XCTAssertEqual(images.map(\.id), ["a", "b"], "sorted by position ascending")
+    }
+
+    /// Regression for `spec-image-list-truncates-page1-ios`: a card holding more
+    /// server-side image records than the per-card cap (e.g. an out-of-band
+    /// create, a pre-cap migration, or a transient race) must NOT be silently
+    /// truncated. The old implementation requested a single page with
+    /// `perPage = maxImagesPerCard` (== 5), capping the query at 5 records; the
+    /// web reference uses `getFullList`. `listCardImages` now walks all pages via
+    /// `client.listAll`, so it returns the complete set regardless of count.
+    func testListFetchesAllPagesAndDoesNotTruncate() async throws {
+        // Server holds 7 image records for this card (more than the cap of 5),
+        // served two-per-page across 4 pages.
+        StubURLProtocol.shared.setHandler { request in
+            let page = Int(
+                URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                    .queryItems?
+                    .first(where: { $0.name == "page" })?
+                    .value ?? "1"
+            ) ?? 1
+            // 7 records id'd by descending position so we can also confirm the
+            // final ascending sort holds across the page boundaries.
+            let all = (0..<7).map { (id: "ci\($0)", position: (7 - $0) * 1000) }
+            let perPage = 2
+            let start = (page - 1) * perPage
+            let slice = all[min(start, all.count)..<min(start + perPage, all.count)]
+            let items = slice.map {
+                #"{"id":"\#($0.id)","card":"c_1","position":\#($0.position),"file":"\#($0.id).jpg"}"#
+            }.joined(separator: ",")
+            let body = "{\"page\":\(page),\"perPage\":\(perPage),"
+                + "\"totalItems\":7,\"totalPages\":4,\"items\":[\(items)]}"
+            return (200, Data(body.utf8))
+        }
+
+        let repo = ImageRepository(client: await makeClient())
+        let images = try await repo.listCardImages(cardId: "c_1")
+
+        XCTAssertEqual(images.count, 7, "all 7 records must be returned, not truncated to the cap of 5")
+        // Sorted ascending by position across all pages.
+        XCTAssertEqual(images.map(\.position), [1000, 2000, 3000, 4000, 5000, 6000, 7000])
+        // More than one page was actually fetched (proves we did not stop at page 1).
+        let getPages = StubURLProtocol.shared.requests
+            .filter { $0.httpMethod == "GET" }
+            .count
+        XCTAssertGreaterThan(getPages, 1, "should walk multiple pages, not just page 1")
     }
 
     func testFileURLForImageMintsTokenAndBuildsURL() async throws {

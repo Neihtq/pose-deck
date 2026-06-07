@@ -81,11 +81,37 @@ public protocol LocalStore: Sendable {
     func upsertDeck(_ deck: Deck) async
     func deck(id: String) async -> Deck?
     func allDecks() async -> [Deck]
+    /// Local-only display hide for a deck, used when a realtime hard-`delete`
+    /// event arrives for a deck (defensive — the server uses soft-delete, but a
+    /// hard delete event must still evict the deck locally; module doc §contract).
+    ///
+    /// Sets the deck's `deletedAt` so the `listDecks` filter hides it, but **must
+    /// not** change `clientUpdatedAt`: the LWW clock belongs to the real server
+    /// row. Stamping a fresh clock here would shadow a genuine server row that
+    /// later re-delivers with its older-but-true timestamp. This write therefore
+    /// bypasses LWW entirely — same contract as ``hideCard(id:deletedAt:)``.
+    func hideDeck(id: String, deletedAt: Date) async
 
     // Cards
     func upsertCard(_ card: Card) async
     func card(id: String) async -> Card?
     func cards(deckId: String) async -> [Card]
+    /// Local-only display hide for a cascaded child of a soft-deleted deck.
+    ///
+    /// Sets the card's `deletedAt` so the parent-deck filter hides it, but
+    /// **must not** change `clientUpdatedAt`: the LWW clock belongs to the real
+    /// server row. Stamping a fresh clock here would permanently shadow the
+    /// genuine server card after a deck restore (the older-but-true row would
+    /// lose LWW against the fabricated future timestamp). This write therefore
+    /// bypasses LWW entirely — it is a local view concern, not a merge.
+    func hideCard(id: String, deletedAt: Date) async
+    /// Local-only display un-hide: clear a card's `deletedAt` while preserving
+    /// `clientUpdatedAt`, bypassing LWW. The mirror image of ``hideCard`` — used
+    /// when a soft-deleted deck is restored so its cascaded children return to
+    /// live without depending on the server re-delivering each card (the server
+    /// never soft-deleted them, so it would never re-deliver them with a fresh
+    /// clock that could overturn the local hidden row).
+    func unhideCard(id: String) async
 
     // Card images (no LWW; hard delete)
     func upsertCardImage(_ image: CardImage) async
@@ -129,6 +155,15 @@ public actor InMemoryLocalStore: LocalStore {
 
     public func allDecks() async -> [Deck] { Array(decks.values) }
 
+    public func hideDeck(id: String, deletedAt: Date) async {
+        // Local-only display hide: set deleted_at but preserve client_updated_at
+        // and bypass LWW (mirror of hideCard) — a hard-delete event evicts the
+        // deck from the listing without poisoning the merge clock.
+        guard var deck = decks[id] else { return }
+        deck.deletedAt = deletedAt
+        decks[id] = deck
+    }
+
     // MARK: Cards
 
     public func upsertCard(_ card: Card) async {
@@ -138,6 +173,22 @@ public actor InMemoryLocalStore: LocalStore {
     }
 
     public func card(id: String) async -> Card? { cards[id] }
+
+    public func hideCard(id: String, deletedAt: Date) async {
+        // Local-only display hide: set deleted_at but preserve client_updated_at
+        // and bypass LWW so the cascade can never poison the merge clock.
+        guard var card = cards[id] else { return }
+        card.deletedAt = deletedAt
+        cards[id] = card
+    }
+
+    public func unhideCard(id: String) async {
+        // Local-only display un-hide: clear deleted_at, preserve client_updated_at,
+        // bypass LWW (mirror of hideCard).
+        guard var card = cards[id] else { return }
+        card.deletedAt = nil
+        cards[id] = card
+    }
 
     public func cards(deckId: String) async -> [Card] {
         cards.values.filter { $0.deck == deckId }.sorted { $0.position < $1.position }

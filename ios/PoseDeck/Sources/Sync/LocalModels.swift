@@ -110,7 +110,7 @@ final class LocalCard: MirrorRow {
 }
 
 @Model
-final class LocalCardImage: MirrorRow {
+final class LocalCardImage: MirrorRow, BlobBearingMirrorRow {
     @Attribute(.unique) var id: String
     var card: String
     var position: Int
@@ -300,5 +300,14 @@ extension LocalCardImage {
         position = image.position
         file = image.file
         created = image.created
+    }
+
+    /// Drop the locally-cached pre-cached JPEG bytes so SwiftData reclaims the
+    /// `.externalStorage` sidecar file. Called on sign-out before the mirror's
+    /// bulk delete so a previous user's cached image bytes don't survive as
+    /// orphaned sidecars in the shared store directory (SEC-2).
+    func clearCachedBlob() {
+        blob = nil
+        blobETag = nil
     }
 }

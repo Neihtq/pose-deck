@@ -118,14 +118,18 @@ public struct ImageRepository: ImageRepositing {
         // alphanumerics today, but routing through PocketBaseFilter.quoted keeps
         // the value inside the quoted literal regardless of caller-supplied text.
         let filter = "card = \(PocketBaseFilter.quoted(cardId))"
-        let response: ListResponse<CardImage> = try await client.list(
+        // Fetch *every* matching image across all pages (mirrors the web
+        // `getFullList`). A single-page `list` capped at `maxImagesPerCard` would
+        // silently truncate a card that holds more than the cap's worth of
+        // server-side records (e.g. an out-of-band create, a pre-cap migration,
+        // or a transient race), under-counting the true server state.
+        let items: [CardImage] = try await client.listAll(
             collection: Self.collection,
-            page: 1,
-            perPage: maxImagesPerCard,
+            perPage: 200,
             filter: filter,
             sort: "position"
         )
-        return response.items.sorted { $0.position < $1.position }
+        return items.sorted { $0.position < $1.position }
     }
 
     public func deleteCardImage(id: String) async throws {

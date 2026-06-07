@@ -177,6 +177,42 @@ final class DeckRepositoryTests: XCTestCase {
         XCTAssertEqual(positions, (1...totalCards).map { $0 * 1000 })
     }
 
+    /// Regression (spec-dup-name-overflow-ios): duplicating a deck whose name is
+    /// within 7 chars of the 200-char DB ceiling must clamp the base name before
+    /// appending " (copy)" so the resulting name never exceeds 200 — otherwise
+    /// the server create is rejected (web `deckApi.ts` clamp parity,
+    /// ARCHITECTURE.md §3.2 max 200).
+    func testDuplicateDeckClampsCopyNameToDbCeiling() async throws {
+        // 200-char source name (exactly at the ceiling).
+        let longName = String(repeating: "A", count: DeckRepository.nameMaxLength)
+
+        StubURLProtocol.shared.setHandler { request in
+            if request.httpMethod == "GET" {
+                let url = request.url!.absoluteString
+                if url.contains("collections/decks") {
+                    let body = #"{"page":1,"perPage":1,"totalItems":1,"totalPages":1,"items":[{"id":"src","owner":"u","name":"\#(longName)","shoot_date":"","deleted_at":""}]}"#
+                    return (200, Data(body.utf8))
+                }
+                // No cards on the source.
+                return (200, Data(#"{"page":1,"perPage":200,"totalItems":0,"totalPages":0,"items":[]}"#.utf8))
+            }
+            return (200, Data(#"{"id":"copy","owner":"u","name":"x","deleted_at":""}"#.utf8))
+        }
+
+        let repo = DeckRepository(client: await makeClient(), now: { Self.fixedNow })
+        _ = try await repo.duplicateDeck(id: "src", ownerId: "u")
+
+        let body = try lastBody()
+        let copyName = try XCTUnwrap(body["name"] as? String, "duplicate must send a name")
+        XCTAssertLessThanOrEqual(
+            copyName.count, DeckRepository.nameMaxLength,
+            "copy name must be clamped to the 200-char DB ceiling"
+        )
+        XCTAssertTrue(copyName.hasSuffix(" (copy)"), "clamped name must still carry the (copy) suffix")
+        // The base is truncated by exactly the suffix length so the full name lands on 200.
+        XCTAssertEqual(copyName.count, DeckRepository.nameMaxLength)
+    }
+
     // MARK: - list pagination (CORR-2 regression)
 
     /// Regression for CORR-2: a user with more decks than fit on one page must

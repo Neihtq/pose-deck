@@ -77,6 +77,59 @@ final class OfflineWritePathTests: XCTestCase {
         XCTAssertNotEqual(body?["deleted_at"] as? String, "", "deleted_at set to a stamp")
     }
 
+    func testSoftDeleteDeckCascadesHideToChildrenLocally() async throws {
+        let store = InMemoryLocalStore()
+        let deckStamp = Date(timeIntervalSince1970: 1)
+        let deck = Deck(id: "d1", owner: "u", name: "x", clientUpdatedAt: deckStamp)
+        await store.upsertDeck(deck)
+
+        // Two live children, one with an image; plus a card in another deck that
+        // must be untouched, and an already-trashed child whose own deletedAt
+        // (not the deck stamp) must be preserved.
+        let childStamp = Date(timeIntervalSince1970: 500)
+        await store.upsertCard(Card(id: "c1", deck: "d1", position: 1000, title: "a", clientUpdatedAt: childStamp))
+        await store.upsertCard(Card(id: "c2", deck: "d1", position: 2000, title: "b", clientUpdatedAt: childStamp))
+        let preTrashStamp = Date(timeIntervalSince1970: 600)
+        await store.upsertCard(Card(id: "c3", deck: "d1", position: 3000, title: "c", clientUpdatedAt: childStamp, deletedAt: preTrashStamp))
+        await store.upsertCard(Card(id: "other", deck: "d2", position: 1000, title: "z", clientUpdatedAt: childStamp))
+        await store.upsertCardImage(CardImage(id: "img1", card: "c1", position: 1, file: "x.jpg"))
+
+        let outbox = InMemoryOutbox()
+        let path = makePath(store: store, outbox: outbox)
+
+        try await path.softDeleteDeck(deck)
+
+        // Live children are hidden, stamped with the deck's soft-delete stamp,
+        // while their real LWW clock (client_updated_at) is preserved.
+        for id in ["c1", "c2"] {
+            let card = await store.card(id: id)
+            XCTAssertEqual(card?.deletedAt, fixedNow, "\(id) hidden at the deck stamp")
+            XCTAssertEqual(card?.clientUpdatedAt, childStamp, "\(id) LWW clock untouched")
+        }
+        // The child's image is evicted from the mirror.
+        let img = await store.cardImage(id: "img1")
+        XCTAssertNil(img, "child card image evicted on deck soft-delete")
+
+        // listCards (cards(deckId:)) still returns the rows, but all carry a
+        // deletedAt so the deck's card list filters them out as hidden.
+        let children = await store.cards(deckId: "d1")
+        XCTAssertTrue(children.allSatisfy { $0.deletedAt != nil }, "no live child survives the deck soft-delete")
+
+        // An already-trashed child keeps its own deletedAt (not re-stamped).
+        let preTrashed = await store.card(id: "c3")
+        XCTAssertEqual(preTrashed?.deletedAt, preTrashStamp, "individually-trashed child keeps its own stamp")
+
+        // A card in a different deck is left alone.
+        let other = await store.card(id: "other")
+        XCTAssertNil(other?.deletedAt, "unrelated deck's card untouched")
+
+        // Only the deck row is enqueued (server cascade carries the children).
+        let pending = await outbox.pending()
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pending.first?.entity, "decks")
+        XCTAssertEqual(pending.first?.type, .update)
+    }
+
     func testReorderEnqueuesOnlyMovedCardsAsOneUnit() async throws {
         let store = InMemoryLocalStore()
         // a@1000, b@2000, c@3000

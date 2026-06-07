@@ -27,6 +27,25 @@ final class SyncCoordinator {
     /// Surfaced to the UI so a signout that would lose queued writes can warn.
     private(set) var pendingUnsyncedCount = 0
 
+    /// Set true when the session token is rejected mid-session (a 401 from
+    /// realtime or the outbox). The UI observes this to drive a sign-out /
+    /// re-login — the iOS counterpart of the web `clearAuthOnUnauthorized`
+    /// (swift-4). Realtime stops and the outbox stays paused on a dead token,
+    /// so this flag is the signal that the session must be re-established
+    /// rather than silently going stale until relaunch.
+    private(set) var sessionExpired = false
+
+    /// De-dupes the 401 signal so realtime + the outbox both reporting the
+    /// same expiry only flips ``sessionExpired`` once.
+    @ObservationIgnored private let expiryReporter: SessionExpiryReporter
+
+    /// Bumps a debounced `revision` whenever the SwiftData mirror is written
+    /// (realtime merge or outbox confirmation). Views read `ticker.revision` in a
+    /// `.task(id:)` to re-query the mirror, so a remote create/edit/delete shows
+    /// without a manual pull-to-refresh. This is the iOS counterpart of the web
+    /// `useLiveQuery` reactive read.
+    let ticker = MirrorChangeTicker()
+
     @ObservationIgnored private let container: ModelContainer
     @ObservationIgnored private let apiClient: APIClient
     @ObservationIgnored private let store: SwiftDataLocalStore
@@ -55,6 +74,29 @@ final class SyncCoordinator {
                 await engine.noteConfirmed(entity: confirmed.entity, recordId: confirmed.recordId)
             }
         )
+        // Latch a single 401 episode and bounce it back onto the main actor so
+        // the @Observable `sessionExpired` flip + the app hook run there. The
+        // reporter is `nonisolated(unsafe)` set right after to break the
+        // initializer's "self before all stored properties" rule cleanly.
+        self.expiryReporter = SessionExpiryReporter()
+        Task { [weak self] in
+            await self?.installExpiryHandler()
+        }
+    }
+
+    /// Wire the reporter's one-shot handler to the main-actor flag flip. Done
+    /// after `init` so the `@Sendable` closure can capture `self` weakly.
+    private func installExpiryHandler() async {
+        await expiryReporter.setHandler { [weak self] in
+            await self?.handleSessionExpired()
+        }
+    }
+
+    /// Flip the observable flag exactly once per expiry. ``RootView`` observes
+    /// `sessionExpired` and signs out (web parity), so the auth gate falls back
+    /// to the login screen.
+    private func handleSessionExpired() {
+        sessionExpired = true
     }
 
     // MARK: - Lifecycle
@@ -66,6 +108,11 @@ final class SyncCoordinator {
     /// state — that stays with ``AuthService``.
     func onAuthenticated(token: String?, ownerId: String) async {
         self.ownerId = ownerId
+        // Fresh (re)auth: clear the latched 401 so a future expiry reports again,
+        // un-pause the processor's dead-token gate, and reset the UI flag.
+        sessionExpired = false
+        await expiryReporter.reset()
+        await processor.resumeAfterAuthRefresh()
         let activeToken: String?
         if let token {
             activeToken = token
@@ -77,6 +124,11 @@ final class SyncCoordinator {
         // backfill; the engine's apply is idempotent so the overlap is safe.
         startRealtime(token: activeToken)
         await backfill(ownerId: ownerId)
+        // Cancel any prior (possibly auth-paused / finished) drain loop so a
+        // re-auth-in-place always gets a fresh loop — guards against a stale
+        // finished handle making `startDrainLoop`'s `== nil` guard a no-op.
+        drainLoop?.cancel()
+        drainLoop = nil
         startDrainLoop()
     }
 
@@ -127,11 +179,15 @@ final class SyncCoordinator {
     private func startRealtime(token: String?) {
         let transport = URLSessionSSETransport(baseURL: apiClient.baseURL)
         let engine = self.engine
+        let reporter = self.expiryReporter
         let client = RealtimeClient(
             transport: transport,
             authToken: token,
             onEvent: { event in await engine.apply(event) },
-            onAuthFailed: { /* token refresh seam — M4 wires real refresh */ }
+            // A 401 on (re)connect stops realtime for good on a dead token.
+            // Surface it so the app can sign out / re-auth instead of going
+            // silently stale (swift-4 / web parity with clearAuthOnUnauthorized).
+            onAuthFailed: { await reporter.reportExpired() }
         )
         realtime = client
         realtimeLoop = Task { await client.run() }
@@ -161,6 +217,13 @@ final class SyncCoordinator {
 
     // MARK: - Outbox drain loop (external scheduler for the no-sleep processor)
 
+    /// Clear the stored drain-loop handle from inside the loop's own teardown so
+    /// `startDrainLoop`'s `drainLoop == nil` guard can restart it after an
+    /// auth-paused exit. Runs on the main actor (the coordinator's isolation).
+    private func clearDrainLoop() {
+        drainLoop = nil
+    }
+
     private func startDrainLoop() {
         guard drainLoop == nil else { return }
         let processor = self.processor
@@ -179,8 +242,22 @@ final class SyncCoordinator {
                     let delay = max(0, until.timeIntervalSinceNow)
                     try? await Task.sleep(for: .seconds(delay))
                 case .authPaused:
-                    // Token refresh is an M4 seam; back off so we don't spin.
-                    try? await Task.sleep(for: .seconds(5))
+                    // Dead token: the processor will keep returning .authPaused
+                    // until resumeAfterAuthRefresh() is called, and no refresh
+                    // happens here. Re-spinning every 5s does nothing useful, so
+                    // surface the expiry (drives sign-out / re-login) and EXIT
+                    // the loop rather than busy-idling forever (swift-4).
+                    //
+                    // Clear the stored handle on the way out: `startDrainLoop`
+                    // guards on `drainLoop == nil`, so leaving a finished handle
+                    // here would make a subsequent re-auth-in-place
+                    // (`onAuthenticated` again, which calls
+                    // `resumeAfterAuthRefresh()`) a silent no-op — the outbox
+                    // would never drain again until relaunch. Nil it so the next
+                    // `onAuthenticated`/`onScenePhase(.active)` restarts the loop.
+                    await self?.clearDrainLoop()
+                    await self?.expiryReporter.reportExpired()
+                    return
                 }
             }
         }
@@ -205,6 +282,17 @@ final class SyncCoordinator {
 
     private func purgeMirror() async {
         let context = ModelContext(container)
+
+        // SEC-2: null out the pre-cached image bytes BEFORE the bulk delete so
+        // SwiftData reclaims their `.externalStorage` sidecar files. A bulk
+        // `delete(model:)` does not reliably reclaim those sidecars eagerly, so
+        // without this a previous user's cached `card_images` bytes can survive
+        // as orphaned files in the shared (non-per-user) store directory.
+        if let images = try? context.fetch(FetchDescriptor<LocalCardImage>()) {
+            MirrorPurge.clearCachedBlobs(in: images)
+            try? context.save()
+        }
+
         for model in LocalMirrorStore.models {
             try? context.delete(model: model)
         }

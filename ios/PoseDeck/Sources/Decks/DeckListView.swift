@@ -10,6 +10,10 @@ import PoseDeckCore
 /// instead host this inside an app-level stack — see `followups`.
 struct DeckListView: View {
     @State private var model: DeckListViewModel
+    /// Bumps `revision` after a realtime merge / outbox confirmation writes the
+    /// SwiftData mirror, so this list re-queries without a manual pull. Optional
+    /// (nil in previews / fakes, which have no live mirror).
+    private let ticker: MirrorChangeTicker?
     /// Factory the detail screen needs (card repo + image reader + owner id).
     private let detailFactory: (Deck) -> DeckDetailView
     /// Optional sign-out action shown in the toolbar (wired by the app root).
@@ -32,10 +36,12 @@ struct DeckListView: View {
 
     init(
         model: DeckListViewModel,
+        ticker: MirrorChangeTicker? = nil,
         detailFactory: @escaping (Deck) -> DeckDetailView,
         onSignOut: (() -> Void)? = nil
     ) {
         self._model = State(initialValue: model)
+        self.ticker = ticker
         self.detailFactory = detailFactory
         self.onSignOut = onSignOut
     }
@@ -109,6 +115,17 @@ struct DeckListView: View {
                 }
         }
         .task { await model.load() }
+        // Reactive re-query: the ticker bumps `revision` after a realtime merge /
+        // outbox confirmation writes the mirror, so a remote create/edit/delete
+        // shows without a manual pull. `refresh()` avoids the full-screen loading
+        // flip. The `revision == 0` skip avoids a redundant reload on first render
+        // (the initial `load()` above already covers it). iOS counterpart of the
+        // web `useLiveQuery` reactive read.
+        .task(id: ticker?.revision) {
+            if let revision = ticker?.revision, revision > 0 {
+                await model.refresh()
+            }
+        }
     }
 
     @ToolbarContentBuilder

@@ -13,6 +13,10 @@ import PoseDeckCore
 /// mode). NO shoot mode here (that is M4).
 struct DeckDetailView: View {
     @State private var model: DeckDetailViewModel
+    /// Bumps `revision` after a realtime merge / outbox confirmation writes the
+    /// SwiftData mirror, so this open detail screen re-queries its cards without a
+    /// manual pull. Optional (nil in previews / fakes, which have no live mirror).
+    private let ticker: MirrorChangeTicker?
     /// Builds the card editor for a given card (`nil` = create a new card).
     private let cardEditorFactory: (Card?) -> AnyView
 
@@ -29,9 +33,11 @@ struct DeckDetailView: View {
 
     init(
         model: DeckDetailViewModel,
+        ticker: MirrorChangeTicker? = nil,
         cardEditorFactory: @escaping (Card?) -> AnyView
     ) {
         self._model = State(initialValue: model)
+        self.ticker = ticker
         self.cardEditorFactory = cardEditorFactory
     }
 
@@ -82,6 +88,17 @@ struct DeckDetailView: View {
                 Button("OK", role: .cancel) { model.actionError = nil }
             } message: { msg in Text(msg) }
             .task { await model.load() }
+            // Reactive re-query: the ticker bumps `revision` after a realtime
+            // merge / outbox confirmation writes the mirror, so a remote
+            // card/deck change refreshes this open screen without a manual pull.
+            // `refresh()` avoids the full-screen loading flip; the `revision == 0`
+            // skip avoids a redundant reload on first render. iOS counterpart of
+            // the web `useLiveQuery` reactive read.
+            .task(id: ticker?.revision) {
+                if let revision = ticker?.revision, revision > 0 {
+                    await model.refresh()
+                }
+            }
             .onChange(of: model.didDelete) { _, deleted in
                 if deleted { dismiss() }
             }

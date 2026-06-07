@@ -73,6 +73,38 @@ public extension APIClient {
 
     // MARK: - Internal plumbing
 
+    /// Escape a value for embedding inside a double-quoted Content-Disposition
+    /// header parameter (`name="..."`, `filename="..."`).
+    ///
+    /// Mirrors ``PocketBaseFilter/escape(_:)``'s defense-in-depth norm for the
+    /// other interpolation sink in this codebase: backslashes are escaped first
+    /// (so the escapes aren't re-escaped), then double-quotes, and control
+    /// characters — crucially CR/LF — are stripped. Without this, a value
+    /// containing `"` could close the quoted parameter and a CR/LF could inject
+    /// extra part headers or break the multipart boundary (header/part injection).
+    /// Today's callers only pass constants, so this is latent hardening, but it
+    /// keeps a future dynamic name/filename from breaking out of the header.
+    internal static func escapeHeaderParameter(_ value: String) -> String {
+        var result = ""
+        result.reserveCapacity(value.count)
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "\\":
+                result += "\\\\"
+            case "\"":
+                result += "\\\""
+            default:
+                // Drop control characters (CR, LF, NUL, etc.); they can't appear
+                // in a single-line header and only serve to inject/obfuscate.
+                if scalar.properties.generalCategory == .control {
+                    continue
+                }
+                result.unicodeScalars.append(scalar)
+            }
+        }
+        return result
+    }
+
     /// Encode multipart/form-data body bytes for the given fields + boundary.
     /// Pure and `static` so it is unit-testable without the network.
     internal static func encodeMultipart(fields: [MultipartField], boundary: String) -> Data {
@@ -84,10 +116,13 @@ public extension APIClient {
             append("--\(boundary)\(crlf)")
             switch field {
             case let .text(name, value):
-                append("Content-Disposition: form-data; name=\"\(name)\"\(crlf)\(crlf)")
+                let safeName = escapeHeaderParameter(name)
+                append("Content-Disposition: form-data; name=\"\(safeName)\"\(crlf)\(crlf)")
                 append("\(value)\(crlf)")
             case let .file(name, filename, mimeType, data):
-                append("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\(crlf)")
+                let safeName = escapeHeaderParameter(name)
+                let safeFilename = escapeHeaderParameter(filename)
+                append("Content-Disposition: form-data; name=\"\(safeName)\"; filename=\"\(safeFilename)\"\(crlf)")
                 append("Content-Type: \(mimeType)\(crlf)\(crlf)")
                 body.append(data)
                 append(crlf)

@@ -143,6 +143,9 @@ public protocol LocalStore: Sendable {
     func upsertDeckGuest(_ guest: DeckGuest) async
     func deckGuest(id: String) async -> DeckGuest?
     func deckGuests(deckId: String) async -> [DeckGuest]
+    /// All mirrored deck-guest rows (used by the backfill reconcile-prune to find
+    /// mirror rows no longer present on the server).
+    func allDeckGuests() async -> [DeckGuest]
     func hardDeleteDeckGuest(id: String) async
 }
 
@@ -267,6 +270,8 @@ public actor InMemoryLocalStore: LocalStore {
             ($0.grantedAt ?? .distantPast) < ($1.grantedAt ?? .distantPast)
         }
     }
+
+    public func allDeckGuests() async -> [DeckGuest] { Array(deckGuests.values) }
 
     public func hardDeleteDeckGuest(id: String) async {
         deckGuests[id] = nil

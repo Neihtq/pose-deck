@@ -260,14 +260,19 @@ export function clearRecentlyUploadedImages(): void {
 const recentlyCreatedIds: Record<string, Map<string, number>> = {
   decks: new Map(),
   cards: new Map(),
+  // deck_guests: an optimistic grant is enqueued like a deck/card create, so it
+  // is subject to the same create-prune race (a hydrate whose server snapshot
+  // predates the grant's commit would prune the fresh local row). Give it a
+  // bucket so `markRecentlyCreated('deck_guests', id)` exempts it (FIX #8).
+  deck_guests: new Map(),
 };
 const RECENT_CREATE_TTL_MS = 30_000;
 
 /**
- * Mark a just-created optimistic `decks`/`cards` id so a racing resync whose
- * snapshot predates the server commit won't prune it. No-op for entities
- * without a create-prune race (images use their own mark; guests/completions
- * are never optimistically created through this path).
+ * Mark a just-created optimistic `decks`/`cards`/`deck_guests` id so a racing
+ * resync whose snapshot predates the server commit won't prune it. No-op for
+ * entities without a bucket (images use their own mark; completions are never
+ * optimistically created through this path).
  */
 export function markRecentlyCreated(
   entity: OutboxEntity,
@@ -385,11 +390,35 @@ export async function liveDecks(db: PoseDeckDB): Promise<Deck[]> {
   return (await db.decks.toArray()).filter(isLive);
 }
 
-/** Soft-deleted decks (trash view), newest-deleted first. */
-export async function liveTrashedDecks(db: PoseDeckDB): Promise<Deck[]> {
+/**
+ * Soft-deleted decks the given user OWNS (trash view), newest-deleted first.
+ *
+ * Scoped to `ownerId` (FIX #3): a guest's mirror may hold an owner's trashed
+ * SHARED deck (the decks listRule still returns it to a guest), but a guest
+ * must never see it in their Trash — nor be able to issue a restore PATCH that
+ * the server would 403. Only the owner's own trashed decks belong in Trash.
+ */
+export async function liveTrashedDecks(
+  db: PoseDeckDB,
+  ownerId: string,
+): Promise<Deck[]> {
   return (await db.decks.toArray())
-    .filter((d) => d.deleted_at !== "")
+    .filter((d) => d.deleted_at !== "" && d.owner === ownerId)
     .sort((a, b) => (a.deleted_at < b.deleted_at ? 1 : -1));
+}
+
+/**
+ * A deck's guests (sharing), ordered by `granted_at`. The listRule already
+ * scopes the mirrored rows to owner+guest visibility; this just re-expresses
+ * the per-deck filter for the owner's Share dialog.
+ */
+export async function liveDeckGuests(
+  db: PoseDeckDB,
+  deckId: string,
+): Promise<DeckGuest[]> {
+  return (await db.deck_guests.where("deck").equals(deckId).toArray()).sort(
+    (a, b) => (a.granted_at < b.granted_at ? -1 : a.granted_at > b.granted_at ? 1 : 0),
+  );
 }
 
 /** A single live deck by id, or undefined if missing/soft-deleted. */

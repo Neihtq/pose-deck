@@ -27,14 +27,19 @@ struct MirrorDeckRepository: DeckRepositoring {
     let outbox: SwiftDataOutbox
     let writePath: OfflineWritePath
     let now: @Sendable () -> Date
+    /// The authenticated user's id — used to owner-scope the Trash so a guest
+    /// never sees/restores an owner's trashed shared deck (`[FIX #3-iOS]`).
+    let currentUserId: String
 
     init(
         store: SwiftDataLocalStore,
         outbox: SwiftDataOutbox,
+        currentUserId: String,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.store = store
         self.outbox = outbox
+        self.currentUserId = currentUserId
         self.writePath = OfflineWritePath(store: store, outbox: outbox, now: now)
         self.now = now
     }
@@ -55,8 +60,13 @@ struct MirrorDeckRepository: DeckRepositoring {
     }
 
     func listTrashedDecks() async throws -> [Deck] {
+        // `[FIX #3-iOS]`: owner-scope the Trash. The decks listRule grants a guest
+        // visibility into an owner's trashed shared decks, so without this filter
+        // a guest's Trash would surface (and could issue an illegal restore PATCH
+        // that 403s on) a deck they don't own. Only the current user's own
+        // soft-deleted decks belong in their Trash.
         await store.allDecks()
-            .filter { $0.deletedAt != nil }
+            .filter { $0.deletedAt != nil && $0.owner == currentUserId }
             .sorted { ($0.deletedAt ?? .distantPast) > ($1.deletedAt ?? .distantPast) }
     }
 
@@ -146,6 +156,51 @@ struct MirrorDeckRepository: DeckRepositoring {
             try await writePath.createCard(deckId: copy.id, fields: fields)
         }
         return copy
+    }
+}
+
+// MARK: - Deck guests (sharing)
+
+/// Mirror-backed deck-guest repository (M5 sharing). Reads serve the local
+/// mirror (deck-scoped); `grantGuest` resolves the email to a user id via the
+/// network ``DeckGuestRepository`` then writes optimistically + enqueues through
+/// the shared ``OfflineWritePath``; `revokeGuest` hard-removes the mirror row +
+/// enqueues a delete. Email resolution is network-bound (the server holds the
+/// users table); the grant/revoke writes themselves are offline-first.
+@MainActor
+struct MirrorDeckGuestRepository: DeckGuestRepositoring {
+    let store: SwiftDataLocalStore
+    let outbox: SwiftDataOutbox
+    let writePath: OfflineWritePath
+    let remote: DeckGuestRepository
+
+    init(
+        store: SwiftDataLocalStore,
+        outbox: SwiftDataOutbox,
+        currentUserId: String,
+        apiClient: APIClient,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.store = store
+        self.outbox = outbox
+        self.writePath = OfflineWritePath(store: store, outbox: outbox, now: now)
+        self.remote = DeckGuestRepository(client: apiClient, currentUserId: currentUserId)
+    }
+
+    func listGuests(deckId: String) async throws -> [DeckGuest] {
+        await store.deckGuests(deckId: deckId)
+    }
+
+    @discardableResult
+    func grantGuest(deckId: String, email: String) async throws -> DeckGuest {
+        guard let userId = try await remote.resolveUser(byEmail: email) else {
+            throw DeckGuestRepositoringError.userNotFound
+        }
+        return try await writePath.grantGuest(deckId: deckId, userId: userId)
+    }
+
+    func revokeGuest(_ guest: DeckGuest) async throws {
+        try await writePath.revokeGuest(guest)
     }
 }
 

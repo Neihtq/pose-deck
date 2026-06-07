@@ -181,6 +181,9 @@ export function createSyncRuntime(
     provider: opts.provider ?? pocketBaseRealtimeProvider,
     fetchAll: opts.fetchAll ?? pocketBaseFetchAll,
     recentlyConfirmed,
+    // Read the live auth store so a `deck_guests` event's guest-vs-owner
+    // decision (M5 FIX #1/#2) always uses the current user id.
+    currentUserId: () => pb.authStore.record?.id ?? "",
   });
 
   return { engine, realtime, recentlyConfirmed };

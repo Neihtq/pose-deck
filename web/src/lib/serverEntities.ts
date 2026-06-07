@@ -145,6 +145,21 @@ export async function send(
       // ack we lost. The optimistic local row is already correct.
       return { kind: "success" };
     }
+    if (
+      entry.type === "create" &&
+      entry.entity === "deck_guests" &&
+      err instanceof ClientResponseError &&
+      err.status === 400
+    ) {
+      // FIX #6: `deck_guests` has a composite-unique `(deck, user)` index. A
+      // re-grant of an already-shared (deck,user) pair — e.g. a racing second
+      // grant, or a replay after a lost ack where the *id* differs — returns a
+      // 400 keyed on the relation fields (NOT `data.id`, so `isDuplicateIdError`
+      // misses it). The grant is idempotent: the share already exists, so treat
+      // it as success rather than a hard `drop` that would toast an error and
+      // roll back the optimistic local guest row.
+      return { kind: "success" };
+    }
     return classifyError(err);
   }
   // Unreachable, but satisfies the type checker.

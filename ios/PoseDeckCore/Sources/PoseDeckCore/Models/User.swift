@@ -7,10 +7,15 @@ import Foundation
 public struct User: Codable, Identifiable, Hashable, Sendable {
     /// PocketBase-generated record id.
     public var id: String
-    /// Unique login email.
-    public var email: String
-    /// Display name.
-    public var name: String
+    /// Unique login email. **Optional** because PocketBase hides it (omits the
+    /// field entirely) for records the caller can't view — e.g. the guest row
+    /// returned by the email-lookup `listRule`, whose `email` is suppressed by
+    /// `viewRule`. The guest-resolution path identifies the matched user by
+    /// `id != currentUserId`, not by reading this field, so a missing email must
+    /// decode cleanly rather than throwing.
+    public var email: String?
+    /// Display name. Optional for the same reason (hidden on non-viewable rows).
+    public var name: String?
     /// Server-managed creation timestamp.
     public var created: Date?
     /// Server-managed last-update timestamp.
@@ -18,8 +23,8 @@ public struct User: Codable, Identifiable, Hashable, Sendable {
 
     public init(
         id: String,
-        email: String,
-        name: String,
+        email: String? = nil,
+        name: String? = nil,
         created: Date? = nil,
         updated: Date? = nil
     ) {

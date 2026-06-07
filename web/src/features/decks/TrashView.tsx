@@ -13,7 +13,7 @@ import { Link } from "react-router-dom";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import { toast } from "@/components/ui/use-toast";
-import { clearAuthOnUnauthorized } from "@/features/auth/AuthContext";
+import { clearAuthOnUnauthorized, useAuth } from "@/features/auth/AuthContext";
 import { restoreDeck } from "@/features/decks/deckApi";
 import { db } from "@/lib/db";
 import { liveTrashedDecks } from "@/lib/localStore";
@@ -38,8 +38,14 @@ function formatDate(value: string): string | null {
 }
 
 export default function TrashView(): React.JSX.Element {
-  // Local-first read: trashed decks come from Dexie via a live query.
-  const liveRows = useLiveQuery(() => liveTrashedDecks(db), []);
+  const { user } = useAuth();
+  const userId = user?.id ?? "";
+  // Local-first read: trashed decks the current user OWNS, from Dexie via a
+  // live query (FIX #3 — a guest never sees an owner's trashed shared deck).
+  const liveRows = useLiveQuery(
+    () => (userId ? liveTrashedDecks(db, userId) : Promise.resolve([])),
+    [userId],
+  );
   const decks = liveRows ?? [];
   const loading = liveRows === undefined;
   const [restoringId, setRestoringId] = React.useState<string | null>(null);

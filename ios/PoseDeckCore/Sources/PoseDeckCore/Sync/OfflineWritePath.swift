@@ -297,6 +297,31 @@ public struct OfflineWritePath: Sendable {
 
     // MARK: - Deck guests (no LWW: insert / hard-delete on revoke)
 
+    /// Grant a guest access to a deck: mint a client id, write the optimistic
+    /// ``DeckGuest`` into the mirror immediately, and enqueue a `.create`.
+    ///
+    /// Mirrors ``createCard``'s no-LWW insert (grants carry no `client_updated_at`).
+    /// A re-grant racing an existing `(deck, user)` row hits the server's
+    /// composite-unique constraint and 400s — ``MutationSender`` classifies a
+    /// `deck_guests` create 400 as idempotent success (`[FIX #6-iOS]`), so the
+    /// optimistic row is kept and no error surfaces. Returns the optimistic
+    /// ``DeckGuest`` so the share UI can reflect it at once.
+    @discardableResult
+    public func grantGuest(deckId: String, userId: String) async throws -> DeckGuest {
+        let id = newId()
+        let stamp = now()
+        let guest = DeckGuest(id: id, deck: deckId, user: userId, grantedAt: stamp)
+        await store.upsertDeckGuest(guest)
+        let body = DeckGuestCreateWire(
+            id: id,
+            deck: deckId,
+            user: userId,
+            granted_at: PocketBaseDate.string(from: stamp)
+        )
+        try await enqueue(.create, entity: "deck_guests", body: body)
+        return guest
+    }
+
     /// Revoke a guest: hard-remove from the mirror + enqueue a delete.
     public func revokeGuest(_ guest: DeckGuest) async throws {
         await store.hardDeleteDeckGuest(id: guest.id)
@@ -365,6 +390,13 @@ public struct OfflineWritePath: Sendable {
     }
     struct IdOnlyWire: Encodable, Sendable {
         let id: String
+    }
+    /// Deck-guest grant body (carries the client-minted id; no LWW clock).
+    struct DeckGuestCreateWire: Encodable, Sendable {
+        let id: String
+        let deck: String
+        let user: String
+        let granted_at: String
     }
     /// Full completion create body (carries the deterministic client id).
     struct CardCompletionUpsertWire: Encodable, Sendable {

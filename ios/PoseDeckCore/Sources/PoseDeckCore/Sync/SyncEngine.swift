@@ -31,6 +31,25 @@ public actor SyncEngine {
     private let echoTTL: TimeInterval
     private let now: @Sendable () -> Date
 
+    /// The authenticated user's id — needed to distinguish a guest-side grant
+    /// (the deck just became visible to *me* and must be hydrated) from an
+    /// owner-side echo of granting *someone else* (store the row only). Settable
+    /// on re-auth via ``setCurrentUserId(_:)``. `nil` until a session is
+    /// established (the engine then treats every guest as a non-self echo).
+    private var currentUserId: String?
+
+    /// Invoked (M5 sharing) when a `deck_guests` CREATE makes a deck visible to
+    /// the current user that is not yet in the local mirror — the app fetches the
+    /// deck + cards + images and upserts them so the shared deck appears live
+    /// mid-session (parity with the web `resync` on guest grant). Per-deck
+    /// hydration coalescing is the app callback's concern.
+    private var onGuestDeckNeedsHydration: (@Sendable (String) async -> Void)?
+
+    /// Install the guest-deck hydration handler (see ``onGuestDeckNeedsHydration``).
+    public func setHydrationHandler(_ handler: @escaping @Sendable (String) async -> Void) {
+        onGuestDeckNeedsHydration = handler
+    }
+
     private struct EchoKey: Hashable {
         let entity: String
         let id: String
@@ -38,12 +57,19 @@ public actor SyncEngine {
 
     public init(
         store: any LocalStore,
+        currentUserId: String? = nil,
         echoTTL: TimeInterval = 10.0,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.store = store
+        self.currentUserId = currentUserId
         self.echoTTL = echoTTL
         self.now = now
+    }
+
+    /// Set/refresh the authenticated user's id (on sign-in / re-auth).
+    public func setCurrentUserId(_ id: String?) {
+        currentUserId = id
     }
 
     /// Record a just-confirmed local mutation so its realtime echo is suppressed
@@ -175,11 +201,46 @@ public actor SyncEngine {
     private func applyDeckGuest(_ event: RealtimeClient.RecordEvent) async -> Bool {
         guard let id = recordId(from: event.recordJSON) else { return false }
         if event.action == "delete" {
-            await store.hardDeleteDeckGuest(id: id) // revoke
+            // A revoke. Resolve who/what it affected from the stored row BEFORE
+            // hard-deleting it, then evict the deck only when this is a foreign
+            // (positively-resolved not-mine) deck that I currently hold as a guest.
+            let revoked = await store.deckGuest(id: id)
+            await store.hardDeleteDeckGuest(id: id)
+            // `[FIX #7-iOS]`: evict the deck ONLY when
+            //   (1) the revoked grant was for ME (user == currentUserId), AND
+            //   (2) the deck row EXISTS locally, AND
+            //   (3) I do NOT own it (owner != currentUserId).
+            // Absent deck row → no-op (can't confirm foreign-owned, never evict).
+            // I own the deck → keep it (owner revoking their own guest must not
+            // lose their own deck). Reuses the deck-removal cascade.
+            guard
+                let currentUserId,
+                let revoked,
+                revoked.user == currentUserId,
+                let deck = await store.deck(id: revoked.deck),
+                deck.owner != currentUserId
+            else {
+                return true
+            }
+            let stamp = now()
+            if deck.deletedAt == nil {
+                await store.hideDeck(id: deck.id, deletedAt: stamp)
+            }
+            await cascadeDeckRemoval(deckId: deck.id, hideAt: stamp)
             return true
         }
         guard let guest = decode(DeckGuest.self, from: event.recordJSON) else { return false }
         await store.upsertDeckGuest(guest) // insert-by-id, no LWW
+        // `[FIX #4]`: a grant TO ME for a deck not yet (or no longer live) in the
+        // mirror means the deck just became visible — hydrate it. If the deck is
+        // already present and live, SKIP (no redundant refetch). An owner echo of
+        // granting someone else (`user != currentUserId`) only stores the row.
+        if let currentUserId, guest.user == currentUserId {
+            let existing = await store.deck(id: guest.deck)
+            if existing == nil || existing?.deletedAt != nil {
+                await onGuestDeckNeedsHydration?(guest.deck)
+            }
+        }
         return true
     }
 

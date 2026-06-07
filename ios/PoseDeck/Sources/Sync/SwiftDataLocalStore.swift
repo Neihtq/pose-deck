@@ -254,6 +254,11 @@ actor SwiftDataLocalStore: LocalStore {
         return rows.map { DeckGuest(id: $0.id, deck: $0.deck, user: $0.user, grantedAt: $0.grantedAt) }
     }
 
+    func allDeckGuests() async -> [DeckGuest] {
+        ((try? context.fetch(FetchDescriptor<LocalDeckGuest>())) ?? [])
+            .map { DeckGuest(id: $0.id, deck: $0.deck, user: $0.user, grantedAt: $0.grantedAt) }
+    }
+
     func hardDeleteDeckGuest(id: String) async {
         let descriptor = FetchDescriptor<LocalDeckGuest>(predicate: #Predicate { $0.id == id })
         if let row = try? context.fetch(descriptor).first {

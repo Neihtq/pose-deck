@@ -65,6 +65,10 @@ vi.mock("@/features/images/imageApi", () => ({
 
 vi.mock("@/features/auth/AuthContext", () => ({
   clearAuthOnUnauthorized: vi.fn(),
+  useAuth: () => ({ user: { id: "u1", email: "owner@posedeck.test" } }),
+}));
+vi.mock("@/features/decks/ShareDeckDialog", () => ({
+  ShareDeckDialog: () => null,
 }));
 
 const toast = vi.fn();

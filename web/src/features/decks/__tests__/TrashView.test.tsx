@@ -20,6 +20,7 @@ vi.mock("@/features/decks/deckApi", () => ({
 
 vi.mock("@/features/auth/AuthContext", () => ({
   clearAuthOnUnauthorized: vi.fn(() => false),
+  useAuth: () => ({ user: { id: "u1" } }),
 }));
 
 const toast = vi.fn();
@@ -96,6 +97,22 @@ describe("TrashView", () => {
     expect(toast).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Deck restored" }),
     );
+  });
+
+  // FIX #3: a guest's mirror may hold an owner's trashed SHARED deck (the decks
+  // listRule still returns it). Trash must show ONLY the current user's own
+  // trashed decks, never a foreign owner's.
+  it("excludes a trashed deck owned by another user", async () => {
+    await db.decks.put(makeDeck("d1", "My Trashed Deck")); // owner u1 (me)
+    await db.decks.put({
+      ...makeDeck("d2", "Shared Owner's Trash"),
+      owner: "someone-else",
+    });
+    renderView();
+    await screen.findByText("My Trashed Deck");
+    expect(
+      screen.queryByText("Shared Owner's Trash"),
+    ).not.toBeInTheDocument();
   });
 
   it("disables the row's button while a restore is in flight", async () => {

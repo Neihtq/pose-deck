@@ -81,7 +81,7 @@ struct RootView: View {
     // MARK: - Authenticated content
 
     private func deckList(ownerId: String) -> some View {
-        let deckRepo = sync.makeDeckRepository()
+        let deckRepo = sync.makeDeckRepository(ownerId: ownerId)
         let model = DeckListViewModel(repo: deckRepo, ownerId: ownerId)
         return DeckListView(
             model: model,
@@ -99,14 +99,16 @@ struct RootView: View {
     }
 
     private func makeDetail(deck: Deck, ownerId: String) -> DeckDetailView {
-        let deckRepo = sync.makeDeckRepository()
+        let deckRepo = sync.makeDeckRepository(ownerId: ownerId)
         let cardRepo = sync.makeCardRepository()
         let imageRepo = sync.makeImageRepository()
+        let guestRepo = sync.makeDeckGuestRepository(ownerId: ownerId)
         let detailModel = DeckDetailViewModel(
             deck: deck,
             deckRepo: deckRepo,
             cardRepo: cardRepo,
             imageRepo: imageRepo,
+            guestRepo: guestRepo,
             ownerId: ownerId
         )
         let completionRepo = sync.makeCardCompletionRepository()

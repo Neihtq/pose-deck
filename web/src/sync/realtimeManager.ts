@@ -52,6 +52,12 @@ export interface RealtimeManagerOptions {
   provider: RealtimeProvider;
   fetchAll: EntityFetcher;
   recentlyConfirmed?: RecentlyConfirmed;
+  /**
+   * The current authenticated user's id, for guest-vs-owner sharing decisions
+   * (FIX #1/#2). Injected as a getter so it always reflects the live auth store
+   * (a re-auth between events is honoured). Returns `""` when signed out.
+   */
+  currentUserId?: () => string;
   /** Called when an event is applied (for tests / metrics). */
   onApplied?(entity: OutboxEntity, event: RealtimeEvent): void;
 }
@@ -61,6 +67,7 @@ export class RealtimeManager {
   private readonly provider: RealtimeProvider;
   private readonly fetchAll: EntityFetcher;
   private readonly recentlyConfirmed?: RecentlyConfirmed;
+  private readonly currentUserId?: () => string;
   private readonly onApplied?: (e: OutboxEntity, ev: RealtimeEvent) => void;
 
   private unsubscribes: Unsubscribe[] = [];
@@ -73,6 +80,7 @@ export class RealtimeManager {
     this.provider = opts.provider;
     this.fetchAll = opts.fetchAll;
     this.recentlyConfirmed = opts.recentlyConfirmed;
+    this.currentUserId = opts.currentUserId;
     this.onApplied = opts.onApplied;
   }
 
@@ -161,7 +169,77 @@ export class RealtimeManager {
     await mergeRecord(this.db, entity, event.record as never, {
       deleted: event.action === "delete",
     });
+
+    // Sharing side-effects (M5, FIX #1/#2). A `deck_guests` event that targets
+    // the CURRENT user changes which decks they can see; the deck list is
+    // Dexie-mirror-backed, so we must reconcile the mirror by hand.
+    if (entity === "deck_guests") {
+      await this.applyDeckGuestSideEffect(event);
+    }
+
     this.onApplied?.(entity, event);
+  }
+
+  /**
+   * React to a `deck_guests` realtime event that concerns the current user.
+   *
+   * FIX #1 (grant): a CREATE granting ME a deck I don't yet mirror locally →
+   * resync, so hydration pulls the now-visible deck + its cards + images into
+   * Dexie and `liveDecks` re-queries. Gated to the absent-deck case so an echo
+   * of a deck I already have doesn't trigger a redundant resync.
+   *
+   * FIX #2 (revoke): a DELETE revoking ME from a deck whose LOCAL row shows a
+   * FOREIGN owner → cascade-evict the deck + its cards + card_images +
+   * image_blobs/pin from Dexie so it disappears from my list. FIX #7-web:
+   * resolve the owner from the LOCAL deck row FIRST; if the deck row is absent
+   * we can't confirm foreign ownership, so do nothing (this also protects an
+   * OWNER who revokes their own guest — their deck row's owner is themselves,
+   * so it is kept).
+   */
+  private async applyDeckGuestSideEffect(event: RealtimeEvent): Promise<void> {
+    const me = this.currentUserId?.() ?? "";
+    if (me === "") return;
+    const guestUser = event.record.user;
+    if (typeof guestUser !== "string" || guestUser !== me) return;
+    const deckId = event.record.deck;
+    if (typeof deckId !== "string" || deckId === "") return;
+
+    if (event.action === "create") {
+      const deck = await this.db.decks.get(deckId);
+      if (!deck) {
+        await this.resync();
+      }
+      return;
+    }
+    if (event.action === "delete") {
+      const deck = await this.db.decks.get(deckId);
+      // FIX #7-web: only evict a positively-resolved FOREIGN-owned deck.
+      if (deck && deck.owner !== me) {
+        await this.cascadeEvictDeck(deckId);
+      }
+    }
+  }
+
+  /**
+   * Remove a deck and everything derived from it from the local mirror: the
+   * deck row, its cards, those cards' card_images, any cached offline image
+   * bytes (`image_blobs`, keyed by card), and the offline pin. Used when the
+   * current user loses guest access (FIX #2) — the server stops returning the
+   * deck, but with no soft-delete tombstone an additive merge would otherwise
+   * leave the stale rows behind.
+   */
+  private async cascadeEvictDeck(deckId: string): Promise<void> {
+    const cards = await this.db.cards.where("deck").equals(deckId).toArray();
+    const cardIds = cards.map((c) => c.id);
+    for (const cardId of cardIds) {
+      await this.db.card_images.where("card").equals(cardId).delete();
+      await this.db.image_blobs.where("card").equals(cardId).delete();
+    }
+    if (cardIds.length > 0) {
+      await this.db.cards.bulkDelete(cardIds);
+    }
+    await this.db.decks.delete(deckId);
+    await this.db.pinned_decks.delete(deckId);
   }
 }
 

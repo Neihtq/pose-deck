@@ -71,13 +71,14 @@ import { toast } from "@/components/ui/use-toast";
 import { cn } from "@/lib/utils";
 import type { Card as CardRecord, CardImage } from "@/lib/types";
 
-import { clearAuthOnUnauthorized } from "@/features/auth/AuthContext";
+import { clearAuthOnUnauthorized, useAuth } from "@/features/auth/AuthContext";
 import {
   createCard,
   reorderCards,
   softDeleteCard,
 } from "@/features/cards/cardApi";
 import { duplicateDeck, renameDeck, softDeleteDeck } from "@/features/decks/deckApi";
+import { ShareDeckDialog } from "@/features/decks/ShareDeckDialog";
 import { OfflineToggle } from "@/features/offline/OfflineToggle";
 import { OfflineImage } from "@/features/offline/OfflineImage";
 import { imageDisplayUrl } from "@/features/images/imageApi";
@@ -107,6 +108,7 @@ type ThumbnailMap = Record<string, CardImage | null>;
 export default function DeckDetailPage(): React.JSX.Element {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { user } = useAuth();
 
   // Local-first reads: the deck and its cards come from Dexie via live queries,
   // so sync / realtime writes re-render the UI automatically. `undefined` =
@@ -140,6 +142,7 @@ export default function DeckDetailPage(): React.JSX.Element {
   const [renaming, setRenaming] = React.useState(false);
 
   const [deleteOpen, setDeleteOpen] = React.useState(false);
+  const [shareOpen, setShareOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [creating, setCreating] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
@@ -408,6 +411,11 @@ export default function DeckDetailPage(): React.JSX.Element {
     );
   }
 
+  // Sharing/editing affordances are owner-only; a guest views the deck
+  // read-only (M5). The deck list still shows guests their shared decks, but
+  // Rename/Duplicate/Delete/Share are hidden for non-owners.
+  const isOwner = deck.owner === user?.id;
+
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-8">
       <div className="mb-6">
@@ -440,10 +448,19 @@ export default function DeckDetailPage(): React.JSX.Element {
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={openRename}>Rename</DropdownMenuItem>
-              <DropdownMenuItem onSelect={handleDuplicate} disabled={busy}>
-                Duplicate
-              </DropdownMenuItem>
+              {isOwner ? (
+                <>
+                  <DropdownMenuItem onSelect={openRename}>
+                    Rename
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={handleDuplicate} disabled={busy}>
+                    Duplicate
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setShareOpen(true)}>
+                    Share
+                  </DropdownMenuItem>
+                </>
+              ) : null}
               <DropdownMenuItem
                 aria-label="Export PDF"
                 data-testid="export-pdf"
@@ -457,13 +474,17 @@ export default function DeckDetailPage(): React.JSX.Element {
               >
                 {exporting ? "Exporting…" : "Export as PDF"}
               </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                className="text-destructive focus:text-destructive"
-                onSelect={() => setDeleteOpen(true)}
-              >
-                Delete
-              </DropdownMenuItem>
+              {isOwner ? (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    className="text-destructive focus:text-destructive"
+                    onSelect={() => setDeleteOpen(true)}
+                  >
+                    Delete
+                  </DropdownMenuItem>
+                </>
+              ) : null}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -538,6 +559,15 @@ export default function DeckDetailPage(): React.JSX.Element {
           </form>
         </DialogContent>
       </Dialog>
+
+      {/* Share dialog (owner-only) */}
+      {isOwner ? (
+        <ShareDeckDialog
+          deckId={deck.id}
+          open={shareOpen}
+          onOpenChange={setShareOpen}
+        />
+      ) : null}
 
       {/* Delete confirmation */}
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>

@@ -18,14 +18,33 @@ final class DeckDetailViewModel {
     private let deckRepo: DeckRepositoring
     private let cardRepo: CardRepositoring
     private let imageRepo: CardImageReading
+    /// Sharing (M5). Optional so previews/tests that don't exercise sharing can
+    /// omit it; the Share affordance only appears for the owner anyway.
+    private let guestRepo: DeckGuestRepositoring?
     let ownerId: String
+
+    /// Whether the current user owns this deck. Only the owner may share, rename,
+    /// duplicate, delete, or restore — a guest's deck-detail is read-only
+    /// (`[FIX #3-iOS]`/owner-gating). Drives the UI's affordance visibility.
+    var isOwner: Bool { deck.owner == ownerId }
 
     private(set) var state: LoadState = .idle
     private(set) var cards: [Card] = []
     /// First-image display URL per card id (nil = none / not yet resolved).
     private(set) var thumbnailURLs: [String: URL] = [:]
 
+    /// Current guests of this deck (M5 sharing), oldest grant first. Re-read on
+    /// the ticker bump so a realtime grant/revoke reflects live in the share UI.
+    private(set) var guests: [DeckGuest] = []
+
     var actionError: String?
+    /// Which modal sheet the deck-detail screen is presenting. Held on the
+    /// `@Observable` model (not view `@State`) so it survives a parent re-render
+    /// that rebuilds the pushed `DeckDetailView` (e.g. a deck-list ticker bump
+    /// fired by an optimistic write would otherwise reset view `@State`). The
+    /// share screen is a pushed destination, not a sheet — see ``DeckDetailView``.
+    enum ActiveSheet: Int, Identifiable { case edit; var id: Int { rawValue } }
+    var activeSheet: ActiveSheet?
     /// Set when the deck itself was soft-deleted from the header — the view pops.
     private(set) var didDelete = false
 
@@ -41,12 +60,14 @@ final class DeckDetailViewModel {
         deckRepo: DeckRepositoring,
         cardRepo: CardRepositoring,
         imageRepo: CardImageReading,
+        guestRepo: DeckGuestRepositoring? = nil,
         ownerId: String
     ) {
         self.deck = deck
         self.deckRepo = deckRepo
         self.cardRepo = cardRepo
         self.imageRepo = imageRepo
+        self.guestRepo = guestRepo
         self.ownerId = ownerId
     }
 
@@ -227,6 +248,50 @@ final class DeckDetailViewModel {
         do {
             _ = try await deckRepo.softDeleteDeck(id: deck.id)
             didDelete = true
+        } catch {
+            actionError = DeckListViewModel.message(for: error)
+        }
+    }
+
+    // MARK: - Sharing (M5)
+
+    /// Re-read the deck's guests from the mirror (on open + each ticker bump).
+    func loadGuests() async {
+        guard let guestRepo else { return }
+        do {
+            guests = try await guestRepo.listGuests(deckId: deck.id)
+        } catch {
+            actionError = DeckListViewModel.message(for: error)
+        }
+    }
+
+    /// Grant a guest by email. Guards self-share (`[FIX #4]`) and a duplicate of
+    /// an already-granted user up front so the UI surfaces a clear message rather
+    /// than relying solely on the server's composite-unique constraint.
+    func grantGuest(email: String) async {
+        guard let guestRepo else { return }
+        let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            let resolved = try await guestRepo.grantGuest(deckId: deck.id, email: trimmed)
+            // Pre-check duplicate locally (the server 400 is also handled as a
+            // no-op, but a local guard gives an immediate, friendly message).
+            if guests.contains(where: { $0.user == resolved.user && $0.id != resolved.id }) {
+                actionError = "This deck is already shared with that user."
+            }
+            await loadGuests()
+        } catch DeckGuestRepositoringError.userNotFound {
+            actionError = "No user with that email."
+        } catch {
+            actionError = DeckListViewModel.message(for: error)
+        }
+    }
+
+    func revokeGuest(_ guest: DeckGuest) async {
+        guard let guestRepo else { return }
+        do {
+            try await guestRepo.revokeGuest(guest)
+            await loadGuests()
         } catch {
             actionError = DeckListViewModel.message(for: error)
         }

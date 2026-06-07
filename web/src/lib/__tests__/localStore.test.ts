@@ -14,6 +14,7 @@ import {
   liveDeck,
   liveDecks,
   liveTrashedDecks,
+  liveDeckGuests,
   markRecentlyCreated,
   markRecentlyUploadedImage,
   mergeRecord,
@@ -257,6 +258,37 @@ describe("hydrateFromServer", () => {
     expect(ids).toEqual(["d-fresh", "d-old"]); // fresh create survived the prune
   });
 
+  // FIX #8: an optimistic deck_guests grant whose server commit post-dates a
+  // racing hydrate snapshot must survive the prune — exactly like decks/cards.
+  it("does not prune a just-created deck_guest absent from a racing server snapshot", async () => {
+    await db.deck_guests.put({
+      id: "grant-fresh",
+      deck: "d1",
+      user: "u2",
+      granted_at: "2026-06-07T00:00:00.000Z",
+    });
+    markRecentlyCreated("deck_guests", "grant-fresh");
+
+    const server: Record<OutboxEntity, unknown[]> = {
+      decks: [],
+      cards: [],
+      card_images: [],
+      deck_guests: [
+        {
+          id: "grant-old",
+          deck: "d1",
+          user: "u3",
+          granted_at: "2026-06-06T00:00:00.000Z",
+        },
+      ], // stale: grant-fresh not yet present
+      card_completions: [],
+    };
+    await hydrateFromServer(db, async (e) => server[e] as never);
+
+    const ids = (await db.deck_guests.toArray()).map((g) => g.id).sort();
+    expect(ids).toEqual(["grant-fresh", "grant-old"]); // optimistic grant survived
+  });
+
   it("does not prune a just-created card absent from a racing server snapshot", async () => {
     await db.cards.put(card({ id: "c-fresh", deck: "d1" }));
     markRecentlyCreated("cards", "c-fresh");
@@ -328,7 +360,39 @@ describe("live read queries", () => {
     ]);
     expect((await liveDecks(db)).map((d) => d.id)).toEqual(["live1"]);
     // newest-deleted first
-    expect((await liveTrashedDecks(db)).map((d) => d.id)).toEqual(["trash2", "trash1"]);
+    expect((await liveTrashedDecks(db, "u1")).map((d) => d.id)).toEqual([
+      "trash2",
+      "trash1",
+    ]);
+  });
+
+  // FIX #3: Trash is owner-scoped — a guest's mirror may hold an owner's
+  // trashed SHARED deck (decks listRule still returns it), but it must never
+  // appear in the guest's Trash.
+  it("liveTrashedDecks excludes decks owned by another user", async () => {
+    await db.decks.bulkPut([
+      deck({ id: "mine", deleted_at: "2026-06-07T01:00:00.000Z" }), // owner u1
+      deck({
+        id: "theirs",
+        owner: "u2",
+        deleted_at: "2026-06-07T02:00:00.000Z",
+      }),
+    ]);
+    expect((await liveTrashedDecks(db, "u1")).map((d) => d.id)).toEqual([
+      "mine",
+    ]);
+  });
+
+  it("liveDeckGuests returns a deck's guests ordered by granted_at", async () => {
+    await db.deck_guests.bulkPut([
+      { id: "g2", deck: "d1", user: "uB", granted_at: "2026-06-07T02:00:00.000Z" },
+      { id: "g1", deck: "d1", user: "uA", granted_at: "2026-06-07T01:00:00.000Z" },
+      { id: "gX", deck: "other", user: "uC", granted_at: "2026-06-07T03:00:00.000Z" },
+    ]);
+    expect((await liveDeckGuests(db, "d1")).map((g) => g.id)).toEqual([
+      "g1",
+      "g2",
+    ]);
   });
 
   it("liveDeck returns undefined for a soft-deleted deck", async () => {

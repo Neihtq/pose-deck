@@ -53,6 +53,13 @@ public struct MutationSender: Sendable {
     /// success (`[FIX-C1]`).
     private static let completionsEntity = "card_completions"
 
+    /// The deck-sharing collection whose `(deck, user)` composite-unique 400 on a
+    /// re-grant must be treated as idempotent success rather than a hard drop
+    /// (`[FIX #6-iOS]`). Unlike a duplicate-`id` replay, this 400 is keyed on the
+    /// relation fields, so `isDuplicateIdError` (which only inspects `data.id`)
+    /// would miss it and the entry would erroneously drop with a surfaced error.
+    private static let deckGuestsEntity = "deck_guests"
+
     public func send(_ entry: OutboxEntry) async -> MutationOutcome {
         do {
             switch entry.type {
@@ -106,7 +113,7 @@ public struct MutationSender: Sendable {
                Self.isDuplicateIdError(body) {
                 return await sendCompletionFollowUpPatch(for: entry)
             }
-            return Self.classify(status: status, body: body, type: entry.type)
+            return Self.classify(status: status, body: body, type: entry.type, entity: entry.entity)
         } catch APIClientError.notAuthenticated {
             // No token at all — same remedy as a 401: pause and refresh.
             return .authExpired
@@ -169,8 +176,15 @@ public struct MutationSender: Sendable {
 
     /// Map an HTTP status to an outcome.
     ///
-    /// Visible for unit testing.
-    static func classify(status: Int, body: Data, type: OutboxMutationType) -> MutationOutcome {
+    /// Visible for unit testing. `entity` lets the 400 branch recognize the
+    /// `deck_guests` composite-unique re-grant as idempotent success (`[FIX #6-iOS]`);
+    /// callers that don't care pass `nil`.
+    static func classify(
+        status: Int,
+        body: Data,
+        type: OutboxMutationType,
+        entity: String? = nil
+    ) -> MutationOutcome {
         switch status {
         case 200..<300:
             return .success
@@ -182,6 +196,15 @@ public struct MutationSender: Sendable {
             // `data.id` ("...value must be unique"). Treat as success so the
             // entry is removed without inserting a duplicate (invariant #1).
             if type == .create, isDuplicateIdError(body) {
+                return .success
+            }
+            // `[FIX #6-iOS]`: a re-grant of an existing `(deck, user)` deck_guests
+            // row 400s on the composite-unique constraint — keyed on the relation
+            // fields, NOT `data.id`, so the duplicate-id check above misses it.
+            // The grant is idempotent (the row already exists with that access),
+            // so treat any deck_guests create 400 as success: drop the redundant
+            // create, keep the optimistic mirror row, surface no error.
+            if type == .create, entity == deckGuestsEntity {
                 return .success
             }
             return .drop(status: status)

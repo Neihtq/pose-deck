@@ -40,6 +40,13 @@ vi.mock("@/features/images/imageApi", () => ({
 }));
 vi.mock("@/features/auth/AuthContext", () => ({
   clearAuthOnUnauthorized: vi.fn(() => false),
+  // DECK.owner === "u1", so the default mock user is the owner.
+  useAuth: () => ({ user: { id: "u1", email: "owner@posedeck.test" } }),
+}));
+// ShareDeckDialog pulls in guestApi → sync; stub it so the owner-gated menu
+// renders without the live sync runtime.
+vi.mock("@/features/decks/ShareDeckDialog", () => ({
+  ShareDeckDialog: () => null,
 }));
 const toast = vi.fn();
 vi.mock("@/components/ui/use-toast", () => ({

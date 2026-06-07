@@ -247,6 +247,77 @@ d("PocketBase contract", () => {
         404,
       );
     });
+
+    // M5 (Phase A2/B): the relaxed users listRule (migration 1700000008) lets
+    // an owner resolve a guest's id by EXACT email via the `email` query param,
+    // without leaking the directory or the matched user's other fields.
+    it("owner resolves a guest's id by email via the email query param only", async () => {
+      // The matched user's `email` is hidden by viewRule (reads back empty), so
+      // a client-side filter would exclude the row — pass ONLY the query param
+      // and pick the row whose id is not the caller's.
+      const rows = await owner
+        .collection("users")
+        .getFullList({ query: { email: "guest@posedeck.test" } });
+      const resolved = rows.find((r) => r.id !== ownerId)?.id ?? null;
+      expect(resolved).toBe(guestId);
+    });
+
+    it("a users list with NO email param returns only the caller (enumeration blocked)", async () => {
+      const rows = await owner.collection("users").getFullList();
+      expect(rows.map((r) => r.id)).toEqual([ownerId]);
+    });
+
+    it("a non-existent email resolves to no other row (null)", async () => {
+      const rows = await owner
+        .collection("users")
+        .getFullList({ query: { email: "nobody@nowhere.test" } });
+      expect(rows.find((r) => r.id !== ownerId)?.id ?? null).toBeNull();
+    });
+
+    it("the email query param does NOT relax the viewRule (getOne(guest) still 404s)", async () => {
+      await expectStatus(owner.collection("users").getOne(guestId), 404);
+    });
+
+    it("owner grant → guest reads the deck → owner revoke → guest's deck 404s", async () => {
+      const deck = await createDeck(owner, cleanup, { name: "Grant lifecycle" });
+      // Before the grant the guest cannot see the deck.
+      await expectStatus(guest.collection("decks").getOne(deck.id), 404);
+
+      const grant = await owner.collection("deck_guests").create({
+        deck: deck.id,
+        user: guestId,
+        granted_at: nowIso(),
+      });
+      cleanup.track(owner, "deck_guests", grant.id);
+
+      // After the grant the guest can read the deck (read-only).
+      expect((await guest.collection("decks").getOne(deck.id)).id).toBe(deck.id);
+
+      // Owner revokes; the guest loses visibility.
+      await owner.collection("deck_guests").delete(grant.id);
+      await expectStatus(guest.collection("decks").getOne(deck.id), 404);
+    });
+
+    it("a duplicate grant for the same (deck,user) hits the composite-unique 400", async () => {
+      const deck = await createDeck(owner, cleanup, { name: "Dup grant deck" });
+      const grant = await owner.collection("deck_guests").create({
+        deck: deck.id,
+        user: guestId,
+        granted_at: nowIso(),
+      });
+      cleanup.track(owner, "deck_guests", grant.id);
+
+      // A second grant for the same (deck,user) trips the composite-unique
+      // index → 400 (FIX #6: classified as idempotent success client-side).
+      await expectStatus(
+        owner.collection("deck_guests").create({
+          deck: deck.id,
+          user: guestId,
+          granted_at: nowIso(),
+        }),
+        400,
+      );
+    });
   });
 
   describe("card_completions visibility (per-user, private)", () => {

@@ -74,6 +74,20 @@ final class SyncCoordinator {
                 await engine.noteConfirmed(entity: confirmed.entity, recordId: confirmed.recordId)
             }
         )
+        // M5 sharing: a mid-session grant TO ME (deck_guests CREATE for a deck not
+        // yet in the mirror) makes a shared deck newly visible — fetch its deck +
+        // cards + images, upsert them, and bump the ticker so the open UI shows it
+        // live (web `resync`-on-grant parity). Set after init so the @Sendable
+        // closure can capture the value-type pieces it needs.
+        Task { [engine, store, apiClient] in
+            await engine.setHydrationHandler { deckId in
+                await SyncCoordinator.hydrateGuestDeck(
+                    deckId: deckId,
+                    store: store,
+                    apiClient: apiClient
+                )
+            }
+        }
         // Latch a single 401 episode and bounce it back onto the main actor so
         // the @Observable `sessionExpired` flip + the app hook run there. The
         // reporter is `nonisolated(unsafe)` set right after to break the
@@ -108,6 +122,10 @@ final class SyncCoordinator {
     /// state — that stays with ``AuthService``.
     func onAuthenticated(token: String?, ownerId: String) async {
         self.ownerId = ownerId
+        // M5 sharing: the engine needs the authenticated user's id to tell a
+        // guest-side grant/revoke (visible to me) from an owner echo of sharing
+        // with someone else.
+        await engine.setCurrentUserId(ownerId)
         // Fresh (re)auth: clear the latched 401 so a future expiry reports again,
         // un-pause the processor's dead-token gate, and reset the UI flag.
         sessionExpired = false
@@ -199,6 +217,7 @@ final class SyncCoordinator {
         let deckRepo = DeckRepository(client: apiClient)
         let cardRepo = CardRepository(client: apiClient)
         let completionRepo = CardCompletionRepository(client: apiClient)
+        let guestRepo = DeckGuestRepository(client: apiClient, currentUserId: ownerId)
         do {
             let live = try await deckRepo.listDecks()
             let trashed = try await deckRepo.listTrashedDecks()
@@ -213,11 +232,61 @@ final class SyncCoordinator {
             // is what *closes* the empty-mirror race; this only narrows it.
             let completions = try await completionRepo.listCompletions(forUser: ownerId)
             for completion in completions { await store.upsertCardCompletion(completion) }
+
+            // M5 sharing: backfill deck_guests and reconcile-prune the mirror to
+            // the server set (parity with the web `reconcileEntity`). The listRule
+            // scopes the result to grants I own or hold, so a mirror guest row not
+            // in this set was revoked while we were offline — hard-delete it so a
+            // stale grant never lingers in the Share sheet.
+            let serverGuests = try await guestRepo.listGuests()
+            let serverGuestIds = Set(serverGuests.map(\.id))
+            for guest in serverGuests { await store.upsertDeckGuest(guest) }
+            let mirroredGuestIds = Set(await store.allDeckGuests().map(\.id))
+            for staleId in mirroredGuestIds.subtracting(serverGuestIds) {
+                await store.hardDeleteDeckGuest(id: staleId)
+            }
         } catch {
             // Offline / transient: the mirror keeps whatever it had; realtime +
             // the next foreground backfill will reconcile.
             #if DEBUG
             print("[SyncCoordinator] backfill failed: \(error)")
+            #endif
+        }
+    }
+
+    /// Hydrate a deck just shared with the current user (a mid-session
+    /// `deck_guests` grant TO me). Fetches the now-visible deck + its cards +
+    /// each card's images and upserts them into the mirror so the shared deck and
+    /// its contents appear live without a relaunch. The store's `context.save()`
+    /// fires `ModelContext.didSave`, which the ticker observes and debounces into
+    /// a single UI re-query — so no explicit ticker bump is needed here.
+    ///
+    /// `nonisolated static` so it runs off the engine actor's hydration callback
+    /// (a `@Sendable` closure) without hopping to the main actor; the pieces it
+    /// touches (`SwiftDataLocalStore` actor + the `APIClient` actor) are
+    /// `Sendable` and self-isolating. Best-effort: any fetch failure leaves the
+    /// mirror as-is (the next backfill reconciles).
+    nonisolated static func hydrateGuestDeck(
+        deckId: String,
+        store: SwiftDataLocalStore,
+        apiClient: APIClient
+    ) async {
+        let deckRepo = DeckRepository(client: apiClient)
+        let cardRepo = CardRepository(client: apiClient)
+        let imageRepo = ImageRepository(client: apiClient)
+        do {
+            let deck = try await deckRepo.getDeck(id: deckId)
+            await store.upsertDeck(deck)
+            let cards = try await cardRepo.listCards(deckId: deckId)
+            for card in cards {
+                await store.upsertCard(card)
+                if let images = try? await imageRepo.listCardImages(cardId: card.id) {
+                    for image in images { await store.upsertCardImage(image) }
+                }
+            }
+        } catch {
+            #if DEBUG
+            print("[SyncCoordinator] guest-deck hydration failed for \(deckId): \(error)")
             #endif
         }
     }
@@ -343,8 +412,17 @@ final class SyncCoordinator {
 
     // MARK: - Repository factories (mirror-backed)
 
-    func makeDeckRepository() -> MirrorDeckRepository {
-        MirrorDeckRepository(store: store, outbox: outbox)
+    func makeDeckRepository(ownerId: String) -> MirrorDeckRepository {
+        MirrorDeckRepository(store: store, outbox: outbox, currentUserId: ownerId)
+    }
+
+    func makeDeckGuestRepository(ownerId: String) -> MirrorDeckGuestRepository {
+        MirrorDeckGuestRepository(
+            store: store,
+            outbox: outbox,
+            currentUserId: ownerId,
+            apiClient: apiClient
+        )
     }
 
     func makeCardRepository() -> MirrorCardRepository {

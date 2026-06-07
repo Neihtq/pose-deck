@@ -25,13 +25,20 @@ struct DeckDetailView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var editMode: EditMode = .inactive
-    @State private var showEditSheet = false
     @State private var showDeleteConfirm = false
-    /// Navigation routing for the card editor + shoot mode.
+    /// Navigation routing for the card editor + shoot mode + share.
+    ///
+    /// Share is presented as a PUSHED destination (not a `.sheet`): an optimistic
+    /// grant writes the SwiftData mirror, which bumps the deck-list ticker and
+    /// re-renders the list body — that rebuilds this pushed `DeckDetailView` and
+    /// tears down any attached `.sheet`, dismissing the share UI mid-grant. A
+    /// navigationDestination is keyed by the route value and survives the parent
+    /// re-render, so the share screen stays put while guests are added/revoked.
     private enum CardRoute: Hashable {
         case existing(Card)
         case new
         case shoot
+        case share
     }
     @State private var cardRoute: CardRoute?
 
@@ -48,7 +55,8 @@ struct DeckDetailView: View {
     }
 
     var body: some View {
-        content
+        @Bindable var model = model
+        return content
             .navigationTitle(model.deck.name)
             .navigationBarTitleDisplayMode(.inline)
             .environment(\.editMode, $editMode)
@@ -58,18 +66,22 @@ struct DeckDetailView: View {
                 case .existing(let card): cardEditorFactory(card)
                 case .new: cardEditorFactory(nil)
                 case .shoot: shootModeFactory(model.deck, model.cards)
+                case .share: ShareDeckView(model: model, ticker: ticker)
                 }
             }
-            .sheet(isPresented: $showEditSheet) {
+            .sheet(isPresented: Binding(
+                get: { model.activeSheet == .edit },
+                set: { if !$0 { model.activeSheet = nil } }
+            )) {
                 DeckEditorSheet(
                     title: "Edit Deck",
                     initialName: model.deck.name,
                     initialDate: model.deck.shootDate,
                     onSave: { name, date in
-                        showEditSheet = false
+                        model.activeSheet = nil
                         Task { await model.applyEdit(name: name, shootDate: date) }
                     },
-                    onCancel: { showEditSheet = false }
+                    onCancel: { model.activeSheet = nil }
                 )
             }
             .confirmationDialog(
@@ -125,24 +137,34 @@ struct DeckDetailView: View {
                 .accessibilityIdentifier("deck.startShoot")
             }
         }
-        ToolbarItem(placement: .topBarTrailing) {
-            EditButton()
-                .accessibilityIdentifier("deck.editButton")
-        }
-        ToolbarItem(placement: .topBarTrailing) {
-            Menu {
-                Button { showEditSheet = true } label: {
-                    Label("Rename / Date", systemImage: "pencil")
+        // Editing (reorder / swipe-delete) and the deck-actions menu are
+        // owner-only — a guest's deck-detail is read-only (`[FIX #3-iOS]` /
+        // owner-gating). A guest sees no Edit / Share / Rename / Delete.
+        if model.isOwner {
+            ToolbarItem(placement: .topBarTrailing) {
+                EditButton()
+                    .accessibilityIdentifier("deck.editButton")
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button { cardRoute = .share } label: {
+                        Label("Share", systemImage: "person.crop.circle.badge.plus")
+                    }
+                    .accessibilityIdentifier("deck.share")
+                    Button { model.activeSheet = .edit } label: {
+                        Label("Rename / Date", systemImage: "pencil")
+                    }
+                    Button { Task { await model.duplicateDeck() } } label: {
+                        Label("Duplicate", systemImage: "doc.on.doc")
+                    }
+                    Divider()
+                    Button(role: .destructive) { showDeleteConfirm = true } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                } label: {
+                    Label("Deck actions", systemImage: "ellipsis.circle")
                 }
-                Button { Task { await model.duplicateDeck() } } label: {
-                    Label("Duplicate", systemImage: "doc.on.doc")
-                }
-                Divider()
-                Button(role: .destructive) { showDeleteConfirm = true } label: {
-                    Label("Delete", systemImage: "trash")
-                }
-            } label: {
-                Label("Deck actions", systemImage: "ellipsis.circle")
+                .accessibilityIdentifier("deck.actionsMenu")
             }
         }
     }
@@ -173,11 +195,15 @@ struct DeckDetailView: View {
             ContentUnavailableView {
                 Label("No cards yet", systemImage: "rectangle.on.rectangle.angled")
             } description: {
-                Text("Add a card to start building this shotlist.")
+                Text(model.isOwner
+                     ? "Add a card to start building this shotlist."
+                     : "This deck has no cards yet.")
             } actions: {
-                Button("Add Card") { cardRoute = .new }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("deck.addCard.empty")
+                if model.isOwner {
+                    Button("Add Card") { cardRoute = .new }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("deck.addCard.empty")
+                }
             }
         } else {
             List {
@@ -193,22 +219,26 @@ struct DeckDetailView: View {
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("card.row.\(card.title)")
                     }
-                    .onDelete { offsets in
+                    // Card edits (delete / reorder) are owner-only; a guest's
+                    // deck-detail is read-only (owner-gating).
+                    .onDelete(perform: model.isOwner ? { offsets in
                         Task { await model.deleteCard(at: offsets) }
-                    }
-                    .onMove { source, dest in
+                    } : nil)
+                    .onMove(perform: model.isOwner ? { source, dest in
                         Task { await model.moveCards(from: source, to: dest) }
-                    }
+                    } : nil)
                     // Disable drag while a reorder is being persisted so a new
                     // drop can't stack on an unconfirmed one (mirrors the web
                     // `dragDisabled={reordering}`). The model also guards this.
-                    .moveDisabled(model.isReordering)
+                    .moveDisabled(model.isReordering || !model.isOwner)
                 }
-                Section {
-                    Button { cardRoute = .new } label: {
-                        Label("Add Card", systemImage: "plus")
+                if model.isOwner {
+                    Section {
+                        Button { cardRoute = .new } label: {
+                            Label("Add Card", systemImage: "plus")
+                        }
+                        .accessibilityIdentifier("deck.addCard")
                     }
-                    .accessibilityIdentifier("deck.addCard")
                 }
             }
             .listStyle(.insetGrouped)

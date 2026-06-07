@@ -76,6 +76,35 @@ describe("send outcome classification", () => {
     expect(res.kind).toBe("success");
   });
 
+  // FIX #6: a `deck_guests` re-grant trips the composite-unique (deck,user)
+  // index, returning a 400 keyed on the relation fields (NOT `data.id`). The
+  // grant is idempotent — the share already exists — so it must classify as
+  // success, not a hard drop (which would toast + roll back the optimistic row).
+  it("treats a deck_guests composite-unique 400 on create as idempotent success", async () => {
+    const t = fakeTransport({
+      create: vi.fn(async () => {
+        throw pbError(400, {
+          user: { code: "validation_not_unique", message: "Value must be unique." },
+        });
+      }),
+    });
+    const res = await send(
+      entry({ entity: "deck_guests", recordId: "guest000000000a" }),
+      t,
+    );
+    expect(res.kind).toBe("success");
+  });
+
+  it("still drops a generic 400 on a NON-deck_guests create (no id field)", async () => {
+    const t = fakeTransport({
+      create: vi.fn(async () => {
+        throw pbError(400, { name: { code: "validation_required" } });
+      }),
+    });
+    const res = await send(entry({ entity: "decks" }), t);
+    expect(res).toEqual({ kind: "drop", reason: "client 400" });
+  });
+
   it("classifies a generic 400 (no id field) as drop", async () => {
     const t = fakeTransport({
       update: vi.fn(async () => {

@@ -156,6 +156,139 @@ describe("RealtimeManager event application", () => {
     expect(await db.decks.get("d1")).toBeUndefined(); // echo suppressed
   });
 
+  // ---- M5 sharing: deck_guests side-effects (FIX #1/#2/#7-web) -----------
+
+  function guest(over: Partial<{ id: string; deck: string; user: string; granted_at: string }> = {}) {
+    return {
+      id: "grant1",
+      deck: "d1",
+      user: "me",
+      granted_at: "2026-06-07T00:00:00.000Z",
+      ...over,
+    };
+  }
+
+  // FIX #1: a CREATE granting ME a deck I don't yet mirror → resync, so
+  // hydration pulls the now-visible deck + cards + images into Dexie.
+  it("triggers a resync when granted a deck that is absent locally", async () => {
+    const f = fakeProvider();
+    const fetchAll = vi.fn(emptyFetch);
+    const rm = new RealtimeManager({
+      db,
+      provider: f.provider,
+      fetchAll,
+      currentUserId: () => "me",
+    });
+    await rm.start();
+    fetchAll.mockClear();
+
+    f.emit("deck_guests", { action: "create", record: guest({ deck: "absent-deck" }) });
+    await vi.waitFor(() => {
+      // resync re-hydrates all five entities.
+      expect(fetchAll).toHaveBeenCalledTimes(5);
+    });
+  });
+
+  // FIX #1 (gate): a CREATE for a deck I ALREADY mirror is an echo — no resync.
+  it("does NOT resync when granted a deck already present locally", async () => {
+    const f = fakeProvider();
+    const fetchAll = vi.fn(emptyFetch);
+    const rm = new RealtimeManager({
+      db,
+      provider: f.provider,
+      fetchAll,
+      currentUserId: () => "me",
+    });
+    await rm.start();
+    // Seed AFTER start so the start-time hydrate (emptyFetch) doesn't prune it.
+    await db.decks.put(deck({ id: "d1", owner: "owner-x" }));
+    fetchAll.mockClear();
+
+    f.emit("deck_guests", { action: "create", record: guest({ deck: "d1" }) });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchAll).not.toHaveBeenCalled();
+  });
+
+  // FIX #1 (gate): a CREATE granting SOMEONE ELSE (owner echo) → no resync.
+  it("does NOT resync on a grant for another user", async () => {
+    const f = fakeProvider();
+    const fetchAll = vi.fn(emptyFetch);
+    const rm = new RealtimeManager({
+      db,
+      provider: f.provider,
+      fetchAll,
+      currentUserId: () => "me",
+    });
+    await rm.start();
+    fetchAll.mockClear();
+
+    f.emit("deck_guests", { action: "create", record: guest({ deck: "absent", user: "someone-else" }) });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchAll).not.toHaveBeenCalled();
+  });
+
+  // FIX #2 + #7-web: a DELETE revoking ME from a FOREIGN-owned deck → evict the
+  // deck + its cards + card_images + image_blobs + pin from Dexie.
+  it("cascade-evicts a foreign-owned deck when my guest access is revoked", async () => {
+    const f = fakeProvider();
+    const rm = new RealtimeManager({
+      db, provider: f.provider, fetchAll: emptyFetch, currentUserId: () => "me",
+    });
+    await rm.start();
+    // Seed AFTER start so the start-time hydrate (emptyFetch) doesn't prune it.
+    await db.decks.put(deck({ id: "d1", owner: "owner-x" }));
+    await db.cards.put({
+      id: "c1", deck: "d1", position: 1000, title: "x", time_slot: "", subjects: "",
+      direction: "", notes: "", client_updated_at: "", created: "", updated: "", deleted_at: "",
+    });
+    await db.card_images.put({ id: "img1", card: "c1", position: 1000, file: "p.png", created: "" });
+    await db.image_blobs.put({ key: "k1", card: "c1", recordId: "img1", blob: new Blob(["x"]), cachedAt: 0 });
+    await db.pinned_decks.put({ deckId: "d1", pinnedAt: 0 });
+    await db.deck_guests.put(guest({ id: "grant1", deck: "d1", user: "me" }));
+
+    f.emit("deck_guests", { action: "delete", record: guest({ id: "grant1", deck: "d1", user: "me" }) });
+    await vi.waitFor(async () => {
+      expect(await db.decks.get("d1")).toBeUndefined();
+    });
+    expect(await db.cards.get("c1")).toBeUndefined();
+    expect(await db.card_images.get("img1")).toBeUndefined();
+    expect(await db.image_blobs.get("k1")).toBeUndefined();
+    expect(await db.pinned_decks.get("d1")).toBeUndefined();
+    expect(await db.deck_guests.get("grant1")).toBeUndefined();
+  });
+
+  // FIX #7-web: an OWNER revoking their OWN guest must KEEP their deck.
+  it("keeps the deck when I OWN it and a guest grant is deleted", async () => {
+    const f = fakeProvider();
+    const rm = new RealtimeManager({
+      db, provider: f.provider, fetchAll: emptyFetch, currentUserId: () => "me",
+    });
+    await rm.start();
+    // Seed AFTER start so the start-time hydrate (emptyFetch) doesn't prune it.
+    await db.decks.put(deck({ id: "d1", owner: "me" }));
+    await db.deck_guests.put(guest({ id: "grant1", deck: "d1", user: "me" }));
+
+    f.emit("deck_guests", { action: "delete", record: guest({ id: "grant1", deck: "d1", user: "me" }) });
+    await vi.waitFor(async () => {
+      expect(await db.deck_guests.get("grant1")).toBeUndefined(); // grant row removed
+    });
+    expect(await db.decks.get("d1")).toBeDefined(); // but the owner's deck stays
+  });
+
+  // FIX #7-web: a DELETE whose deck row is ABSENT locally → no-op (can't confirm
+  // foreign ownership, so never evict).
+  it("does nothing on a revoke when the deck row is absent locally", async () => {
+    const f = fakeProvider();
+    const rm = new RealtimeManager({
+      db, provider: f.provider, fetchAll: emptyFetch, currentUserId: () => "me",
+    });
+    await rm.start();
+    // Should not throw; nothing to evict.
+    f.emit("deck_guests", { action: "delete", record: guest({ id: "grant1", deck: "absent", user: "me" }) });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await db.decks.get("absent")).toBeUndefined();
+  });
+
   // Regression (C4): a CONCURRENT remote write that is strictly newer than the
   // mutation we confirmed must be applied via LWW, not swallowed as our echo,
   // even when it arrives within the suppression TTL before our own echo.

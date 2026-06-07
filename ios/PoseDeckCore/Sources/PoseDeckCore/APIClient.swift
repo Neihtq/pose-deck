@@ -129,13 +129,18 @@ public actor APIClient {
     ///   - perPage: page size.
     ///   - filter: optional PocketBase filter expression.
     ///   - sort: optional sort expression (e.g. `"-created"`).
+    ///   - extraQuery: additional raw query items appended verbatim (e.g.
+    ///     `["email": value]`). Used by the guest-email lookup, whose `listRule`
+    ///     reads `@request.query.email` — a value the SDK passes as a plain query
+    ///     param rather than a filter clause.
     public func list<T: Codable & Sendable>(
         _ type: T.Type = T.self,
         collection: String,
         page: Int = 1,
         perPage: Int = 50,
         filter: String? = nil,
-        sort: String? = nil
+        sort: String? = nil,
+        extraQuery: [String: String] = [:]
     ) async throws -> ListResponse<T> {
         var query: [URLQueryItem] = [
             URLQueryItem(name: "page", value: String(page)),
@@ -143,6 +148,9 @@ public actor APIClient {
         ]
         if let filter { query.append(URLQueryItem(name: "filter", value: filter)) }
         if let sort { query.append(URLQueryItem(name: "sort", value: sort)) }
+        for (name, value) in extraQuery.sorted(by: { $0.key < $1.key }) {
+            query.append(URLQueryItem(name: name, value: value))
+        }
 
         let request = try makeRequest(
             method: "GET",

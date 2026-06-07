@@ -90,6 +90,18 @@ final class ShootModeUITests: PoseDeckUITestCase {
             "Session should be complete after acting on all cards"
         )
 
+        // Re-shoot (item 3): "Shoot again" resets the deck back to Card 1 of 3
+        // with the skipped badge cleared.
+        waitFor("shoot.reshoot", "Shoot-again button missing").tap()
+        XCTAssertTrue(
+            waitForLabel("shoot.progress", "Card 1 of 3"),
+            "Re-shoot should return to Card 1 of 3 (got '\(element("shoot.progress").label)')"
+        )
+        XCTAssertFalse(
+            element("shoot.skipped-count").waitForExistence(timeout: 3),
+            "Re-shoot should clear the skipped badge"
+        )
+
         // Exit + clean up.
         if element("shoot.exit").exists { element("shoot.exit").tap() }
         leaveDeckToList()

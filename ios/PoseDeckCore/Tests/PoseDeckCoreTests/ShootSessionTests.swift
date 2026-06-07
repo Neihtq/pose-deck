@@ -220,4 +220,45 @@ final class ShootSessionTests: XCTestCase {
         XCTAssertEqual(s.progress.position, 3, "both 'a' (just done) and 'b' (done, now behind) are passed")
         XCTAssertEqual(s.progress.total, 3)
     }
+
+    // MARK: - reset (re-shoot, item 3)
+
+    /// `reset()` restores the original order even after a skip reordered the
+    /// working order, clears all progress + undo history, and the result equals a
+    /// fresh `init(cardIds:)`.
+    func testResetRestoresOriginalOrderAndClearsProgress() {
+        var s = session(["a", "b", "c"])
+        s.skip()                           // ["b","c","a"], a skipped, current b
+        s.markDone()                       // done b
+        XCTAssertNotEqual(s.workingOrder, ["a", "b", "c"], "skip reordered the working order")
+        XCTAssertTrue(s.canUndo)
+
+        s.reset()
+
+        XCTAssertEqual(s.workingOrder, ["a", "b", "c"], "working order restored to the original")
+        XCTAssertEqual(s.originalOrder, ["a", "b", "c"], "original order preserved")
+        XCTAssertEqual(s.currentCardId, "a", "cursor back at the first original card")
+        XCTAssertFalse(s.isComplete)
+        XCTAssertFalse(s.canUndo)
+        XCTAssertTrue(s.doneIds.isEmpty)
+        XCTAssertTrue(s.skippedActiveIds.isEmpty)
+        XCTAssertEqual(s.progress.position, 1)
+        XCTAssertEqual(s.progress.total, 3)
+        XCTAssertEqual(s, ShootSession(cardIds: ["a", "b", "c"]), "a reset session equals a fresh one")
+    }
+
+    /// `originalOrder` comes from the constructor parameter, not from
+    /// `workingOrder` (which `skip()` mutates), so resetting a session that began
+    /// from a hydrated state still returns to the original card order.
+    func testResetFromHydratedSessionReturnsToOriginal() {
+        var s = ShootSession(cardIds: ["a", "b", "c"], doneIds: ["a"], skippedActiveIds: ["c"])
+        XCTAssertEqual(s.originalOrder, ["a", "b", "c"])
+        s.skip()                           // reorders working order
+        s.reset()
+        XCTAssertEqual(s.workingOrder, ["a", "b", "c"])
+        XCTAssertEqual(s.currentCardId, "a")
+        XCTAssertTrue(s.doneIds.isEmpty)
+        XCTAssertTrue(s.skippedActiveIds.isEmpty)
+        XCTAssertFalse(s.isComplete)
+    }
 }

@@ -310,6 +310,18 @@ struct MirrorCardCompletionRepository: CardCompletionRepositoring {
     func clearCompletion(cardId: String, userId: String) async throws -> CardCompletion {
         try await writePath.markCardCompletion(cardId: cardId, userId: userId, state: .pending)
     }
+
+    /// Reset every supplied completion back to `pending` so a finished deck can be
+    /// re-shot (item 3). There is no bulk completion write, so loop
+    /// `markCardCompletion(.pending)` per id: each call writes the deterministic
+    /// `(card, user)`-keyed row (LWW / `changed_at`-convergent, coalescing) and
+    /// `applyLocalCardCompletion` updates the local mirror synchronously, so when
+    /// this method returns the local mirror reads `pending` for all supplied ids.
+    func resetCompletions(forCardIds cardIds: [String], userId: String) async throws {
+        for cardId in cardIds {
+            _ = try await writePath.markCardCompletion(cardId: cardId, userId: userId, state: .pending)
+        }
+    }
 }
 
 // MARK: - Images

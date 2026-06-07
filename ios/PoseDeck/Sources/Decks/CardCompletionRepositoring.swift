@@ -21,6 +21,12 @@ protocol CardCompletionRepositoring {
     /// STATE convergence only — never shoot order). `[FIX-M6]`
     @discardableResult
     func clearCompletion(cardId: String, userId: String) async throws -> CardCompletion
+    /// Reset every supplied `(card, user)` completion back to `pending` so a
+    /// finished deck can be re-shot (item 3). The caller passes the **scoped**
+    /// id set — done ∪ skipped ∪ ids present in the prior completion fetch — not
+    /// every deck card, so we never fabricate pending rows for never-touched
+    /// cards while still clearing cross-device done state (`[M-scope]`).
+    func resetCompletions(forCardIds cardIds: [String], userId: String) async throws
 }
 
 /// In-memory ``CardCompletionRepositoring`` for `#Preview`s and unit tests.
@@ -59,6 +65,13 @@ final class FakeCardCompletionRepository: CardCompletionRepositoring {
     func clearCompletion(cardId: String, userId: String) async throws -> CardCompletion {
         try check()
         return upsert(cardId: cardId, userId: userId, state: .pending)
+    }
+
+    func resetCompletions(forCardIds cardIds: [String], userId: String) async throws {
+        try check()
+        for cardId in cardIds {
+            _ = upsert(cardId: cardId, userId: userId, state: .pending)
+        }
     }
 
     private func upsert(cardId: String, userId: String, state: CardCompletion.State) -> CardCompletion {

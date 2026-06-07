@@ -7,10 +7,13 @@ import PoseDeckCore
 /// button, a top-center "Card N of M" progress indicator, a skipped badge, an
 /// always-available exit, and an end state once every card has been acted on.
 ///
-/// **CI hook:** alongside the swipe physics, hidden accessibility buttons
-/// (`shoot.action.done` / `.skip` / `.undo`) call the *same* view-model methods
-/// as the gestures, so XCUITest drives the session deterministically without raw
-/// swipe physics (the M3 lesson: the simulator must exercise real runtime logic).
+/// **Control bar:** a single bottom control bar (in a `.safeAreaInset`, outside
+/// the card's drag transform) carries four real bordered buttons — Skip
+/// (`shoot.action.skip`), Undo (`shoot.action.undo`, gated on `canUndo`), Details
+/// (`shoot.action.details`, opens the same detail sheet as swipe-up), and Done
+/// (`shoot.action.done`) — which call the *same* view-model methods as the
+/// gestures, so XCUITest drives the session deterministically without raw swipe
+/// physics (the M3 lesson: the simulator must exercise real runtime logic).
 struct ShootModeView: View {
     @State private var model: ShootModeViewModel
     @Environment(\.dismiss) private var dismiss
@@ -40,11 +43,11 @@ struct ShootModeView: View {
                 CardDetailSheet(card: card, imageURL: model.currentImageURL)
             }
         }
-        // CI-hook controls overlaid at the bottom: drive the SAME view-model
-        // methods as the gestures so UI tests advance the session without
-        // simulating swipes. Rendered as a real, hittable (but visually muted)
-        // control row so XCUITest can scroll-to-visible + tap them.
-        .overlay(alignment: .bottom) { actionHooks }
+        // Single bottom control bar (replaces the old in-card hintBar + the
+        // overlapping actionHooks overlay). Lives in the safe-area inset so the
+        // card lays out *above* it and the buttons never sit on top of the card
+        // content. Buttons drive the SAME view-model methods as the gestures.
+        .safeAreaInset(edge: .bottom) { controlBar }
     }
 
     @ViewBuilder
@@ -87,12 +90,21 @@ struct ShootModeView: View {
             }
             .padding(.horizontal)
             Spacer(minLength: 0)
-            hintBar
         }
         .padding()
         .offset(dragOffset)
+        // Rotate toward the drag direction (~12° at full throw) and ease the scale
+        // down slightly so the card feels physical instead of stiff (item 2).
+        .rotationEffect(.degrees(Double(dragOffset.width / 18).clamped(to: -12...12)))
+        .scaleEffect(1 - min(abs(dragOffset.width), 160) / 1600)
         .gesture(swipeGesture)
+        // Fresh per-card `@State dragOffset` so a newly-swapped card never inherits
+        // the prior card's fly-off offset and re-animates off-screen (`[M-flyoff]`).
+        .id(session.currentCardId)
     }
+
+    /// The id the card view is keyed on — the pure session's current card id.
+    private var session: ShootSession { model.session }
 
     @ViewBuilder
     private var cardImage: some View {
@@ -120,18 +132,6 @@ struct ShootModeView: View {
         }
     }
 
-    private var hintBar: some View {
-        HStack {
-            Label("Skip", systemImage: "arrow.left").foregroundStyle(.secondary)
-            Spacer()
-            Label("Details", systemImage: "arrow.up").foregroundStyle(.secondary)
-            Spacer()
-            Label("Done", systemImage: "arrow.right").foregroundStyle(.secondary)
-        }
-        .font(.caption)
-        .padding(.horizontal)
-    }
-
     private var swipeGesture: some Gesture {
         DragGesture()
             .onChanged { value in dragOffset = value.translation }
@@ -139,34 +139,63 @@ struct ShootModeView: View {
                 let h = value.translation.width
                 let v = value.translation.height
                 let threshold: CGFloat = 80
-                withAnimation(.easeOut(duration: 0.2)) { dragOffset = .zero }
                 if abs(v) > abs(h) && v < -threshold {
+                    // Swipe up: open details. Spring the card back to rest.
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { dragOffset = .zero }
                     showDetailSheet = true
                 } else if h > threshold {
-                    model.done()
+                    flyOff(toLeading: false) { model.done() }
                 } else if h < -threshold {
-                    model.skip()
+                    flyOff(toLeading: true) { model.skip() }
+                } else {
+                    // Under threshold: spring back to centre.
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { dragOffset = .zero }
                 }
             }
+    }
+
+    /// Fly the current card off-screen in the swipe direction, then advance the
+    /// session. `[M-flyoff]`: the card is keyed on `session.currentCardId`, so
+    /// when `advance()` swaps the model's current card SwiftUI builds a *fresh*
+    /// card view with `dragOffset == .zero` (no inherited fly-off, no jump). We
+    /// run the mutation on the animation's completion so the departing frame
+    /// finishes before the swap. The button path calls `advance()` directly with
+    /// `dragOffset == .zero`, so it advances with zero dependence on animation.
+    private func flyOff(toLeading: Bool, _ advance: @escaping () -> Void) {
+        let offX: CGFloat = toLeading ? -700 : 700
+        withAnimation(.easeIn(duration: 0.22)) {
+            dragOffset = CGSize(width: offX, height: 0)
+        } completion: {
+            advance()
+        }
     }
 
     // MARK: - Complete state
 
     private var completeState: some View {
+        // NOTE: do not put `shoot.complete` on the enclosing VStack — making the
+        // container an accessibility element merges its children and hides the
+        // inner button ids (`shoot.reshoot`) from XCUITest. Keep the marker id on
+        // the title text so the buttons stay independently addressable.
         VStack(spacing: 16) {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 64))
                 .foregroundStyle(.green)
             Text("Shoot complete")
                 .font(.title2.weight(.semibold))
+                .accessibilityIdentifier("shoot.complete")
             if model.skippedCount > 0 {
                 Text("\(model.skippedCount) card\(model.skippedCount == 1 ? "" : "s") skipped")
                     .foregroundStyle(.secondary)
             }
-            Button("Done") { dismiss() }
-                .buttonStyle(.borderedProminent)
+            VStack(spacing: 12) {
+                Button("Shoot again") { Task { await model.reshoot() } }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("shoot.reshoot")
+                Button("Done") { dismiss() }
+                    .buttonStyle(.bordered)
+            }
         }
-        .accessibilityIdentifier("shoot.complete")
     }
 
     // MARK: - Top bar (undo / progress / skipped / exit)
@@ -209,34 +238,59 @@ struct ShootModeView: View {
         }
     }
 
-    // MARK: - CI-hook accessibility buttons (drive the same model methods)
+    // MARK: - Control bar (single bottom action row)
 
-    /// Explicit tap controls for the three actions, mirroring the swipe gestures.
-    /// These are a real, fully-interactive accessibility surface (good practice
-    /// for users who can't swipe) and double as the deterministic XCUITest hook —
-    /// the swipe physics is the primary surface but is hand-verified on-device.
-    private var actionHooks: some View {
-        HStack(spacing: 24) {
-            hookButton("Skip", system: "arrow.left", id: "shoot.action.skip", enabled: !model.isComplete) { model.skip() }
-            hookButton("Undo", system: "arrow.uturn.backward", id: "shoot.action.undo", enabled: model.canUndo) { model.undo() }
-            hookButton("Done", system: "checkmark", id: "shoot.action.done", enabled: !model.isComplete) { model.done() }
+    /// The single bottom control bar (replaces both the old in-card `hintBar` and
+    /// the overlapping `actionHooks` overlay — items 5 + 6). Four real bordered
+    /// buttons that drive the same view-model methods as the gestures: Skip, Undo
+    /// (gated on `canUndo`; `[C1]` its id `shoot.action.undo` is the XCUITest tap
+    /// target and MUST survive), Details (opens the SAME `$showDetailSheet` as the
+    /// swipe-up), and Done. Hidden in the complete state, where the reshoot/exit
+    /// buttons take over. Lives in the safe-area inset, outside the card's drag
+    /// transform, so it never overlaps the card content.
+    @ViewBuilder
+    private var controlBar: some View {
+        if !model.isComplete {
+            HStack(spacing: 16) {
+                barButton("Skip", system: "arrow.left", id: "shoot.action.skip", enabled: true) {
+                    // Button path: advance immediately with zero dependence on the
+                    // fly-off animation (`[M-flyoff]`); the `.id` swap keeps the
+                    // next card at rest.
+                    model.skip()
+                }
+                barButton("Undo", system: "arrow.uturn.backward", id: "shoot.action.undo", enabled: model.canUndo) {
+                    model.undo()
+                }
+                barButton("Details", system: "arrow.up", id: "shoot.action.details", enabled: true) {
+                    showDetailSheet = true
+                }
+                barButton("Done", system: "checkmark", id: "shoot.action.done", enabled: true) {
+                    model.done()
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+            .background(.bar)
         }
-        .padding(.vertical, 8)
-        .padding(.bottom, 8)
     }
 
-    private func hookButton(_ title: String, system: String, id: String, enabled: Bool, _ action: @escaping () -> Void) -> some View {
+    private func barButton(_ title: String, system: String, id: String, enabled: Bool, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label(title, systemImage: system)
-                .labelStyle(.iconOnly)
-                .font(.title3)
-                .frame(width: 48, height: 40)
+                .font(.body)
+                .frame(maxWidth: .infinity, minHeight: 36)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.bordered)
         .disabled(!enabled)
         .accessibilityLabel(title)
         .accessibilityIdentifier(id)
+    }
+}
+
+private extension Comparable {
+    func clamped(to range: ClosedRange<Self>) -> Self {
+        min(max(self, range.lowerBound), range.upperBound)
     }
 }
 

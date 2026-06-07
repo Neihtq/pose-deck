@@ -122,6 +122,30 @@ final class ShootModeViewModel {
         await prefetchImages()
     }
 
+    /// Re-shoot a finished deck (item 3): reset the pure session to its original
+    /// order and clear all progress, then **await** the scoped completion reset so
+    /// the local mirror reads `pending` *before* any hydration path can re-read it.
+    ///
+    /// `[M-scope]` only the cards that actually carried state are reset — the
+    /// session's done ∪ skipped ids plus any ids present in the prior fetch — never
+    /// every deck card. `[M-hydrate]` `didHydrate` stays `true`, and because the
+    /// mirror reset is awaited (not just scheduled), even a *fresh* view-model
+    /// instance whose `load()` re-fetches would now read `pending`. Never calls
+    /// `load()` (which would re-seed from completions).
+    func reshoot() async {
+        // Capture the scoped id set before resetting the session (reset clears it).
+        var scoped = session.doneIds.union(session.skippedActiveIds)
+        let cardIds = cards.map(\.id)
+        if let prior = try? await completionRepo.completions(forCardIds: cardIds, userId: userId) {
+            for completion in prior where completion.state != .pending {
+                scoped.insert(completion.card)
+            }
+        }
+        session.reset()
+        try? await completionRepo.resetCompletions(forCardIds: Array(scoped), userId: userId)
+        await prefetchImages()
+    }
+
     // MARK: - Transitions (session + persist)
 
     /// Mark the current card done (swipe right) and persist `.done`.

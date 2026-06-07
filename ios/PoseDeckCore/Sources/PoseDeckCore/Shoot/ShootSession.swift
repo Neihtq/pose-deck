@@ -30,6 +30,12 @@ public struct ShootSession: Sendable, Equatable {
     /// cards in `position` order; done cards stay in place, skipped cards move to
     /// the end.
     public private(set) var workingOrder: [String]
+    /// The original, position-sorted card ids the session was built from, captured
+    /// directly from the constructor parameter before any mutation. Used by
+    /// ``reset()`` to restore a finished session to its starting order so the deck
+    /// can be re-shot (item 3); never derived from `workingOrder`, which `skip()`
+    /// reorders (`[M-reset]`).
+    public private(set) var originalOrder: [String]
     /// Cursor into `workingOrder`. `currentCardId` is the first id at/after this
     /// index that is not yet done.
     public private(set) var index: Int
@@ -48,6 +54,7 @@ public struct ShootSession: Sendable, Equatable {
     /// design (DESIGN.md §4.2: shoot mode is read-only in v1).
     public init(cardIds: [String]) {
         self.workingOrder = cardIds
+        self.originalOrder = cardIds
         self.index = 0
         self.doneIds = []
         self.skippedActiveIds = []
@@ -65,6 +72,7 @@ public struct ShootSession: Sendable, Equatable {
     public init(cardIds: [String], doneIds: Set<String>, skippedActiveIds: Set<String>) {
         let present = Set(cardIds)
         self.workingOrder = cardIds
+        self.originalOrder = cardIds
         self.index = 0
         self.doneIds = doneIds.intersection(present)
         self.skippedActiveIds = skippedActiveIds.intersection(present)
@@ -192,5 +200,18 @@ public struct ShootSession: Sendable, Equatable {
             }
             index = fromIndex
         }
+    }
+
+    /// Restore the session to its starting state so the deck can be re-shot
+    /// (item 3): the working order returns to ``originalOrder`` (undoing any
+    /// `skip()` reorders), the cursor returns to the start, and all progress
+    /// (done/skipped) plus the undo history is cleared. The result is identical to
+    /// a fresh `init(cardIds:)` with the original ids.
+    public mutating func reset() {
+        workingOrder = originalOrder
+        index = 0
+        doneIds = []
+        skippedActiveIds = []
+        undoStack = []
     }
 }

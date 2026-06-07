@@ -11,8 +11,10 @@
 | **M1** — web prep MVP | ✅ done + gauntlet passed |
 | **M2** — iOS prep MVP | ✅ **DONE + simulator-verified** — 14 XCUITests green on iPhone 16 Pro |
 | **M3** — sync layer (outbox + realtime + offline) | ✅ **DONE + both gauntlets passed + sim-verified** — web 242 tests/4 layers/9 fixes; iOS core 290 tests; iOS app 12 fixes; SwiftData crash found+fixed by re-running the 14 XCUITests (all green) |
-| **M4** — iOS shoot mode | ⬜ next |
-| M5 sharing · M6 PDF · M7 SideStore · M8 polish | ⬜ pending |
+| **M4** — iOS shoot mode | ✅ **DONE + sim-verified** (15/15 XCUITests incl. ShootModeUITests); iOS gauntlet running |
+| **M6** — PDF export (web) | ✅ **DONE** (@react-pdf/renderer, 272 web tests, sample PDF valid) — done early (web-only, parallelized w/ M4) |
+| **M5** — sharing (deck_guests) | ⬜ next |
+| M7 SideStore · M8 polish | ⬜ pending |
 
 Working tree clean, all on `main`, nothing pushed (push only when asked).
 Latest commit: `4b77882 M3 iOS: fix SwiftData @Model crash + verify on sim`.

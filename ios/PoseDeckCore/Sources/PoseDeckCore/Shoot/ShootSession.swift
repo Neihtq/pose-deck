@@ -54,6 +54,23 @@ public struct ShootSession: Sendable, Equatable {
         self.undoStack = []
     }
 
+    /// Build a session hydrated from prior completion **state** (done/skipped),
+    /// re-deriving the per-device working order from the supplied position-sorted
+    /// card ids (`[FIX-M6]`: order is never synced — only state crosses devices).
+    ///
+    /// Hydrated state seeds no undo history (a prior-session completion is not a
+    /// reversible in-session transition) and leaves the cursor at the start; the
+    /// derived `currentCardId` skips over already-done cards. Ids in
+    /// `doneIds`/`skippedActiveIds` that are not in `cardIds` are ignored.
+    public init(cardIds: [String], doneIds: Set<String>, skippedActiveIds: Set<String>) {
+        let present = Set(cardIds)
+        self.workingOrder = cardIds
+        self.index = 0
+        self.doneIds = doneIds.intersection(present)
+        self.skippedActiveIds = skippedActiveIds.intersection(present)
+        self.undoStack = []
+    }
+
     // MARK: - Derived state
 
     /// The id of the card currently presented, or `nil` when the session is

@@ -341,3 +341,13 @@ extension LocalCardImage {
         blobETag = nil
     }
 }
+
+extension LocalCardCompletion {
+    var asCardCompletion: CardCompletion {
+        CardCompletion(
+            id: id, card: card, user: user,
+            state: CardCompletion.State(rawValue: stateRaw) ?? .pending,
+            changedAt: changedAt
+        )
+    }
+}

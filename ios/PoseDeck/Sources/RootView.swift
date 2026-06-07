@@ -109,6 +109,7 @@ struct RootView: View {
             imageRepo: imageRepo,
             ownerId: ownerId
         )
+        let completionRepo = sync.makeCardCompletionRepository()
         return DeckDetailView(
             model: detailModel,
             // Same reactive re-query as the list: a realtime card/deck merge
@@ -121,6 +122,19 @@ struct RootView: View {
                         cardId: card?.id,
                         cardRepo: cardRepo,
                         imageRepo: imageRepo
+                    )
+                )
+            },
+            shootModeFactory: { shootDeck, cards in
+                AnyView(
+                    ShootModeView(
+                        ShootModeViewModel(
+                            deck: shootDeck,
+                            cards: cards,
+                            completionRepo: completionRepo,
+                            imageRepo: imageRepo,
+                            userId: ownerId
+                        )
                     )
                 )
             }

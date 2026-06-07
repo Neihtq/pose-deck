@@ -169,4 +169,27 @@ final class ShootSessionTests: XCTestCase {
         XCTAssertTrue(s.isComplete)
         XCTAssertEqual(s.progress.total, 0)
     }
+
+    // MARK: - Hydration (B5)
+
+    /// A session hydrated from prior completion state seeds done/skipped sets,
+    /// re-derives order from the supplied card ids, and skips over done cards.
+    func testHydratedSessionSeedsStateAndSkipsDone() {
+        let s = ShootSession(cardIds: ["a", "b", "c"], doneIds: ["a"], skippedActiveIds: ["b"])
+        XCTAssertEqual(s.workingOrder, ["a", "b", "c"], "order is re-derived per-device, not synced")
+        XCTAssertTrue(s.doneIds.contains("a"))
+        XCTAssertEqual(s.currentCardId, "b", "cursor skips the already-done card")
+        XCTAssertFalse(s.isComplete, "c is still neither done nor skipped")
+        XCTAssertFalse(s.canUndo, "hydrated state seeds no undo history")
+        XCTAssertEqual(s.skippedCount, 1)
+    }
+
+    /// Hydrated ids absent from the deck snapshot are ignored (a deleted card's
+    /// stale completion can't seed phantom progress).
+    func testHydratedSessionIgnoresAbsentIds() {
+        let s = ShootSession(cardIds: ["a"], doneIds: ["ghost"], skippedActiveIds: [])
+        XCTAssertTrue(s.doneIds.isEmpty)
+        XCTAssertEqual(s.currentCardId, "a")
+        XCTAssertFalse(s.isComplete)
+    }
 }

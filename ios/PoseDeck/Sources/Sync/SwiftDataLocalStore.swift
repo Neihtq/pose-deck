@@ -187,8 +187,43 @@ actor SwiftDataLocalStore: LocalStore {
         guard let row = try? context.fetch(
             FetchDescriptor<LocalCardCompletion>(predicate: #Predicate { $0.id == id })
         ).first else { return nil }
-        let state = CardCompletion.State(rawValue: row.stateRaw) ?? .pending
-        return CardCompletion(id: row.id, card: row.card, user: row.user, state: state, changedAt: row.changedAt)
+        return row.asCardCompletion
+    }
+
+    /// `[FIX-M1]`: force-apply a user-originated completion, **bypassing the LWW
+    /// tie guard**. Unlike ``upsertCardCompletion(_:)`` (which routes through
+    /// ``MirrorMerge``/LWW for incoming realtime echoes), the user's own shoot
+    /// action must always take effect locally — even when `changedAt` equals the
+    /// existing row's clock (e.g. markDone → clear → markDone under a constant
+    /// injected clock).
+    func applyLocalCardCompletion(_ completion: CardCompletion) async {
+        let id = completion.id
+        let existing = try? context.fetch(
+            FetchDescriptor<LocalCardCompletion>(predicate: #Predicate { $0.id == id })
+        ).first
+        if let existing {
+            existing.card = completion.card
+            existing.user = completion.user
+            existing.stateRaw = completion.state.rawValue
+            existing.changedAt = completion.changedAt
+        } else {
+            context.insert(LocalCardCompletion(
+                id: completion.id, card: completion.card, user: completion.user,
+                stateRaw: completion.state.rawValue, changedAt: completion.changedAt
+            ))
+        }
+        try? context.save()
+    }
+
+    /// Deck-scoped completion read (`[B1]`): completions hold no deck relation, so
+    /// the deck scope is expressed via its card ids.
+    func cardCompletions(cardIds: [String]) async -> [CardCompletion] {
+        guard !cardIds.isEmpty else { return [] }
+        let wanted = Set(cardIds)
+        let descriptor = FetchDescriptor<LocalCardCompletion>(
+            predicate: #Predicate { wanted.contains($0.card) }
+        )
+        return ((try? context.fetch(descriptor)) ?? []).map(\.asCardCompletion)
     }
 
     // MARK: - Deck guests (no LWW: insert / hard delete on revoke)

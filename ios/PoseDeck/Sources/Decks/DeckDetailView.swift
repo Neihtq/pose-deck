@@ -19,26 +19,32 @@ struct DeckDetailView: View {
     private let ticker: MirrorChangeTicker?
     /// Builds the card editor for a given card (`nil` = create a new card).
     private let cardEditorFactory: (Card?) -> AnyView
+    /// Builds the shoot-mode screen for the deck + a snapshot of its current
+    /// cards (same injection pattern as `cardEditorFactory`). M4 §4.2.
+    private let shootModeFactory: (Deck, [Card]) -> AnyView
 
     @Environment(\.dismiss) private var dismiss
     @State private var editMode: EditMode = .inactive
     @State private var showEditSheet = false
     @State private var showDeleteConfirm = false
-    /// Navigation routing for the card editor.
+    /// Navigation routing for the card editor + shoot mode.
     private enum CardRoute: Hashable {
         case existing(Card)
         case new
+        case shoot
     }
     @State private var cardRoute: CardRoute?
 
     init(
         model: DeckDetailViewModel,
         ticker: MirrorChangeTicker? = nil,
-        cardEditorFactory: @escaping (Card?) -> AnyView
+        cardEditorFactory: @escaping (Card?) -> AnyView,
+        shootModeFactory: @escaping (Deck, [Card]) -> AnyView = { _, _ in AnyView(EmptyView()) }
     ) {
         self._model = State(initialValue: model)
         self.ticker = ticker
         self.cardEditorFactory = cardEditorFactory
+        self.shootModeFactory = shootModeFactory
     }
 
     var body: some View {
@@ -51,6 +57,7 @@ struct DeckDetailView: View {
                 switch route {
                 case .existing(let card): cardEditorFactory(card)
                 case .new: cardEditorFactory(nil)
+                case .shoot: shootModeFactory(model.deck, model.cards)
                 }
             }
             .sheet(isPresented: $showEditSheet) {
@@ -110,6 +117,14 @@ struct DeckDetailView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        if !model.isEmpty {
+            ToolbarItem(placement: .topBarLeading) {
+                Button { cardRoute = .shoot } label: {
+                    Label("Start shoot", systemImage: "camera")
+                }
+                .accessibilityIdentifier("deck.startShoot")
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             EditButton()
                 .accessibilityIdentifier("deck.editButton")

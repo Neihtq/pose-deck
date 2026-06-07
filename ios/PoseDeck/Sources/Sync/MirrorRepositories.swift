@@ -207,6 +207,49 @@ struct MirrorCardRepository: CardRepositoring {
     }
 }
 
+// MARK: - Card completions (per-user shoot progress)
+
+/// Mirror-backed completion repository. Reads serve the local mirror
+/// (deck-scoped via card ids); writes route through the shared ``OfflineWritePath``
+/// so the optimistic mirror write + the exact PocketBase wire body live in one
+/// audited place (mirroring the deck/card repos). `markDone`→`.done`,
+/// `markSkipped`→`.skipped`, `clearCompletion`→`.pending`.
+@MainActor
+struct MirrorCardCompletionRepository: CardCompletionRepositoring {
+    let store: SwiftDataLocalStore
+    let outbox: SwiftDataOutbox
+    let writePath: OfflineWritePath
+
+    init(
+        store: SwiftDataLocalStore,
+        outbox: SwiftDataOutbox,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.store = store
+        self.outbox = outbox
+        self.writePath = OfflineWritePath(store: store, outbox: outbox, now: now)
+    }
+
+    func completions(forCardIds cardIds: [String], userId: String) async throws -> [CardCompletion] {
+        await store.cardCompletions(cardIds: cardIds).filter { $0.user == userId }
+    }
+
+    @discardableResult
+    func markDone(cardId: String, userId: String) async throws -> CardCompletion {
+        try await writePath.markCardCompletion(cardId: cardId, userId: userId, state: .done)
+    }
+
+    @discardableResult
+    func markSkipped(cardId: String, userId: String) async throws -> CardCompletion {
+        try await writePath.markCardCompletion(cardId: cardId, userId: userId, state: .skipped)
+    }
+
+    @discardableResult
+    func clearCompletion(cardId: String, userId: String) async throws -> CardCompletion {
+        try await writePath.markCardCompletion(cardId: cardId, userId: userId, state: .pending)
+    }
+}
+
 // MARK: - Images
 
 /// Mirror-backed image repository. Reads serve a cached `blob` first (offline)

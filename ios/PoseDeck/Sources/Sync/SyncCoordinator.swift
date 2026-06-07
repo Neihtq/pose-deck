@@ -198,6 +198,7 @@ final class SyncCoordinator {
     private func backfill(ownerId: String) async {
         let deckRepo = DeckRepository(client: apiClient)
         let cardRepo = CardRepository(client: apiClient)
+        let completionRepo = CardCompletionRepository(client: apiClient)
         do {
             let live = try await deckRepo.listDecks()
             let trashed = try await deckRepo.listTrashedDecks()
@@ -206,6 +207,12 @@ final class SyncCoordinator {
                 let cards = try await cardRepo.listCards(deckId: deck.id)
                 for card in cards { await store.upsertCard(card) }
             }
+            // Seed prior shoot progress (so a fresh launch / second device sees
+            // already-done/skipped cards). LWW-merged via `upsertCardCompletion`
+            // so a stale baseline can't clobber a newer local action. `[FIX-C1]`
+            // is what *closes* the empty-mirror race; this only narrows it.
+            let completions = try await completionRepo.listCompletions(forUser: ownerId)
+            for completion in completions { await store.upsertCardCompletion(completion) }
         } catch {
             // Offline / transient: the mirror keeps whatever it had; realtime +
             // the next foreground backfill will reconcile.
@@ -336,5 +343,9 @@ final class SyncCoordinator {
 
     func makeImageRepository() -> MirrorImageRepository {
         MirrorImageRepository(store: store, outbox: outbox, remote: ImageRepository(client: apiClient))
+    }
+
+    func makeCardCompletionRepository() -> MirrorCardCompletionRepository {
+        MirrorCardCompletionRepository(store: store, outbox: outbox)
     }
 }

@@ -213,6 +213,54 @@ final class DeckRepositoryTests: XCTestCase {
         XCTAssertEqual(copyName.count, DeckRepository.nameMaxLength)
     }
 
+    // MARK: - name length clamp (SPEC-IOS-1 regression)
+
+    /// Regression (SPEC-IOS-1): `createDeck` must clamp an over-long `name` to the
+    /// 200-char DB ceiling (ARCHITECTURE.md §3.2) before sending it, mirroring the
+    /// web `deckApi.ts` `maxLength={200}` input cap. Previously the raw name went
+    /// straight into the create body, so a >200-char name produced an opaque
+    /// server rejection ("Something went wrong") with no client-side prevention.
+    func testCreateDeckClampsOverlongNameToDbCeiling() async throws {
+        StubURLProtocol.shared.setHandler { _ in
+            (200, Data(#"{"id":"d1","owner":"u","name":"x","deleted_at":""}"#.utf8))
+        }
+        let repo = DeckRepository(client: await makeClient(), now: { Self.fixedNow })
+        let overlong = String(repeating: "A", count: DeckRepository.nameMaxLength + 50)
+        _ = try await repo.createDeck(name: overlong, ownerId: "u")
+
+        let body = try lastBody()
+        let sent = try XCTUnwrap(body["name"] as? String, "create must send a name")
+        XCTAssertEqual(sent.count, DeckRepository.nameMaxLength, "name clamped to the 200-char DB ceiling")
+    }
+
+    /// Regression (SPEC-IOS-1): `renameDeck` must likewise clamp an over-long
+    /// `name` to the DB ceiling before the PATCH, so a long rename never surfaces
+    /// as an opaque server error (web `deckApi.ts` `maxLength={200}` parity).
+    func testRenameDeckClampsOverlongNameToDbCeiling() async throws {
+        StubURLProtocol.shared.setHandler { _ in
+            (200, Data(#"{"id":"d1","owner":"u","name":"x","deleted_at":""}"#.utf8))
+        }
+        let repo = DeckRepository(client: await makeClient(), now: { Self.fixedNow })
+        let overlong = String(repeating: "B", count: DeckRepository.nameMaxLength + 50)
+        _ = try await repo.renameDeck(id: "d1", name: overlong)
+
+        let body = try lastBody()
+        let sent = try XCTUnwrap(body["name"] as? String, "rename must send a name")
+        XCTAssertEqual(sent.count, DeckRepository.nameMaxLength, "name clamped to the 200-char DB ceiling")
+    }
+
+    /// A name at or under the ceiling must pass through unchanged (the clamp is a
+    /// ceiling, not a transform).
+    func testCreateDeckLeavesInBoundsNameUnchanged() async throws {
+        StubURLProtocol.shared.setHandler { _ in
+            (200, Data(#"{"id":"d1","owner":"u","name":"x","deleted_at":""}"#.utf8))
+        }
+        let repo = DeckRepository(client: await makeClient(), now: { Self.fixedNow })
+        _ = try await repo.createDeck(name: "Smith Wedding", ownerId: "u")
+        let body = try lastBody()
+        XCTAssertEqual(body["name"] as? String, "Smith Wedding")
+    }
+
     // MARK: - list pagination (CORR-2 regression)
 
     /// Regression for CORR-2: a user with more decks than fit on one page must

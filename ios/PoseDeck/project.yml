@@ -65,6 +65,23 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_EMIT_LOC_STRINGS: true
         ENABLE_USER_SCRIPT_SANDBOXING: true
+        # [swift-2] Build the app target in the Swift 6 LANGUAGE MODE so the
+        # data-race-safety design of the concurrent sync glue (SyncCoordinator,
+        # the @MainActor mirror repos, the SwiftDataLocalStore actor, the view
+        # models) is actually ENFORCED at compile time. The repo-wide default is
+        # Swift 5 (settings.base.SWIFT_VERSION 5.9), under which Sendable /
+        # cross-actor-capture violations are downgraded to warnings or dropped —
+        # so a regression that lets a non-Sendable escape (e.g. a ModelContext
+        # leaving its actor, or sending a @MainActor repo into a nonisolated
+        # closure) would silently compile. SWIFT_VERSION 6.0 promotes those to
+        # hard errors, making this static check fail the build. The simulator
+        # cannot run here, so this is the ONLY validation path for the races.
+        #
+        # PoseDeckCore is already swift-tools-version 6.1 (Swift 6 language
+        # mode); this brings the app target up to the same enforcement level.
+        # SwiftData's #Predicate / @Model macro expansions are correctly
+        # Sendable-annotated for Swift 6, so they do NOT error here.
+        SWIFT_VERSION: "6.0"
         # Keychain-access-group entitlement so the persisted auth session works
         # on an ad-hoc-signed simulator build (UI tests). See the entitlements
         # file for the errSecMissingEntitlement (-34018) rationale.

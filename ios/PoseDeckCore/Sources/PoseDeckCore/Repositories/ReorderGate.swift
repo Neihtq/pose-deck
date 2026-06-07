@@ -21,8 +21,16 @@ public struct ReorderGate: Sendable, Equatable {
     /// disable drag in the UI (mirrors the web `dragDisabled={reordering}`).
     public private(set) var isBusy: Bool
 
+    /// Set when a mirror re-query (realtime / outbox-confirmation / ticker bump)
+    /// arrived *while* a reorder was in flight and was therefore skipped. The
+    /// reorder's exit path consults this to run exactly one coalesced refresh
+    /// after it settles, so the screen still converges to the merged remote
+    /// state without clobbering the optimistic order mid-flight. See `swift-1`.
+    public private(set) var pendingRefresh: Bool
+
     public init(isBusy: Bool = false) {
         self.isBusy = isBusy
+        self.pendingRefresh = false
     }
 
     /// Attempt to begin a reorder. Returns `true` and marks the gate busy when
@@ -39,7 +47,33 @@ public struct ReorderGate: Sendable, Equatable {
 
     /// Mark the in-flight reorder finished, re-opening the gate. Safe to call
     /// even when not busy. Intended for a `defer` so it runs on every exit path.
+    /// Does not clear `pendingRefresh` — the caller drains that separately via
+    /// `takePendingRefresh()` so a coalesced re-query runs after the gate reopens.
     public mutating func finish() {
         isBusy = false
+    }
+
+    /// Record that a mirror re-query should run. While a reorder is in flight a
+    /// concurrent re-read of the mirror would overwrite the optimistic order with
+    /// a partially-restriped (neither-old-nor-new) ordering — the `swift-1`
+    /// actor-interleaving window — so callers skip the re-read and call this to
+    /// remember that one is owed. Returns `true` when the refresh should be run
+    /// *now* (the gate is idle), and `false` when it was deferred (busy), so the
+    /// caller can `guard gate.requestRefresh() else { return }`.
+    public mutating func requestRefresh() -> Bool {
+        if isBusy {
+            pendingRefresh = true
+            return false
+        }
+        return true
+    }
+
+    /// Consume any deferred refresh recorded during the in-flight window,
+    /// clearing the flag. Returns `true` exactly once per coalesced batch of
+    /// skipped re-queries, so the reorder's exit path runs a single catch-up
+    /// refresh after the gate reopens.
+    public mutating func takePendingRefresh() -> Bool {
+        defer { pendingRefresh = false }
+        return pendingRefresh
     }
 }

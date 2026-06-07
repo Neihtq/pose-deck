@@ -68,7 +68,19 @@ final class DeckDetailViewModel {
         }
     }
 
+    /// Re-read cards from the mirror after a realtime merge / outbox confirmation
+    /// (the ticker bump) or a return from the editor.
+    ///
+    /// SWIFT-1 guard: while a reorder is being persisted, re-reading the mirror
+    /// would overwrite the optimistic order with a partially-restriped ordering.
+    /// `SwiftDataLocalStore` is an `actor` and `OfflineWritePath.reorderCards`
+    /// upserts the moved cards one at a time across `await` boundaries, so a
+    /// re-read landing in that gap can observe a neither-old-nor-new order and
+    /// clobber the optimistic `cards` — defeating `ReorderGate`. So we skip the
+    /// re-read while busy and remember that one is owed; `moveCards` runs the
+    /// coalesced catch-up refresh once after the reorder settles.
     func refresh() async {
+        guard reorderGate.requestRefresh() else { return }
         do {
             cards = try await cardRepo.listCards(deckId: deck.id)
             state = .loaded
@@ -139,7 +151,6 @@ final class DeckDetailViewModel {
         // and launch a second interleaving PATCH loop. Mirrors the web
         // early-return in `handleDragEnd`.
         guard reorderGate.begin() else { return }
-        defer { reorderGate.finish() }
 
         let before = currentPositions
         cards.move(fromOffsets: source, toOffset: destination)
@@ -160,6 +171,14 @@ final class DeckDetailViewModel {
             // corrupted server state.
             cards = CardRepository.restoredOrder(of: cards, to: before)
             await loadThumbnails()
+        }
+        // Reopen the gate, then drain any mirror re-query that arrived (and was
+        // skipped) while the reorder was in flight. Done explicitly rather than
+        // in a `defer` so the catch-up `refresh()` runs *after* the gate is open
+        // — otherwise `requestRefresh()` would just re-defer it forever (SWIFT-1).
+        reorderGate.finish()
+        if reorderGate.takePendingRefresh() {
+            await refresh()
         }
     }
 

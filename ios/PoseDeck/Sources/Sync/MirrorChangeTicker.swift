@@ -25,15 +25,25 @@ final class MirrorChangeTicker {
     /// `PoseDeckCore` so the burst-into-one-bump contract is unit-testable.
     private var coalescer = ChangeTickerCoalescer()
 
-    @ObservationIgnored private var observer: NSObjectProtocol?
-    @ObservationIgnored private var debounceTask: Task<Void, Never>?
+    /// Teardown state (the NotificationCenter observer token + debounce task)
+    /// lives in a nonisolated reference so the (nonisolated) `deinit` can tear
+    /// it down without touching `@MainActor`-isolated stored properties — which
+    /// Swift 6 forbids for non-Sendable state. The token and task are only ever
+    /// mutated from the main actor (init + `scheduleBump`), and both
+    /// `NotificationCenter.removeObserver` and `Task.cancel` are safe to call
+    /// from any thread, so the nonisolated read in `deinit` is race-free.
+    private let cleanup = Cleanup()
+    @ObservationIgnored private var debounceTask: Task<Void, Never>? {
+        get { cleanup.debounceTask }
+        set { cleanup.debounceTask = newValue }
+    }
     @ObservationIgnored private let debounce: Duration
 
     /// - Parameter debounceMilliseconds: quiet window before a bump (default 300ms,
     ///   inside the required 250–500ms band).
     init(debounceMilliseconds: Int = 300) {
         self.debounce = .milliseconds(debounceMilliseconds)
-        observer = NotificationCenter.default.addObserver(
+        cleanup.observer = NotificationCenter.default.addObserver(
             forName: ModelContext.didSave,
             object: nil,
             queue: .main
@@ -48,8 +58,22 @@ final class MirrorChangeTicker {
     }
 
     deinit {
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        debounceTask?.cancel()
+        // Nonisolated teardown via the shared holder (see `cleanup`).
+        cleanup.tearDown()
+    }
+
+    /// Nonisolated holder for teardown state so `deinit` can release it without
+    /// crossing actor isolation. `@unchecked Sendable`: the stored values are
+    /// only mutated on the main actor, and `removeObserver` / `Task.cancel` are
+    /// thread-safe, so the deinit-time access cannot race a live mutation.
+    private final class Cleanup: @unchecked Sendable {
+        var observer: NSObjectProtocol?
+        var debounceTask: Task<Void, Never>?
+
+        func tearDown() {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            debounceTask?.cancel()
+        }
     }
 
     /// Coalesce a burst of change notifications into a single bump after the

@@ -91,7 +91,10 @@ public struct DeckRepository: Sendable {
     ///
     /// `owner` is required and not auto-populated by the server, so the caller
     /// must pass the authenticated user id. An unset `shootDate` is sent as `""`
-    /// to match PocketBase's "unset datetime" representation.
+    /// to match PocketBase's "unset datetime" representation. `name` is clamped
+    /// to the DB ceiling (``nameMaxLength``, ARCHITECTURE.md §3.2 max 200) so an
+    /// over-long name never reaches the server as an opaque rejection (web
+    /// `deckApi.ts` `maxLength={200}` input parity).
     @discardableResult
     public func createDeck(
         name: String,
@@ -100,7 +103,7 @@ public struct DeckRepository: Sendable {
     ) async throws -> Deck {
         let body = CreateDeckBody(
             owner: ownerId,
-            name: name,
+            name: String(name.prefix(Self.nameMaxLength)),
             shoot_date: shootDate.map(PocketBaseDate.string(from:)) ?? "",
             deleted_at: "",
             client_updated_at: PocketBaseDate.string(from: now())
@@ -109,9 +112,17 @@ public struct DeckRepository: Sendable {
     }
 
     /// Rename a deck.
+    ///
+    /// `name` is clamped to the DB ceiling (``nameMaxLength``, ARCHITECTURE.md
+    /// §3.2 max 200) so an over-long name never reaches the server as an opaque
+    /// rejection — mirrors the web `deckApi.ts` `maxLength={200}` input cap and
+    /// the create/duplicate clamps.
     @discardableResult
     public func renameDeck(id: String, name: String) async throws -> Deck {
-        let body = RenameBody(name: name, client_updated_at: PocketBaseDate.string(from: now()))
+        let body = RenameBody(
+            name: String(name.prefix(Self.nameMaxLength)),
+            client_updated_at: PocketBaseDate.string(from: now())
+        )
         return try await client.update(collection: collection, id: id, body: body)
     }
 

@@ -129,7 +129,14 @@ struct MirrorDeckRepository: DeckRepositoring {
         guard let source = await store.deck(id: id), source.deletedAt == nil else {
             throw DeckRepositoryError.notFound(id: id)
         }
-        let copy = try await writePath.createDeck(name: "\(source.name) (copy)", shootDate: nil, ownerId: ownerId)
+        // Clamp the copy name to the DB ceiling (ARCHITECTURE.md §3.2, max 200)
+        // before appending " (copy)" so the suffix survives and the enqueued
+        // create is never server-rejected — mirrors DeckRepository.duplicateDeck
+        // and the web deckApi.ts. OfflineWritePath.createDeck also clamps as a
+        // backstop, but clamping the base here keeps the " (copy)" suffix intact.
+        let suffix = " (copy)"
+        let base = String(source.name.prefix(DeckRepository.nameMaxLength - suffix.count))
+        let copy = try await writePath.createDeck(name: base + suffix, shootDate: nil, ownerId: ownerId)
         let sourceCards = await store.cards(deckId: id).filter { $0.deletedAt == nil }
         for card in sourceCards {
             let fields = CardRepository.CardFields(

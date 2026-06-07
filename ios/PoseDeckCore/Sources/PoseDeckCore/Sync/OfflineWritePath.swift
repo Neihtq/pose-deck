@@ -43,10 +43,20 @@ public struct OfflineWritePath: Sendable {
 
     /// Create a deck locally + enqueue. Returns the optimistic ``Deck`` (with the
     /// client-minted id) so the UI can navigate immediately.
+    ///
+    /// `name` is clamped to the DB ceiling (``DeckRepository/nameMaxLength``,
+    /// ARCHITECTURE.md §3.2 max 200) here so EVERY offline create — a direct
+    /// create or a `duplicateDeck` " (copy)" name — is protected at one audited
+    /// chokepoint. Without this, an over-long name would write an optimistic
+    /// local row but produce an outbox create the server 4xxes and drops, leaving
+    /// a silent ghost deck (and any enqueued child copies referencing it) that
+    /// never syncs. Matches the clamp in ``DeckRepository/duplicateDeck`` and the
+    /// web `deckApi.ts` reference.
     @discardableResult
     public func createDeck(name: String, shootDate: Date? = nil, ownerId: String) async throws -> Deck {
         let id = newId()
         let stamp = now()
+        let name = String(name.prefix(DeckRepository.nameMaxLength))
         let deck = Deck(
             id: id,
             owner: ownerId,
@@ -70,7 +80,14 @@ public struct OfflineWritePath: Sendable {
     }
 
     /// Rename a deck locally + enqueue.
+    ///
+    /// `name` is clamped to the DB ceiling (``DeckRepository/nameMaxLength``,
+    /// ARCHITECTURE.md §3.2 max 200) — same chokepoint discipline as
+    /// ``createDeck(name:shootDate:ownerId:)`` so an over-long rename never
+    /// writes an optimistic local row whose outbox update the server 4xxes and
+    /// drops (web `deckApi.ts` `maxLength={200}` parity).
     public func renameDeck(_ deck: Deck, name: String) async throws {
+        let name = String(name.prefix(DeckRepository.nameMaxLength))
         var updated = deck
         updated.name = name
         updated.clientUpdatedAt = now()

@@ -80,6 +80,29 @@ final class MirrorPurgeTests: XCTestCase {
     /// while a present blob — even empty bytes — reads back through `cachedBlob`.
     /// This is what distinguishes a not-yet-cached image from a cached one in the
     /// offline read path, without an optional `Data?` that would crash SwiftData.
+    // MARK: - SEC-IOS-1: shared HTTP cache flush on sign-out
+
+    /// A stand-in for `URLCache.shared`, recording flush calls so we can assert
+    /// the sign-out purge policy reaches the HTTP cache. The real
+    /// `URLCache: PurgeableResponseCache` conformance is compile-verified.
+    private final class SpyResponseCache: PurgeableResponseCache {
+        private(set) var flushCount = 0
+        func removeAllCachedResponses() { flushCount += 1 }
+    }
+
+    /// SEC-IOS-1: the sign-out purge must flush the shared HTTP response cache so
+    /// a prior user's pre-cached / AsyncImage-loaded protected `card_images`
+    /// bytes don't survive as unencrypted remanence in the process-global,
+    /// non-per-user `URLCache.shared` on-disk store. `URLCache.shared` itself is
+    /// process-global and shared across `swift test` cases, so we cover the
+    /// policy over the `PurgeableResponseCache` seam the app's `purgeMirror`
+    /// invokes; the `URLCache.shared` wiring is compile-verified via `xcodebuild`.
+    func testClearSharedHTTPCacheFlushesTheCache() {
+        let cache = SpyResponseCache()
+        MirrorPurge.clearSharedHTTPCache(cache)
+        XCTAssertEqual(cache.flushCount, 1, "sign-out must flush the shared HTTP response cache so protected image bytes don't persist for the next user")
+    }
+
     func testCachedBlobReflectsPresenceNotEmptiness() {
         let notCached = FakeImageRow(blob: nil)
         XCTAssertFalse(notCached.isCached)

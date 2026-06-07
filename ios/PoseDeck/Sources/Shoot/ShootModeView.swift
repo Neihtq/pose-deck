@@ -32,6 +32,9 @@ struct ShootModeView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .navigationBar)
         .task { await model.load() }
+        // Tear down any in-flight persist / prefetch work when the screen goes
+        // away so unstructured tasks can't outlive it ([FIX-swift-4]).
+        .onDisappear { model.cancelPendingWork() }
         .sheet(isPresented: $showDetailSheet) {
             if let card = model.currentCard {
                 CardDetailSheet(card: card, imageURL: model.currentImageURL)

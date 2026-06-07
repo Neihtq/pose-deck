@@ -25,6 +25,7 @@ final class RepositoryIntegrationTests: XCTestCase {
         var cardIds: [String] = []
         var imageIds: [String] = []
         var guestIds: [String] = []
+        var completionIds: [String] = []
     }
 
     // MARK: - Auth
@@ -240,6 +241,65 @@ final class RepositoryIntegrationTests: XCTestCase {
         XCTAssertEqual(Array(bytes.prefix(2)), [0xFF, 0xD8], "fetched bytes must be the JPEG we uploaded (SOI marker)")
     }
 
+    // MARK: - card_completions: deterministic id + idempotent upsert (M4)
+
+    /// The M4 shoot-mode write contract against the REAL server: a `(card, user)`
+    /// completion has a composite-unique constraint (ARCHITECTURE.md §3.6), and
+    /// the repo mints a **deterministic** record id so the first mark is an
+    /// idempotent `.create` and every later state flip lands on the SAME row.
+    ///
+    /// This is the one M4 path the offline unit suite can only *simulate* (the
+    /// StubURLProtocol fakes PocketBase's `validation_not_unique` 400 shape). Here
+    /// we prove the live server actually:
+    ///  1. accepts the client-supplied deterministic id on create (mark done),
+    ///  2. rejects a second create on the same `(card, user)` with the
+    ///     unique-collision 400 the repo's `upsert` falls back to a PATCH on
+    ///     (mark skipped → state flips on the existing row, not a duplicate),
+    ///  3. returns the single converged row via `listCompletions(forUser:)`.
+    func testCardCompletionDeterministicIdUpsertRoundTrip() async throws {
+        try IntegrationEnvironment.skipIfDisabled()
+        let client = IntegrationEnvironment.makeClient()
+        var cleanup = Cleanup()
+        defer { hardCleanup(client: client, cleanup: cleanup) }
+
+        let auth = try await client.authWithPassword(
+            email: IntegrationEnvironment.ownerEmail,
+            password: IntegrationEnvironment.ownerPassword
+        )
+        let deckRepo = DeckRepository(client: client)
+        let cardRepo = CardRepository(client: client)
+        let completionRepo = CardCompletionRepository(client: client)
+
+        let deck = try await deckRepo.createDeck(name: uniqueName("integ-compl"), ownerId: auth.record.id)
+        cleanup.deckIds.append(deck.id)
+        let card = try await cardRepo.createCard(deckId: deck.id, fields: .init(title: "Shoot me"))
+        cleanup.cardIds.append(card.id)
+
+        let expectedId = CardCompletion.deterministicId(card: card.id, user: auth.record.id)
+
+        // 1. First mark: a CREATE with the client-minted deterministic id.
+        let done = try await completionRepo.markDone(cardId: card.id, userId: auth.record.id)
+        cleanup.completionIds.append(done.id)
+        XCTAssertEqual(done.id, expectedId, "the server must accept and store the client-supplied deterministic id")
+        XCTAssertEqual(done.state, .done)
+        XCTAssertEqual(done.card, card.id)
+        XCTAssertEqual(done.user, auth.record.id)
+
+        // 2. Second mark on the SAME (card, user): the create collides on the
+        // composite-unique constraint (400 validation_not_unique) and `upsert`
+        // falls back to a PATCH — the state flips on the existing row.
+        let skipped = try await completionRepo.markSkipped(cardId: card.id, userId: auth.record.id)
+        XCTAssertEqual(skipped.id, expectedId, "the flip must land on the SAME deterministic row, not a duplicate")
+        XCTAssertEqual(skipped.state, .skipped, "the unique-collision path must PATCH the new state, not drop it")
+
+        // 3. Exactly one converged row is visible for this user/card.
+        let all = try await completionRepo.listCompletions(forUser: auth.record.id)
+        let mine = all.filter { $0.card == card.id }
+        XCTAssertEqual(mine.count, 1, "there must be exactly one completion row for the (card, user) pair")
+        XCTAssertEqual(mine.first?.state, .skipped, "the listed row reflects the latest flipped state")
+        XCTAssertEqual(mine.first?.id, expectedId)
+    }
+
     // MARK: - Guest visibility
 
     func testGuestCanSeeSharedDeckButNotUnsharedOne() async throws {
@@ -285,11 +345,12 @@ final class RepositoryIntegrationTests: XCTestCase {
 
     /// Hard-delete every record a test created, ignoring failures (best-effort,
     /// so a partial failure mid-test still cleans up what exists). Order:
-    /// images → guests → cards → decks (children before parents).
+    /// images → completions → guests → cards → decks (children before parents).
     private func hardCleanup(client: APIClient, cleanup: Cleanup) {
         let semaphore = DispatchSemaphore(value: 0)
         Task {
             for id in cleanup.imageIds { try? await client.delete(collection: ImageRepository.collection, id: id) }
+            for id in cleanup.completionIds { try? await client.delete(collection: "card_completions", id: id) }
             for id in cleanup.guestIds { try? await client.delete(collection: "deck_guests", id: id) }
             for id in cleanup.cardIds { try? await client.delete(collection: "cards", id: id) }
             for id in cleanup.deckIds { try? await client.delete(collection: "decks", id: id) }

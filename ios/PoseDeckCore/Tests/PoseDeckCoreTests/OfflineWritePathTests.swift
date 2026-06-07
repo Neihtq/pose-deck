@@ -44,6 +44,75 @@ final class OfflineWritePathTests: XCTestCase {
         XCTAssertEqual(body?["name"] as? String, "Shoot")
     }
 
+    /// Regression (CORR-IOS-DUP-NAME-CLAMP): the production offline-first
+    /// `duplicateDeck` (MirrorDeckRepository) routes its " (copy)" name through
+    /// `OfflineWritePath.createDeck`, which previously did NOT clamp `name` to the
+    /// 200-char DB ceiling. A source name within 7 chars of 200 overflowed once
+    /// " (copy)" was appended, producing an optimistic local deck plus an outbox
+    /// create the server 4xxes and drops — a silent ghost duplicate. The clamp in
+    /// `createDeck` is the chokepoint that protects EVERY offline create; this
+    /// asserts both the optimistic local row and the enqueued wire body land at or
+    /// under the ceiling. Mirrors DeckRepositoryTests.testDuplicateDeckClampsCopyNameToDbCeiling.
+    func testCreateDeckClampsOverlongNameToDbCeiling() async throws {
+        let store = InMemoryLocalStore()
+        let outbox = InMemoryOutbox()
+        let path = makePath(store: store, outbox: outbox, ids: ["deck00000000001"])
+
+        // Simulate the duplicate path's worst case: a 200-char source name plus
+        // the " (copy)" suffix = 207 chars handed to createDeck.
+        let overlong = String(repeating: "A", count: DeckRepository.nameMaxLength) + " (copy)"
+        XCTAssertGreaterThan(overlong.count, DeckRepository.nameMaxLength)
+
+        let deck = try await path.createDeck(name: overlong, ownerId: "u1")
+
+        // Optimistic local row is clamped.
+        XCTAssertEqual(deck.name.count, DeckRepository.nameMaxLength, "returned deck name clamped")
+        let stored = await store.deck(id: "deck00000000001")
+        XCTAssertEqual(stored?.name.count, DeckRepository.nameMaxLength, "mirror row name clamped")
+
+        // The enqueued wire body the server will receive is at/under the ceiling,
+        // so the create is no longer rejected and dropped.
+        let pending = await outbox.pending()
+        XCTAssertEqual(pending.count, 1)
+        let body = try JSONSerialization.jsonObject(with: pending[0].payload) as? [String: Any]
+        let wireName = try XCTUnwrap(body?["name"] as? String)
+        XCTAssertLessThanOrEqual(wireName.count, DeckRepository.nameMaxLength, "wire name clamped to DB ceiling")
+        XCTAssertEqual(wireName, deck.name, "mirror and wire names agree")
+    }
+
+    /// Regression (SPEC-IOS-1): the offline `renameDeck` previously forwarded the
+    /// raw `name` into both the optimistic local row and the outbox update body. A
+    /// rename >200 chars wrote an optimistic local row but produced an outbox
+    /// update the server 4xxes and drops — leaving the mirror permanently out of
+    /// sync with the server. The clamp mirrors `createDeck`'s chokepoint and the
+    /// web `deckApi.ts` `maxLength={200}` input cap.
+    func testRenameDeckClampsOverlongNameToDbCeiling() async throws {
+        let store = InMemoryLocalStore()
+        let outbox = InMemoryOutbox()
+        let path = makePath(store: store, outbox: outbox)
+
+        // Seed with an older clock so the rename (stamped at fixedNow) wins LWW.
+        let deck = Deck(id: "deck00000000001", owner: "u1", name: "Old",
+                        clientUpdatedAt: fixedNow.addingTimeInterval(-60))
+        await store.upsertDeck(deck)
+
+        let overlong = String(repeating: "B", count: DeckRepository.nameMaxLength + 50)
+        try await path.renameDeck(deck, name: overlong)
+
+        // Optimistic local row is clamped.
+        let stored = await store.deck(id: "deck00000000001")
+        XCTAssertEqual(stored?.name.count, DeckRepository.nameMaxLength, "mirror row name clamped")
+
+        // The enqueued update body is at/under the ceiling so the PATCH is accepted.
+        let pending = await outbox.pending()
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pending.first?.type, .update)
+        let body = try JSONSerialization.jsonObject(with: pending[0].payload) as? [String: Any]
+        let wireName = try XCTUnwrap(body?["name"] as? String)
+        XCTAssertEqual(wireName.count, DeckRepository.nameMaxLength, "wire name clamped to DB ceiling")
+        XCTAssertEqual(wireName, stored?.name, "mirror and wire names agree")
+    }
+
     func testCreateCardComputesPositionFromLocalStore() async throws {
         let store = InMemoryLocalStore()
         await store.upsertCard(Card(id: "c1", deck: "d1", position: 1000, title: "a", clientUpdatedAt: fixedNow))

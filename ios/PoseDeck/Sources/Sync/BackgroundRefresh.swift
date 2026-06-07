@@ -35,7 +35,14 @@ enum BackgroundRefresh {
                 task.setTaskCompleted(success: false)
                 return
             }
-            handle(refreshTask)
+            // BGTaskScheduler invokes this launch handler on the main thread, so
+            // `refreshTask` is already main-actor-confined in practice — but its
+            // type (`BGAppRefreshTask`) is non-Sendable, so the compiler can't
+            // know that as it crosses from this nonisolated @Sendable closure to
+            // the @MainActor `handle`. The box carries the OS's main-thread
+            // guarantee across that boundary; `assumeIsolated` then asserts it.
+            let box = UncheckedSendableBox(refreshTask)
+            MainActor.assumeIsolated { handle(box.value) }
         }
     }
 
@@ -56,7 +63,16 @@ enum BackgroundRefresh {
 
     /// Handle a fired refresh task: compute targets, run the pre-cache under the
     /// task's expiration deadline, reschedule the next run, and report completion.
+    @MainActor
     private static func handle(_ task: BGAppRefreshTask) {
+        // `task` is confined to the main actor for its whole lifetime here, so
+        // `setTaskCompleted` and the `expirationHandler` assignment never race:
+        // both `handle` and the work closure are main-actor-isolated, and the
+        // expiration handler only touches the Sendable `work` Task. Without this
+        // isolation `task` (a non-Sendable `BGAppRefreshTask`) would be *sent*
+        // from the nonisolated register-handler context into a main-actor work
+        // closure while still being used nonisolated to set `expirationHandler`
+        // — the exact cross-actor send Swift 6 strict concurrency rejects.
         let work = Task { @MainActor in
             guard let provider = precacheProvider, let plan = await provider() else {
                 task.setTaskCompleted(success: false)
@@ -68,7 +84,8 @@ enum BackgroundRefresh {
             schedule(earliestBeginDate: plan.nextRefresh)
             task.setTaskCompleted(success: true)
         }
-        // Expiration: cancel the work so the OS doesn't kill us mid-write.
+        // Expiration: cancel the work so the OS doesn't kill us mid-write. The
+        // closure captures only the Sendable `work` handle, not `task`.
         task.expirationHandler = { work.cancel() }
     }
 
@@ -85,4 +102,14 @@ enum BackgroundRefresh {
         )
         #endif
     }
+}
+
+/// Carries a non-Sendable value across an isolation boundary where a runtime
+/// invariant (here: BGTaskScheduler always invokes its launch handler on the
+/// main thread) guarantees there is no concurrent access. Use only with such a
+/// guarantee, immediately re-entering the value's home isolation (e.g. via
+/// `MainActor.assumeIsolated`) on the other side.
+private struct UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+    init(_ value: Value) { self.value = value }
 }

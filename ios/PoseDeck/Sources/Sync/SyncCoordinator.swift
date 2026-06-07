@@ -304,6 +304,16 @@ final class SyncCoordinator {
             try? context.delete(model: model)
         }
         try? context.save()
+
+        // SEC-IOS-1: also flush the shared HTTP response cache. Pre-cached and
+        // AsyncImage-displayed protected `card_images` responses (?token= URLs)
+        // are cached to URLCache.shared's process-global, non-per-user on-disk
+        // store under their long-lived Cache-Control. The mirror is the intended
+        // offline store (purged above), so the HTTP-cache copy is pure remanence
+        // — a previous user's private image bytes left unencrypted in a shared
+        // cache dir after sign-out. Clear it so the next user of a shared install
+        // can't recover them.
+        MirrorPurge.clearSharedHTTPCache(URLCache.shared)
     }
 
     // MARK: - Background refresh scheduling

@@ -27,6 +27,12 @@ final class ShootModeViewModel {
     @ObservationIgnored private let imageRepo: any CardImageReading
     @ObservationIgnored private let userId: String
 
+    /// Owns the lifecycle of the fire-and-forget persist + prefetch work so it is
+    /// cancellable and coalesced rather than leaking past the screen
+    /// (`[FIX-swift-4]`). Cancelled via ``cancelPendingWork()`` from the view's
+    /// disappear hook.
+    @ObservationIgnored private let scheduler = ShootTaskScheduler()
+
     /// The pure state machine the view drives.
     private(set) var session: ShootSession
 
@@ -118,7 +124,7 @@ final class ShootModeViewModel {
         guard let cardId = session.currentCardId else { return }
         session.markDone()
         persist(cardId: cardId) { try await $0.markDone(cardId: cardId, userId: $1) }
-        Task { await prefetchImages() }
+        scheduler.coalesce { [weak self] in await self?.prefetchImages() }
     }
 
     /// Skip the current card to the end (swipe left) and persist `.skipped`.
@@ -126,7 +132,7 @@ final class ShootModeViewModel {
         guard let cardId = session.currentCardId else { return }
         session.skip()
         persist(cardId: cardId) { try await $0.markSkipped(cardId: cardId, userId: $1) }
-        Task { await prefetchImages() }
+        scheduler.coalesce { [weak self] in await self?.prefetchImages() }
     }
 
     /// Reverse the most recent transition and persist the reversed card back to
@@ -137,7 +143,15 @@ final class ShootModeViewModel {
         guard let reversedCardId = poppedCardId() else { return }
         session.undo()
         persist(cardId: reversedCardId) { try await $0.clearCompletion(cardId: reversedCardId, userId: $1) }
-        Task { await prefetchImages() }
+        scheduler.coalesce { [weak self] in await self?.prefetchImages() }
+    }
+
+    /// Cancel all outstanding persist + prefetch work. Driven from the view's
+    /// disappear hook so dismissing the shoot screen tears down in-flight image
+    /// fetches and completion writes instead of letting them outlive the screen
+    /// (`[FIX-swift-4]`).
+    func cancelPendingWork() {
+        scheduler.cancelAll()
     }
 
     /// The card id the top undo frame would reverse, without mutating the session.
@@ -154,15 +168,24 @@ final class ShootModeViewModel {
     /// snapshot ignores live deletions, so we must not fabricate zombie progress).
     private func persist(
         cardId: String,
-        _ op: @escaping @Sendable (any CardCompletionRepositoring, String) async throws -> CardCompletion
+        // `@MainActor`-isolated: `CardCompletionRepositoring` is itself a
+        // `@MainActor` protocol, so `repo` never leaves the main actor. Marking
+        // the op main-actor-isolated (rather than a bare nonisolated `@Sendable`)
+        // is what keeps it data-race-safe under Swift 6 / strict concurrency: a
+        // nonisolated closure would have to *send* the main-actor `repo` ($0)
+        // into itself to call `markDone`/`markSkipped`/`clearCompletion`, which
+        // the compiler correctly rejects as a cross-actor send.
+        _ op: @escaping @MainActor @Sendable (any CardCompletionRepositoring, String) async throws -> CardCompletion
     ) {
         let repo = completionRepo
         let userId = self.userId
-        Task { @MainActor in
+        // Route through the scheduler so the write is retained in a cancellable
+        // bag and torn down with the screen (`[FIX-swift-4]`).
+        scheduler.persist { [weak self] in
             // The snapshot is frozen, but a card could be soft-deleted in the
             // mirror mid-shoot; the snapshot's `deletedAt` is the read at session
             // start. Honour the live snapshot's view: cards we hold are non-deleted.
-            guard cardsById[cardId] != nil else { return }
+            guard let self, self.cardsById[cardId] != nil else { return }
             try? await op(repo, userId)
         }
     }

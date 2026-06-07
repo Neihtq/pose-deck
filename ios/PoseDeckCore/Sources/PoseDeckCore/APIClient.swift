@@ -13,11 +13,6 @@ public enum APIClientError: Error, Sendable {
     case httpError(status: Int, body: Data)
     /// A request requiring authentication was attempted with no auth token set.
     case notAuthenticated
-    /// A documented-but-unimplemented endpoint was called (e.g. realtime
-    /// ``APIClient/subscribe(collection:)`` before the M3 sync work lands).
-    /// Throwing this — rather than `fatalError` — keeps a premature call
-    /// recoverable instead of aborting the process.
-    case notImplemented
 }
 
 /// Minimal PocketBase auth response shape for the password auth endpoint.
@@ -228,22 +223,35 @@ public actor APIClient {
         _ = try await sendRaw(request)
     }
 
-    // MARK: - Realtime (TODO stub)
+    // MARK: - Realtime (SSE)
 
-    /// TODO: Realtime subscription via PocketBase's SSE endpoint
-    /// (`GET /api/realtime`). Per ARCHITECTURE.md §4.4 the client should, on
-    /// login, open an SSE connection, POST the desired collection subscriptions
-    /// to `/api/realtime`, and feed incoming events through the last-write-wins
-    /// merge (§4.3). The server filters events using collection rules so the
-    /// client only receives records it can see.
+    /// Subscribe to one collection's realtime stream and forward decoded record
+    /// events to `onEvent` (ARCHITECTURE.md §4.4).
     ///
-    /// Not implemented in this skeleton — `URLSession` SSE handling, reconnect
-    /// with backoff, and the event-decoding pipeline land with the M3 sync work.
-    public func subscribe(collection: String) async throws {
-        // Intentionally unimplemented: documented stub for the M3 realtime layer.
-        // Throw a catchable error rather than `fatalError` so a premature call
-        // is recoverable instead of crashing the process.
-        throw APIClientError.notImplemented
+    /// Thin delegation to ``RealtimeClient`` over a ``URLSessionSSETransport``
+    /// built from this client's `baseURL` and current auth token: it performs
+    /// the PB handshake (`GET /api/realtime` → `PB_CONNECT` → `POST` the
+    /// subscription), parses the SSE stream, and reconnects/resubscribes on a
+    /// drop. The returned ``RealtimeClient`` is the connection handle — call
+    /// `stop()` on it to disconnect.
+    ///
+    /// For the full five-collection app subscription, construct a
+    /// ``RealtimeClient`` directly with the default `subscriptions`; this
+    /// single-collection helper exists for focused callers and tests.
+    @discardableResult
+    public func subscribe(
+        collection: String,
+        onEvent: @escaping @Sendable (RealtimeClient.RecordEvent) async -> Void
+    ) async -> RealtimeClient {
+        let transport = URLSessionSSETransport(baseURL: baseURL, session: session)
+        let client = RealtimeClient(
+            transport: transport,
+            subscriptions: [collection],
+            authToken: authToken,
+            onEvent: onEvent
+        )
+        Task { await client.run() }
+        return client
     }
 
     // MARK: - Request plumbing
@@ -287,6 +295,30 @@ public actor APIClient {
 
     private func sendRaw(_ request: URLRequest) async throws -> Data {
         try await performRaw(request)
+    }
+
+    /// Dispatch a raw outbox mutation: send `body` verbatim to `path` with the
+    /// given HTTP `method`, attaching the `X-Idempotency-Key` header.
+    ///
+    /// The body is the already-encoded PocketBase record JSON owned by the
+    /// outbox entry — it is NOT re-encoded here, so the client-supplied `id` and
+    /// wire-format datetimes are preserved exactly. On a non-2xx response this
+    /// throws ``APIClientError/httpError(status:body:)`` so ``MutationSender``
+    /// can classify the status (incl. the 400 duplicate-id idempotent replay).
+    ///
+    /// Used by the M3 outbox processor; routes through the same injected
+    /// `URLSession` so it is exercised offline via `StubURLProtocol` in tests.
+    func performMutation(
+        method: String,
+        path: String,
+        body: Data?,
+        idempotencyKey: UUID
+    ) async throws -> Data {
+        var request = try makeRequest(method: method, path: path, body: body)
+        // Forward-compat idempotency header (invariant #1 relies on the
+        // client-supplied id, not this header, but we send it regardless).
+        request.setValue(idempotencyKey.uuidString, forHTTPHeaderField: "X-Idempotency-Key")
+        return try await performRaw(request)
     }
 
     /// Send a prepared request through the client's own `URLSession`, applying

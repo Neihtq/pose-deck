@@ -21,9 +21,14 @@ import { db } from "@/lib/db";
 import { newClientId } from "@/lib/ids";
 import { markRecentlyCreated } from "@/lib/localStore";
 import { enqueueCoalesced } from "@/lib/outbox";
-import { pb } from "@/lib/pocketbase";
-import { wakeSync } from "@/sync";
-import type { Card, Deck, ISODateString } from "@/lib/types";
+import { collections, pb } from "@/lib/pocketbase";
+import { drainSync, wakeSync } from "@/sync";
+import {
+  imageDisplayUrl,
+  listCardImages,
+  uploadCardImage,
+} from "@/features/images/imageApi";
+import type { Card, CardImage, Deck, ISODateString } from "@/lib/types";
 
 /** Current wall-clock time as an ISO 8601 string. */
 function nowIso(): ISODateString {
@@ -188,9 +193,22 @@ export async function restoreDeck(id: string): Promise<Deck> {
  * Reads the source deck + its live cards from Dexie, then creates a fresh deck
  * (name suffixed with "(copy)", no `shoot_date`) and a copy of every
  * non-soft-deleted card with freshly striped integer-gap positions, preserving
- * order. All writes are optimistic (Dexie + outbox); images and completions are
- * not copied (DESIGN.md §3.3). Duplication is only valid for *live* source
- * decks — a trashed source throws so it can't be resurrected outside restore.
+ * order. The card/deck writes are optimistic (Dexie + outbox); completions are
+ * not copied (DESIGN.md §3.3).
+ *
+ * Card IMAGES are copied best-effort as an ONLINE-only post-step ([C2]): the
+ * offline-first duplicate only *enqueues* the copy cards' `create`s, so a copy
+ * card does not exist server-side at duplicate time, and `uploadCardImage` is a
+ * synchronous PocketBase-direct multipart POST that needs a real parent card.
+ * So image-copy is gated on `navigator.onLine` and deferred behind a sync drain
+ * + a server-side existence check of each copy card (see {@link copyDeckImages})
+ * — it is fired as a detached background task so the duplicate itself returns
+ * immediately and NEVER blocks or fails on image work (the cards exist
+ * regardless). Offline → cards copy, images are skipped cleanly; online → the
+ * duplicated images appear once the copy cards have synced and the bytes upload.
+ *
+ * Duplication is only valid for *live* source decks — a trashed source throws so
+ * it can't be resurrected outside restore.
  */
 export async function duplicateDeck(id: string): Promise<Deck> {
   const source = await db.decks.get(id);
@@ -231,6 +249,10 @@ export async function duplicateDeck(id: string): Promise<Deck> {
     .filter((c) => c.deleted_at === "")
     .sort((a, b) => a.position - b.position);
 
+  // Source→copy card id pairs, so the online-only image-copy post-step can
+  // attach each source card's images to its corresponding copy card.
+  const cardIdPairs: Array<{ sourceCardId: string; copyCardId: string }> = [];
+
   let position = POSITION_GAP;
   for (const card of sourceCards) {
     const cardStamp = nowIso();
@@ -266,11 +288,101 @@ export async function duplicateDeck(id: string): Promise<Deck> {
         client_updated_at: cardStamp,
       },
     });
+    cardIdPairs.push({ sourceCardId: card.id, copyCardId: newCard.id });
     position += POSITION_GAP;
   }
 
   wakeSync();
+
+  // Best-effort, online-only image copy ([C2]). Fired detached so the duplicate
+  // returns immediately and is never blocked or failed by image work — the
+  // cards are copied regardless. `copyDeckImages` itself is gated on
+  // `navigator.onLine` and fully self-contained (never throws to here).
+  void copyDeckImages(cardIdPairs);
+
   return copy;
+}
+
+/**
+ * Best-effort, ONLINE-only copy of each source card's images onto its
+ * corresponding copy card ([C2]). Safe to fire-and-forget: it swallows every
+ * error and resolves regardless, so it can NEVER block or fail the duplicate.
+ *
+ * Mechanism (the simplest correct one given the offline-first / PB-direct
+ * constraints):
+ *  1. Gate on `navigator.onLine`; offline → no upload is attempted at all.
+ *  2. `await drainSync()` — wait for a full outbox drain pass so the copy cards'
+ *     `create`s have a chance to flush to the server (they were enqueued just
+ *     before this runs). The copy ids are client-minted and stable, so they
+ *     match across the optimistic write and the server insert.
+ *  3. Per copy card, verify it exists server-side (`cards.getOne`) before
+ *     attaching — a not-yet-synced card is skipped (its images are simply not
+ *     copied this pass; the duplicate still succeeded).
+ *  4. Per source image (in position order): mint a token display URL, fetch the
+ *     bytes as a blob, and `uploadCardImage(copyCardId, blob, position)`.
+ *
+ * Each card and each image is wrapped in its own try/catch: a single failure
+ * (network blip, expired token, the 5-image cap via `TooManyImagesError`) is
+ * logged and skipped; the rest continue. Exported so it is independently
+ * unit-testable.
+ */
+export async function copyDeckImages(
+  cardIdPairs: Array<{ sourceCardId: string; copyCardId: string }>,
+): Promise<void> {
+  // Offline → cards copied, images skipped cleanly. `navigator` may be absent
+  // in non-browser contexts; treat "unknown" as online so tests/SSR don't skip.
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return;
+  }
+  if (cardIdPairs.length === 0) {
+    return;
+  }
+
+  // Wait for the copy cards' `create`s (enqueued by the caller) to flush.
+  try {
+    await drainSync();
+  } catch {
+    // A failed/partial drain is non-fatal: the per-card existence check below
+    // simply skips any card that hasn't reached the server yet.
+  }
+
+  for (const { sourceCardId, copyCardId } of cardIdPairs) {
+    try {
+      // The copy card must exist server-side before we can attach images to it.
+      // A 404 (not yet synced) skips this card's images for this pass.
+      await collections.cards().getOne(copyCardId);
+    } catch {
+      continue;
+    }
+
+    let sourceImages: CardImage[];
+    try {
+      sourceImages = await listCardImages(sourceCardId);
+    } catch {
+      continue;
+    }
+
+    for (const image of sourceImages) {
+      try {
+        const url = await imageDisplayUrl(image);
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`image fetch failed: ${response.status}`);
+        }
+        const blob = await response.blob();
+        // Preserve the source position; `uploadCardImage` re-checks the 5-image
+        // cap and throws `TooManyImagesError`, which we catch per-image below.
+        await uploadCardImage(copyCardId, blob, image.position);
+      } catch (err) {
+        // Best-effort: log and continue. A single image failing (network,
+        // expired token, cap reached) must not abort the rest of the copy.
+        console.warn(
+          `[duplicateDeck] skipped copying image ${image.id} → card ${copyCardId}:`,
+          err,
+        );
+      }
+    }
+  }
 }
 
 /** Re-exported for callers/tests that need the canonical gap value. */

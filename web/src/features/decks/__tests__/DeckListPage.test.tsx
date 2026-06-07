@@ -179,6 +179,32 @@ describe("DeckListPage", () => {
     );
   });
 
+  it("exposes Duplicate in each deck's actions menu and calls duplicateDeck", async () => {
+    await db.decks.put(makeDeck({ id: "d1", name: "Source Deck" }));
+    duplicateDeck.mockResolvedValue(makeDeck({ id: "d2", name: "Source Deck (copy)" }));
+
+    renderPage();
+    await screen.findByText("Source Deck");
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Deck actions for Source Deck" }),
+      new window.PointerEvent("pointerdown", { button: 0, bubbles: true }),
+    );
+    const menu = await screen.findByRole("menu");
+    // Duplicate now lives in the deck LIST (moved out of the detail header).
+    const duplicateItem = within(menu).getByText("Duplicate");
+    expect(duplicateItem).toBeInTheDocument();
+
+    fireEvent.click(duplicateItem);
+
+    await waitFor(() => expect(duplicateDeck).toHaveBeenCalledWith("d1"));
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Deck duplicated" }),
+      ),
+    );
+  });
+
   it("optimistically deletes a deck: the live query drops the row and toasts", async () => {
     await db.decks.put(makeDeck({ id: "d1", name: "Doomed Deck" }));
     // The mock mirrors a real soft-delete into Dexie so the live query updates.

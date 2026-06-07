@@ -1,10 +1,11 @@
 /**
  * Owner-gating tests for DeckDetailPage (M5 sharing).
  *
- * The deck header dropdown exposes Rename/Duplicate/Share/Delete ONLY to the
- * deck owner; a guest viewer (deck.owner !== current user) sees a read-only
- * deck — none of those affordances. The mocked `useAuth` user id is toggled per
- * test via a module-level holder.
+ * The deck header dropdown exposes Rename/Share/Delete ONLY to the deck owner;
+ * a guest viewer (deck.owner !== current user) sees a read-only deck — none of
+ * those affordances. (Duplicate now lives in the deck LIST, not the detail
+ * header.) The mocked `useAuth` user id is toggled per test via a module-level
+ * holder.
  */
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -25,7 +26,6 @@ vi.mock("@/features/cards/cardApi", () => ({
   softDeleteCard: vi.fn(),
 }));
 vi.mock("@/features/decks/deckApi", () => ({
-  duplicateDeck: vi.fn(),
   renameDeck: vi.fn(),
   softDeleteDeck: vi.fn(),
 }));
@@ -86,17 +86,18 @@ beforeEach(async () => {
 });
 
 describe("DeckDetailPage owner gating", () => {
-  it("shows Share/Rename/Duplicate/Delete to the owner", async () => {
+  it("shows Share/Rename/Delete to the owner (Duplicate lives in the deck list)", async () => {
     renderPage();
     await screen.findByText("Owned Deck");
     const menu = await openMenu();
     expect(within(menu).getByText("Share")).toBeInTheDocument();
     expect(within(menu).getByText("Rename")).toBeInTheDocument();
-    expect(within(menu).getByText("Duplicate")).toBeInTheDocument();
     expect(within(menu).getByText("Delete")).toBeInTheDocument();
+    // Duplicate was moved to the deck list — it must NOT be in the detail menu.
+    expect(within(menu).queryByText("Duplicate")).not.toBeInTheDocument();
   });
 
-  it("hides Share/Rename/Duplicate/Delete from a guest viewer", async () => {
+  it("hides Share/Rename/Delete from a guest viewer", async () => {
     authUser.id = "guest9"; // not the deck owner
     authUser.email = "guest@posedeck.test";
     renderPage();

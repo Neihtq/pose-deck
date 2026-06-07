@@ -1,24 +1,62 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { db } from "@/lib/db";
 import { decodeOutboxPayload } from "@/lib/outbox";
-import type { Card, Deck } from "@/lib/types";
+import type { Card, CardImage, Deck } from "@/lib/types";
 
-// Mock the sync wake() seam (the engine is wired separately).
-vi.mock("@/sync", () => ({ wakeSync: vi.fn() }));
+// Mock seams. Declared via `vi.hoisted` so they are initialized BEFORE the
+// hoisted `vi.mock` factories that close over them run (avoids the TDZ that a
+// plain top-level `const` referenced inside a factory would hit).
+const mocks = vi.hoisted(() => ({
+  // `drainSync` resolves immediately so the online-only image-copy post-step
+  // proceeds in tests.
+  drainSync: vi.fn((): Promise<void> => Promise.resolve()),
+  // `collections.cards().getOne` seam: verifies a copy card exists server-side.
+  cardsGetOne: vi.fn((id: string): Promise<{ id: string }> =>
+    Promise.resolve({ id }),
+  ),
+  // Image API seams.
+  listCardImages: vi.fn(
+    (_cardId: string): Promise<unknown[]> => Promise.resolve([]),
+  ),
+  uploadCardImage: vi.fn(
+    (_cardId: string, _blob: Blob, _position: number): Promise<unknown> =>
+      Promise.resolve({}),
+  ),
+}));
+const { drainSync, cardsGetOne, listCardImages, uploadCardImage } = mocks;
 
-// Provide an authenticated user so `currentUserId()` can stamp `owner`.
+vi.mock("@/sync", () => ({ wakeSync: vi.fn(), drainSync: mocks.drainSync }));
+
+// Authenticated user so `currentUserId()` can stamp `owner`, plus the cards
+// existence-check seam.
 vi.mock("@/lib/pocketbase", () => ({
   pb: { authStore: { record: { id: "user1" } } },
+  collections: { cards: () => ({ getOne: mocks.cardsGetOne }) },
 }));
 
+vi.mock("@/features/images/imageApi", () => {
+  class TooManyImagesError extends Error {}
+  return {
+    listCardImages: mocks.listCardImages,
+    uploadCardImage: mocks.uploadCardImage,
+    imageDisplayUrl: vi.fn(
+      (img: { file: string }): Promise<string> =>
+        Promise.resolve(`https://files/${img.file}`),
+    ),
+    TooManyImagesError,
+  };
+});
+
 import {
+  copyDeckImages,
   createDeck,
   duplicateDeck,
   renameDeck,
   restoreDeck,
   softDeleteDeck,
 } from "@/features/decks/deckApi";
+import { TooManyImagesError } from "@/features/images/imageApi";
 
 function makeDeck(id: string, deletedAt: string): Deck {
   return {
@@ -52,7 +90,39 @@ function makeCard(id: string, deck: string, position: number): Card {
 
 beforeEach(async () => {
   await Promise.all([db.decks.clear(), db.cards.clear(), db.outbox.clear()]);
+  drainSync.mockClear();
+  cardsGetOne.mockReset();
+  cardsGetOne.mockImplementation(async (id: string) => ({ id }));
+  listCardImages.mockReset();
+  listCardImages.mockResolvedValue([]);
+  uploadCardImage.mockReset();
+  uploadCardImage.mockResolvedValue({});
+  // Default: online + a fetch that yields a small blob.
+  setOnline(true);
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => ({
+      ok: true,
+      blob: async () => new Blob(["img"], { type: "image/jpeg" }),
+    })),
+  );
 });
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+/** Toggle `navigator.onLine` for offline-gating tests. */
+function setOnline(online: boolean): void {
+  Object.defineProperty(navigator, "onLine", {
+    configurable: true,
+    get: () => online,
+  });
+}
+
+function makeImage(id: string, card: string, position: number): CardImage {
+  return { id, card, file: `${id}.jpg`, position, created: "" };
+}
 
 describe("createDeck (local-first)", () => {
   it("stamps owner from the auth store, writes Dexie + enqueues a create", async () => {
@@ -153,6 +223,88 @@ describe("duplicateDeck (soft-deleted source guard, finding C2)", () => {
     expect(cardCreates).toHaveLength(2);
   });
 
+  it("offline → duplicate still succeeds and attempts NO image upload (B3 / C2)", async () => {
+    setOnline(false);
+    await db.decks.put(makeDeck("deck1", ""));
+    await db.cards.put(makeCard("c1", "deck1", 1000));
+    listCardImages.mockResolvedValue([makeImage("img1", "c1", 0)]);
+
+    const copy = await duplicateDeck("deck1");
+    // Let the detached (gated) copy task settle.
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(copy.name).toBe("deck1 (copy)");
+    // Cards copied regardless; but offline means no drain/upload was attempted.
+    expect(await db.cards.where("deck").equals(copy.id).count()).toBe(1);
+    expect(drainSync).not.toHaveBeenCalled();
+    expect(uploadCardImage).not.toHaveBeenCalled();
+  });
+});
+
+describe("copyDeckImages (online-only best-effort image copy, B3 / C2)", () => {
+  it("copies each source card's images to the copy card at the source position", async () => {
+    listCardImages.mockImplementation(async (cardId: string) => {
+      if (cardId === "src1") {
+        return [makeImage("i1", "src1", 0), makeImage("i2", "src1", 1)];
+      }
+      return [];
+    });
+
+    await copyDeckImages([{ sourceCardId: "src1", copyCardId: "copy1" }]);
+
+    // Drained first, verified the copy card exists, then uploaded both images.
+    expect(drainSync).toHaveBeenCalledTimes(1);
+    expect(cardsGetOne).toHaveBeenCalledWith("copy1");
+    expect(uploadCardImage).toHaveBeenCalledTimes(2);
+    // (copyCardId, blob, position) — position preserved from the source image.
+    expect(uploadCardImage.mock.calls[0][0]).toBe("copy1");
+    expect(uploadCardImage.mock.calls[0][2]).toBe(0);
+    expect(uploadCardImage.mock.calls[1][2]).toBe(1);
+  });
+
+  it("logs and continues when a single image upload rejects (cap respected)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    listCardImages.mockResolvedValue([
+      makeImage("i1", "src1", 0),
+      makeImage("i2", "src1", 1),
+      makeImage("i3", "src1", 2),
+    ]);
+    // The middle image trips the per-card 5-image cap; the rest still upload.
+    uploadCardImage
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new TooManyImagesError("copy1"))
+      .mockResolvedValueOnce({});
+
+    await copyDeckImages([{ sourceCardId: "src1", copyCardId: "copy1" }]);
+
+    // All three were attempted; the rejection did not abort the loop.
+    expect(uploadCardImage).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("skips a copy card that does not yet exist server-side (404), no upload", async () => {
+    cardsGetOne.mockRejectedValue(new Error("404"));
+    listCardImages.mockResolvedValue([makeImage("i1", "src1", 0)]);
+
+    await copyDeckImages([{ sourceCardId: "src1", copyCardId: "copy1" }]);
+
+    expect(uploadCardImage).not.toHaveBeenCalled();
+  });
+
+  it("offline → does not drain or upload", async () => {
+    setOnline(false);
+    listCardImages.mockResolvedValue([makeImage("i1", "src1", 0)]);
+
+    await copyDeckImages([{ sourceCardId: "src1", copyCardId: "copy1" }]);
+
+    expect(drainSync).not.toHaveBeenCalled();
+    expect(uploadCardImage).not.toHaveBeenCalled();
+  });
+});
+
+describe("duplicateDeck name clamp", () => {
   it("clamps the copy name to the 200-char DB ceiling (finding spec-dup-name-overflow)", async () => {
     // A source name at the 200-char ceiling: `<name> (copy)` would be 207 chars
     // and the server (ARCHITECTURE.md §3.2, max 200) rejects it with a 400.

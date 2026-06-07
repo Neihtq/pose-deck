@@ -10,7 +10,8 @@
  * reorder reconciles back through the live query.
  *
  * The header shows the deck name with inline rename, a back link to the deck
- * list ("/"), and a duplicate / delete menu. Each card row shows its
+ * list ("/"), and a rename / share / export / delete menu (Duplicate lives in
+ * the deck list, not here). Each card row shows its
  * title / time slot / subjects / direction plus a thumbnail (the first card
  * image, via `<OfflineImage>` so a pinned deck renders offline). "Add card"
  * creates a card and opens the card editor; clicking a row opens the editor.
@@ -77,7 +78,7 @@ import {
   reorderCards,
   softDeleteCard,
 } from "@/features/cards/cardApi";
-import { duplicateDeck, renameDeck, softDeleteDeck } from "@/features/decks/deckApi";
+import { renameDeck, softDeleteDeck } from "@/features/decks/deckApi";
 import { ShareDeckDialog } from "@/features/decks/ShareDeckDialog";
 import { OfflineToggle } from "@/features/offline/OfflineToggle";
 import { OfflineImage } from "@/features/offline/OfflineImage";
@@ -262,27 +263,6 @@ export default function DeckDetailPage(): React.JSX.Element {
     [deck, renameValue],
   );
 
-  const handleDuplicate = React.useCallback(async () => {
-    if (!deck) {
-      return;
-    }
-    setBusy(true);
-    try {
-      const copy = await duplicateDeck(deck.id);
-      toast({ title: "Deck duplicated", description: copy.name });
-      navigate(`/decks/${copy.id}`);
-    } catch (err) {
-      clearAuthOnUnauthorized(err);
-      toast({
-        variant: "destructive",
-        title: "Duplicate failed",
-        description: "Couldn't duplicate this deck. Please try again.",
-      });
-    } finally {
-      setBusy(false);
-    }
-  }, [deck, navigate]);
-
   // Export the deck to a downloaded PDF (M6). The heavy `@react-pdf/renderer`
   // module is loaded ONLY here, via dynamic import, so it is code-split out of
   // the initial app chunk (most sessions never export). `exportDeckPdf` reads
@@ -413,7 +393,7 @@ export default function DeckDetailPage(): React.JSX.Element {
 
   // Sharing/editing affordances are owner-only; a guest views the deck
   // read-only (M5). The deck list still shows guests their shared decks, but
-  // Rename/Duplicate/Delete/Share are hidden for non-owners.
+  // Rename/Delete/Share are hidden for non-owners.
   const isOwner = deck.owner === user?.id;
 
   return (
@@ -452,9 +432,6 @@ export default function DeckDetailPage(): React.JSX.Element {
                 <>
                   <DropdownMenuItem onSelect={openRename}>
                     Rename
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={handleDuplicate} disabled={busy}>
-                    Duplicate
                   </DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => setShareOpen(true)}>
                     Share

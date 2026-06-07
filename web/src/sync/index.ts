@@ -232,6 +232,21 @@ export function wakeSync(): void {
   runtime?.engine.wake();
 }
 
+/**
+ * Await a full outbox drain pass and resolve once it settles.
+ *
+ * `SyncEngine.drain()` is single-flight: concurrent callers await the SAME
+ * in-flight pass, and the returned promise resolves only after a complete pass
+ * (so any pending creates queued before the call have been sent on a healthy
+ * connection). Resolves immediately when sync isn't running. Used by the
+ * online-only duplicate image-copy post-step, which must wait for the copy
+ * cards' `create`s to flush before it can attach images to them server-side.
+ */
+export async function drainSync(): Promise<void> {
+  if (!runtime) return;
+  await runtime.engine.drain();
+}
+
 /** Re-run a reconciling hydrate (e.g. manual refresh). */
 export async function resync(): Promise<void> {
   if (!started || !runtime) return;

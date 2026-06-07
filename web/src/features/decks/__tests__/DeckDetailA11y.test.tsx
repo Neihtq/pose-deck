@@ -30,7 +30,6 @@ vi.mock("@/features/cards/cardApi", () => ({
   softDeleteCard: vi.fn(),
 }));
 vi.mock("@/features/decks/deckApi", () => ({
-  duplicateDeck: vi.fn(),
   renameDeck: vi.fn(),
   softDeleteDeck: vi.fn(),
 }));

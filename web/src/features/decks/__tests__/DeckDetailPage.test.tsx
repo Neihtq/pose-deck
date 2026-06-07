@@ -1,16 +1,16 @@
 /**
  * Component tests for DeckDetailPage (route `/decks/:id`) beyond the reorder
- * race covered in DeckDetailReorder.test.tsx.
+ * behaviour covered in DeckDetailReorder.test.tsx.
  *
- * Covers: load error rendering, the empty-cards state, "Add card" (optimistic
- * append + navigate to the new card editor), and delete (soft-delete → navigate
- * home + toast). The deck/card/image APIs and the auth 401-handler are mocked,
- * so no PocketBase SDK or network is involved.
+ * As of M3 the deck + its cards are read from Dexie via live queries. These
+ * tests seed the real (fake-indexeddb) `db`; the mutation APIs are mocked and
+ * mirror their effect into Dexie so the live queries propagate.
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { db } from "@/lib/db";
 import type { Card, Deck } from "@/lib/types";
 
 const navigate = vi.fn();
@@ -22,26 +22,21 @@ vi.mock("react-router-dom", async () => {
   return { ...actual, useNavigate: () => navigate };
 });
 
-const getDeck = vi.fn();
-const listCards = vi.fn();
 const createCard = vi.fn();
 const softDeleteCard = vi.fn();
 const softDeleteDeck = vi.fn();
 vi.mock("@/features/cards/cardApi", () => ({
-  listCards: (...a: unknown[]) => listCards(...a),
   reorderCards: vi.fn(),
   createCard: (...a: unknown[]) => createCard(...a),
   softDeleteCard: (...a: unknown[]) => softDeleteCard(...a),
 }));
 vi.mock("@/features/decks/deckApi", () => ({
-  getDeck: (...a: unknown[]) => getDeck(...a),
   duplicateDeck: vi.fn(),
   renameDeck: vi.fn(),
   softDeleteDeck: (...a: unknown[]) => softDeleteDeck(...a),
 }));
 vi.mock("@/features/images/imageApi", () => ({
   imageDisplayUrl: vi.fn(async () => null),
-  listCardImages: vi.fn(async () => []),
 }));
 vi.mock("@/features/auth/AuthContext", () => ({
   clearAuthOnUnauthorized: vi.fn(() => false),
@@ -91,20 +86,18 @@ function renderPage() {
   );
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   navigate.mockReset();
-  getDeck.mockReset();
-  listCards.mockReset();
   createCard.mockReset();
   softDeleteCard.mockReset();
   softDeleteDeck.mockReset();
   toast.mockReset();
+  await Promise.all([db.decks.clear(), db.cards.clear(), db.card_images.clear()]);
 });
 
 describe("DeckDetailPage", () => {
   it("renders the deck name, card count, and the empty-cards state", async () => {
-    getDeck.mockResolvedValue(DECK);
-    listCards.mockResolvedValue([]);
+    await db.decks.put(DECK);
     renderPage();
 
     await screen.findByText("Smith Wedding");
@@ -112,16 +105,14 @@ describe("DeckDetailPage", () => {
     expect(screen.getByText("No cards yet.")).toBeInTheDocument();
   });
 
-  it("renders a load error when the deck cannot be loaded", async () => {
-    getDeck.mockRejectedValue(new Error("not found"));
-    listCards.mockResolvedValue([]);
+  it("renders 'Deck not found.' when the deck is absent from the local store", async () => {
     renderPage();
-    await screen.findByText("Couldn't load this deck.");
+    await screen.findByText("Deck not found.");
   });
 
   it("renders cards and a singular count for one card", async () => {
-    getDeck.mockResolvedValue(DECK);
-    listCards.mockResolvedValue([makeCard("c1", "First look", 1000)]);
+    await db.decks.put(DECK);
+    await db.cards.put(makeCard("c1", "First look", 1000));
     renderPage();
 
     await screen.findByText("First look");
@@ -129,9 +120,12 @@ describe("DeckDetailPage", () => {
   });
 
   it("adds a card optimistically and navigates to its editor", async () => {
-    getDeck.mockResolvedValue(DECK);
-    listCards.mockResolvedValue([]);
-    createCard.mockResolvedValue(makeCard("new1", "Untitled card", 1000));
+    await db.decks.put(DECK);
+    createCard.mockImplementation(async () => {
+      const card = makeCard("new1", "Untitled card", 1000);
+      await db.cards.put(card);
+      return card;
+    });
     renderPage();
     await screen.findByText("Smith Wedding");
 
@@ -151,8 +145,8 @@ describe("DeckDetailPage", () => {
   });
 
   it("deletes the deck and navigates home with a toast", async () => {
-    getDeck.mockResolvedValue(DECK);
-    listCards.mockResolvedValue([makeCard("c1", "First look", 1000)]);
+    await db.decks.put(DECK);
+    await db.cards.put(makeCard("c1", "First look", 1000));
     softDeleteDeck.mockResolvedValue(undefined);
     renderPage();
     await screen.findByText("First look");
@@ -176,12 +170,15 @@ describe("DeckDetailPage", () => {
   });
 
   it("deletes a card inline from the list (confirm) without opening it", async () => {
-    getDeck.mockResolvedValue(DECK);
-    listCards.mockResolvedValue([
+    await db.decks.put(DECK);
+    await db.cards.bulkPut([
       makeCard("c1", "First look", 1000),
       makeCard("c2", "Family group", 2000),
     ]);
-    softDeleteCard.mockResolvedValue(undefined);
+    // The mock mirrors a real soft-delete so the live card query drops the row.
+    softDeleteCard.mockImplementation(async (id: string) => {
+      await db.cards.update(id, { deleted_at: new Date().toISOString() });
+    });
     renderPage();
     await screen.findByText("First look");
 

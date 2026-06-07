@@ -1,20 +1,19 @@
 /**
  * Deck detail page (route `/decks/:id`).
  *
- * Shows a single deck's cards as an ordered, drag-droppable list. Cards are
- * loaded via `cardApi.listCards`; reordering is optimistic (the list updates
- * immediately) and persisted with `cardApi.reorderCards`. Reorders are
- * serialized — a new drag is blocked while one is in flight — and on failure
- * the authoritative order is re-fetched via `cardApi.listCards` rather than
- * reverting to a possibly-stale local snapshot.
+ * Shows a single deck's cards as an ordered, drag-droppable list. As of M3 the
+ * deck and its cards are read from Dexie via live queries (`liveDeck`,
+ * `liveCards`), so sync / realtime writes re-render the UI automatically.
+ * Reordering writes the new positions to Dexie + the outbox via
+ * `cardApi.reorderCards`; the live query reflects the new order immediately, so
+ * there is no manual optimistic snapshot to revert — a failed/rolled-back
+ * reorder reconciles back through the live query.
  *
  * The header shows the deck name with inline rename, a back link to the deck
  * list ("/"), and a duplicate / delete menu. Each card row shows its
  * title / time slot / subjects / direction plus a thumbnail (the first card
  * image, via `images.imageDisplayUrl`). "Add card" creates a card and opens
  * the card editor; clicking a row opens the editor for that card.
- *
- * M1 talks to PocketBase directly (via the deck/card APIs); outbox sync is M3.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -75,12 +74,14 @@ import type { Card as CardRecord, CardImage } from "@/lib/types";
 import { clearAuthOnUnauthorized } from "@/features/auth/AuthContext";
 import {
   createCard,
-  listCards,
   reorderCards,
   softDeleteCard,
 } from "@/features/cards/cardApi";
-import { duplicateDeck, getDeck, renameDeck, softDeleteDeck } from "@/features/decks/deckApi";
-import { imageDisplayUrl, listCardImages } from "@/features/images/imageApi";
+import { duplicateDeck, renameDeck, softDeleteDeck } from "@/features/decks/deckApi";
+import { imageDisplayUrl } from "@/features/images/imageApi";
+import { db } from "@/lib/db";
+import { liveCardImages, liveCards, liveDeck } from "@/lib/localStore";
+import { useLiveQuery } from "@/lib/useLiveQuery";
 import type { Deck } from "@/lib/types";
 
 /**
@@ -108,16 +109,31 @@ export default function DeckDetailPage(): React.JSX.Element {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
 
-  const [deck, setDeck] = React.useState<Deck | null>(null);
-  const [cards, setCards] = React.useState<CardRecord[]>([]);
-  const [thumbnails, setThumbnails] = React.useState<ThumbnailMap>({});
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  // Local-first reads: the deck and its cards come from Dexie via live queries,
+  // so sync / realtime writes re-render the UI automatically. `undefined` =
+  // loading; `null`/missing deck = not-found (or soft-deleted).
+  // `liveDeck` resolves to `null` for a missing/soft-deleted deck; the live
+  // query hook returns `undefined` only while still loading. Mapping not-found
+  // to `null` (not `undefined`) lets us distinguish "loading" from "not found".
+  const liveDeckRow = useLiveQuery<Deck | null>(
+    () => (id ? liveDeck(db, id).then((d) => d ?? null) : Promise.resolve(null)),
+    [id],
+  );
+  const liveCardRows = useLiveQuery(
+    () => (id ? liveCards(db, id) : Promise.resolve([])),
+    [id],
+  );
+  const deck: Deck | null = liveDeckRow ?? null;
+  const cards = React.useMemo<CardRecord[]>(
+    () => liveCardRows ?? [],
+    [liveCardRows],
+  );
+  const loading = liveDeckRow === undefined || liveCardRows === undefined;
 
-  // True while a `reorderCards` request is in flight. We block starting a new
-  // reorder until the previous one settles: overlapping optimistic reorders
-  // would capture each other's intermediate (non-server-confirmed) state as
-  // their revert baseline, so a later failure could restore a stale order.
+  const [thumbnails, setThumbnails] = React.useState<ThumbnailMap>({});
+
+  // True while a `reorderCards` write is in flight. We block starting a new
+  // reorder until the previous one settles so two restripes can't interleave.
   const [reordering, setReordering] = React.useState(false);
 
   const [renameOpen, setRenameOpen] = React.useState(false);
@@ -142,65 +158,34 @@ export default function DeckDetailPage(): React.JSX.Element {
     }),
   );
 
-  // Load the deck + its cards (and per-card first-image thumbnails).
+  // Best-effort: resolve each card's first-image thumbnail from Dexie. Re-runs
+  // whenever the live card list changes (e.g. a card or its image syncs in).
   React.useEffect(() => {
-    if (!id) {
-      return;
-    }
     let cancelled = false;
-    setLoading(true);
-    setError(null);
-
     (async () => {
-      try {
-        const [loadedDeck, loadedCards] = await Promise.all([
-          getDeck(id),
-          listCards(id),
-        ]);
-        if (cancelled) {
-          return;
-        }
-        setDeck(loadedDeck);
-        setCards(loadedCards);
-
-        // Best-effort: fetch the first image for each card for thumbnails.
-        const thumbEntries = await Promise.all(
-          loadedCards.map(
-            async (card): Promise<[string, Thumbnail | null]> => {
-              try {
-                const imgs: CardImage[] = await listCardImages(card.id);
-                const first = imgs[0];
-                if (!first) {
-                  return [card.id, null];
-                }
-                const url = await imageDisplayUrl(first, { thumb: "200x200" });
-                return [card.id, { url, image: first }];
-              } catch {
-                return [card.id, null];
-              }
-            },
-          ),
-        );
-        if (!cancelled) {
-          setThumbnails(Object.fromEntries(thumbEntries));
-        }
-      } catch (err) {
-        if (cancelled) {
-          return;
-        }
-        clearAuthOnUnauthorized(err);
-        setError("Couldn't load this deck.");
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
+      const thumbEntries = await Promise.all(
+        cards.map(async (card): Promise<[string, Thumbnail | null]> => {
+          try {
+            const imgs: CardImage[] = await liveCardImages(db, card.id);
+            const first = imgs[0];
+            if (!first) {
+              return [card.id, null];
+            }
+            const url = await imageDisplayUrl(first, { thumb: "200x200" });
+            return [card.id, { url, image: first }];
+          } catch {
+            return [card.id, null];
+          }
+        }),
+      );
+      if (!cancelled) {
+        setThumbnails(Object.fromEntries(thumbEntries));
       }
     })();
-
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [cards]);
 
   // Re-mint a thumbnail's display URL when its <img> fails to load. The load
   // effect resolves each URL once (deps `[id]`) with a short-lived `?token=`
@@ -230,9 +215,8 @@ export default function DeckDetailPage(): React.JSX.Element {
 
   const handleDragEnd = React.useCallback(
     (event: DragEndEvent) => {
-      // Serialize persistence: ignore drops while a reorder is still in flight
-      // so we never optimistically stack a second reorder on top of an
-      // unconfirmed one (which would corrupt the revert baseline).
+      // Serialize persistence: ignore drops while a reorder write is still in
+      // flight so two restripes can't interleave.
       if (reordering || !id) {
         return;
       }
@@ -247,26 +231,18 @@ export default function DeckDetailPage(): React.JSX.Element {
       }
 
       const reordered = arrayMove(cards, oldIndex, newIndex);
-      setCards(reordered); // optimistic
       setReordering(true);
 
       const orderedIds = reordered.map((c) => c.id);
       // Pass the pre-reorder positions so reorderCards can skip cards that did
       // not actually move, avoiding needless client_updated_at bumps that could
       // clobber concurrent edits under last-write-wins (ARCHITECTURE.md §4.3).
+      // The optimistic order is written to Dexie inside reorderCards, so the
+      // live card query re-renders the new order without a local snapshot.
       const currentPositions = new Map(cards.map((c) => [c.id, c.position]));
       reorderCards(id, orderedIds, currentPositions)
-        .catch(async (err) => {
+        .catch((err) => {
           clearAuthOnUnauthorized(err);
-          // Don't trust a local snapshot: a non-atomic reorder may have
-          // partially restriped the server, so re-fetch the authoritative
-          // order rather than reverting to a possibly-stale local order.
-          try {
-            const fresh = await listCards(id);
-            setCards(fresh);
-          } catch (refetchErr) {
-            clearAuthOnUnauthorized(refetchErr);
-          }
           toast({
             variant: "destructive",
             title: "Reorder failed",
@@ -295,8 +271,8 @@ export default function DeckDetailPage(): React.JSX.Element {
       }
       setRenaming(true);
       try {
-        const updated = await renameDeck(deck.id, next);
-        setDeck(updated);
+        await renameDeck(deck.id, next);
+        // The live deck query reflects the new name automatically.
         setRenameOpen(false);
       } catch (err) {
         clearAuthOnUnauthorized(err);
@@ -362,7 +338,7 @@ export default function DeckDetailPage(): React.JSX.Element {
     setCreating(true);
     try {
       const card = await createCard(id, { title: "Untitled card" });
-      setCards((prev) => [...prev, card]);
+      // The live card query picks up the optimistic row; navigate to its editor.
       navigate(`/decks/${id}/cards/${card.id}`);
     } catch (err) {
       clearAuthOnUnauthorized(err);
@@ -386,8 +362,9 @@ export default function DeckDetailPage(): React.JSX.Element {
     [id, navigate],
   );
 
-  // Soft-delete a card directly from the list (after confirmation), removing it
-  // from local state on success. Never hard-deletes (DESIGN.md soft-delete model).
+  // Soft-delete a card directly from the list (after confirmation). The live
+  // card query drops the row once `deleted_at` is set. Never hard-deletes
+  // (DESIGN.md soft-delete model).
   const handleDeleteCard = React.useCallback(async () => {
     if (!cardToDelete) {
       return;
@@ -395,12 +372,6 @@ export default function DeckDetailPage(): React.JSX.Element {
     setDeletingCard(true);
     try {
       await softDeleteCard(cardToDelete.id);
-      setCards((prev) => prev.filter((c) => c.id !== cardToDelete.id));
-      setThumbnails((prev) => {
-        const next = { ...prev };
-        delete next[cardToDelete.id];
-        return next;
-      });
       toast({ title: "Card deleted" });
       setCardToDelete(null);
     } catch (err) {
@@ -423,15 +394,13 @@ export default function DeckDetailPage(): React.JSX.Element {
     );
   }
 
-  if (error || !deck) {
+  if (!deck) {
     return (
       <div className="mx-auto w-full max-w-3xl px-4 py-10">
         <Link to="/" className="text-sm text-muted-foreground hover:underline">
           ← Back to decks
         </Link>
-        <p className="mt-6 text-sm text-destructive">
-          {error ?? "Deck not found."}
-        </p>
+        <p className="mt-6 text-sm text-destructive">Deck not found.</p>
       </div>
     );
   }

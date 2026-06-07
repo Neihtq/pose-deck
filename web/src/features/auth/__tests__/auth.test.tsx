@@ -82,6 +82,16 @@ vi.mock("@/lib/pocketbase", () => {
   };
 });
 
+// AuthContext starts/stops the sync runtime on auth transitions. Stub it so the
+// context unit tests don't construct a real engine / open realtime subscriptions
+// against the mocked PocketBase.
+const startSync = vi.fn(async () => {});
+const stopSync = vi.fn(async () => {});
+vi.mock("@/sync", () => ({
+  startSync: () => startSync(),
+  stopSync: () => stopSync(),
+}));
+
 // Import after the mock is registered so the context binds to the fake.
 import { clearFileToken } from "@/lib/pocketbase";
 
@@ -98,6 +108,8 @@ beforeEach(() => {
   fakeAuthStore.clear();
   authWithPassword.mockClear();
   clearFileTokenMock.mockClear();
+  startSync.mockClear();
+  stopSync.mockClear();
 });
 
 describe("AuthProvider / useAuth", () => {
@@ -140,6 +152,24 @@ describe("AuthProvider / useAuth", () => {
 
     await waitFor(() => expect(result.current.isAuthenticated).toBe(false));
     expect(result.current.user).toBeNull();
+  });
+
+  it("starts sync on sign-in and stops it on sign-out (M3)", async () => {
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    // Mounted while signed out → no start yet.
+    expect(startSync).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await result.current.signIn("owner@posedeck.test", "changeme123");
+    });
+    await waitFor(() => expect(startSync).toHaveBeenCalled());
+    expect(stopSync).not.toHaveBeenCalled();
+
+    act(() => {
+      result.current.signOut();
+    });
+    await waitFor(() => expect(stopSync).toHaveBeenCalled());
   });
 
   it("reflects external store changes (e.g. cross-tab / token refresh)", async () => {

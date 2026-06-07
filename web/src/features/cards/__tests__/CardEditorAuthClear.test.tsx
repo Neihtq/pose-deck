@@ -22,16 +22,16 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ClientResponseError } from "pocketbase";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { db } from "@/lib/db";
 import type { Card, CardImage } from "@/lib/types";
 
 // --- Mock data-access + side-effect modules -------------------------------
+// The card + images are read from Dexie (seeded below); mutations are mocked.
 const createCard = vi.fn();
 const updateCard = vi.fn();
 const softDeleteCard = vi.fn();
 const deleteCardImage = vi.fn();
-const listCardImages = vi.fn();
 const imageDisplayUrl = vi.fn();
-const getFirstListItem = vi.fn();
 const toast = vi.fn();
 
 // The unit under test: the real fix funnels errors here. We spy on it so we
@@ -48,7 +48,6 @@ vi.mock("@/features/images/imageApi", () => ({
   MAX_IMAGES_PER_CARD: 5,
   deleteCardImage: (...args: unknown[]) => deleteCardImage(...args),
   imageDisplayUrl: (...args: unknown[]) => imageDisplayUrl(...args),
-  listCardImages: (...args: unknown[]) => listCardImages(...args),
 }));
 
 vi.mock("@/features/images/useImageUpload", () => ({
@@ -58,14 +57,6 @@ vi.mock("@/features/images/useImageUpload", () => ({
     uploading: false,
     error: null,
   }),
-}));
-
-vi.mock("@/lib/pocketbase", () => ({
-  collections: {
-    cards: () => ({
-      getFirstListItem: (...args: unknown[]) => getFirstListItem(...args),
-    }),
-  },
 }));
 
 vi.mock("@/components/ui/use-toast", () => ({
@@ -124,22 +115,21 @@ function renderEditPage() {
   );
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   createCard.mockReset();
   updateCard.mockReset();
   softDeleteCard.mockReset();
   deleteCardImage.mockReset();
-  listCardImages.mockReset();
   imageDisplayUrl.mockReset();
-  getFirstListItem.mockReset();
   toast.mockReset();
   clearAuthOnUnauthorized.mockReset();
   // By default a 401 was indeed a 401 -> auth cleared, redirect handled.
   clearAuthOnUnauthorized.mockReturnValue(true);
-  // Healthy edit-mode load by default.
-  getFirstListItem.mockResolvedValue(CARD);
-  listCardImages.mockResolvedValue([IMAGE]);
   imageDisplayUrl.mockResolvedValue("blob:img1");
+  // Healthy edit-mode load: seed the card + its image into Dexie.
+  await Promise.all([db.cards.clear(), db.card_images.clear()]);
+  await db.cards.put(CARD);
+  await db.card_images.put(IMAGE);
 });
 
 async function waitForEditorLoaded() {
@@ -219,21 +209,5 @@ describe("CardEditor clears auth on 401 (react-3)", () => {
     expect(
       toast.mock.calls.some((c) => c[0]?.title === "Could not remove image"),
     ).toBe(false);
-  });
-
-  it("routes a 401 from the load effect through clearAuthOnUnauthorized (no error message)", async () => {
-    const err = unauthorized();
-    getFirstListItem.mockRejectedValue(err);
-    listCardImages.mockRejectedValue(err);
-
-    renderEditPage();
-
-    await waitFor(() =>
-      expect(clearAuthOnUnauthorized).toHaveBeenCalledWith(err),
-    );
-    // With auth cleared, the editor must not show a raw load error.
-    expect(
-      screen.queryByText(/Failed to load card/i),
-    ).not.toBeInTheDocument();
   });
 });

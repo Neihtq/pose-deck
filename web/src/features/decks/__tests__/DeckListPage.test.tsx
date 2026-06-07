@@ -1,20 +1,20 @@
 /**
  * Component tests for DeckListPage (route: "/", DESIGN.md §3.3).
  *
- * Covers the page-level behaviours: initial loading state, load error + retry,
- * the empty state, rendering + date-grouping of decks, the name search filter,
- * the "New deck" dialog (validation + create → navigate), and the optimistic
- * duplicate / delete flows that refetch the list and toast.
+ * As of M3 the deck list is local-first: decks are read from Dexie via a live
+ * query. These tests seed the real (fake-indexeddb) `db` and let the live query
+ * drive the UI; mutations are mocked at the deckApi function level, and the
+ * delete mock mirrors a real soft-delete into Dexie so we can assert the live
+ * query drops the row (the M1 "refetch + toast" behaviour, now via live query).
  *
- * All data-access modules (`deckApi`, `cardApi`, `imageApi`) and the auth
- * 401-handler are mocked, so no PocketBase SDK or network is touched. The real
- * `deckGrouping` is kept so we exercise the actual grouping/search logic.
- * `useNavigate` is spied through a partial react-router-dom mock.
+ * The real `deckGrouping` is kept so we exercise the actual grouping/search
+ * logic. `useNavigate` is spied through a partial react-router-dom mock.
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { db } from "@/lib/db";
 import type { Deck } from "@/lib/types";
 
 const navigate = vi.fn();
@@ -26,24 +26,21 @@ vi.mock("react-router-dom", async () => {
   return { ...actual, useNavigate: () => navigate };
 });
 
-const listDecks = vi.fn();
 const createDeck = vi.fn();
 const duplicateDeck = vi.fn();
 const softDeleteDeck = vi.fn();
 const renameDeck = vi.fn();
 vi.mock("@/features/decks/deckApi", () => ({
-  listDecks: (...a: unknown[]) => listDecks(...a),
   createDeck: (...a: unknown[]) => createDeck(...a),
   duplicateDeck: (...a: unknown[]) => duplicateDeck(...a),
   softDeleteDeck: (...a: unknown[]) => softDeleteDeck(...a),
   renameDeck: (...a: unknown[]) => renameDeck(...a),
 }));
 
-// Thumbnails are best-effort; stub them to resolve to nothing so the page's
-// thumbnail effect never hits a real backend.
-vi.mock("@/features/cards/cardApi", () => ({ listCards: vi.fn(async () => []) }));
+// Thumbnails are best-effort; stub the URL resolver so the page's thumbnail
+// effect never hits a real backend. (liveCards/liveCardImages read the real,
+// empty db, so no images resolve.)
 vi.mock("@/features/images/imageApi", () => ({
-  listCardImages: vi.fn(async () => []),
   imageDisplayUrl: vi.fn(async () => null),
 }));
 
@@ -89,26 +86,25 @@ function isoOffsetDays(days: number): string {
   return d.toISOString();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   navigate.mockReset();
-  listDecks.mockReset();
   createDeck.mockReset();
   duplicateDeck.mockReset();
   softDeleteDeck.mockReset();
   renameDeck.mockReset();
   toast.mockReset();
+  await Promise.all([db.decks.clear(), db.cards.clear(), db.card_images.clear()]);
 });
 
 describe("DeckListPage", () => {
   it("shows a loading state, then renders decks grouped by date", async () => {
-    listDecks.mockResolvedValue([
+    await db.decks.bulkPut([
       makeDeck({ id: "u", name: "Future Shoot", shoot_date: isoOffsetDays(2) }),
       makeDeck({ id: "n", name: "No Date Shoot" }),
       makeDeck({ id: "p", name: "Old Shoot", shoot_date: isoOffsetDays(-5) }),
     ]);
 
     renderPage();
-    expect(screen.getByText("Loading decks…")).toBeInTheDocument();
 
     await screen.findByText("Future Shoot");
     expect(screen.getByText("No Date Shoot")).toBeInTheDocument();
@@ -120,25 +116,12 @@ describe("DeckListPage", () => {
   });
 
   it("renders the empty state when there are no decks", async () => {
-    listDecks.mockResolvedValue([]);
     renderPage();
     await screen.findByText(/no decks yet/i);
   });
 
-  it("shows a load error with a Retry that refetches", async () => {
-    listDecks.mockRejectedValueOnce(new Error("boom"));
-    renderPage();
-
-    await screen.findByText(/could not load your decks/i);
-
-    listDecks.mockResolvedValueOnce([makeDeck({ id: "d1", name: "Recovered" })]);
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-
-    await screen.findByText("Recovered");
-  });
-
   it("filters decks by the search query", async () => {
-    listDecks.mockResolvedValue([
+    await db.decks.bulkPut([
       makeDeck({ id: "a", name: "Smith Wedding" }),
       makeDeck({ id: "b", name: "Jones Portraits" }),
     ]);
@@ -154,7 +137,7 @@ describe("DeckListPage", () => {
   });
 
   it("shows a no-match message when the search filters everything out", async () => {
-    listDecks.mockResolvedValue([makeDeck({ id: "a", name: "Smith Wedding" })]);
+    await db.decks.put(makeDeck({ id: "a", name: "Smith Wedding" }));
     renderPage();
     await screen.findByText("Smith Wedding");
 
@@ -165,7 +148,6 @@ describe("DeckListPage", () => {
   });
 
   it("creates a deck via the dialog and navigates into it", async () => {
-    listDecks.mockResolvedValue([]);
     createDeck.mockResolvedValue(makeDeck({ id: "new1", name: "Beach Shoot" }));
     renderPage();
     await screen.findByText(/no decks yet/i);
@@ -197,11 +179,12 @@ describe("DeckListPage", () => {
     );
   });
 
-  it("optimistically deletes a deck: refetches and toasts", async () => {
-    listDecks
-      .mockResolvedValueOnce([makeDeck({ id: "d1", name: "Doomed Deck" })])
-      .mockResolvedValueOnce([]); // after delete, list is empty
-    softDeleteDeck.mockResolvedValue(undefined);
+  it("optimistically deletes a deck: the live query drops the row and toasts", async () => {
+    await db.decks.put(makeDeck({ id: "d1", name: "Doomed Deck" }));
+    // The mock mirrors a real soft-delete into Dexie so the live query updates.
+    softDeleteDeck.mockImplementation(async (id: string) => {
+      await db.decks.update(id, { deleted_at: new Date().toISOString() });
+    });
 
     renderPage();
     await screen.findByText("Doomed Deck");
@@ -218,6 +201,9 @@ describe("DeckListPage", () => {
     fireEvent.click(within(confirm).getByRole("button", { name: "Delete" }));
 
     await waitFor(() => expect(softDeleteDeck).toHaveBeenCalledWith("d1"));
+    await waitFor(() =>
+      expect(screen.queryByText("Doomed Deck")).not.toBeInTheDocument(),
+    );
     await waitFor(() =>
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({ title: "Deck moved to Trash" }),

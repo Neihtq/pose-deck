@@ -40,7 +40,8 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { cn } from "@/lib/utils";
 
-import { collections } from "@/lib/pocketbase";
+import { db } from "@/lib/db";
+import { liveCardImages } from "@/lib/localStore";
 import type { Card, CardImage } from "@/lib/types";
 
 import { clearAuthOnUnauthorized } from "@/features/auth/AuthContext";
@@ -55,7 +56,6 @@ import {
   MAX_IMAGES_PER_CARD,
   deleteCardImage,
   imageDisplayUrl,
-  listCardImages,
 } from "@/features/images/imageApi";
 import { useImageUpload } from "@/features/images/useImageUpload";
 
@@ -110,7 +110,13 @@ export default function CardEditor(): JSX.Element {
     }
   }, [deckId, navigate]);
 
-  // Load the card + its images in edit mode.
+  // Load the card + its images in edit mode FROM DEXIE (local-first). Reading
+  // the card from the network (getFirstListItem) 404s for an offline or
+  // just-created card whose create has not yet been acked — the
+  // create-navigate-404 hole. Dexie holds the optimistic row immediately, so
+  // the editor opens regardless of sync state. A trashed card (non-empty
+  // `deleted_at`) reads as not-found, matching the old `deleted_at = ""`
+  // scoping and the soft-delete model.
   useEffect(() => {
     if (!cardId) {
       setForm(EMPTY_FORM);
@@ -123,17 +129,15 @@ export default function CardEditor(): JSX.Element {
     setLoadError(null);
     (async () => {
       try {
-        // Scope with `deleted_at = ""` so a trashed card reads as not-found:
-        // the card `viewRule` has no soft-delete condition (ARCHITECTURE.md
-        // §3.2), so a plain getOne would let a stale tab/bookmark/direct URL
-        // open and edit a record that should only live in Trash.
         const [card, imgs] = await Promise.all([
-          collections
-            .cards()
-            .getFirstListItem(`id = "${cardId}" && deleted_at = ""`),
-          listCardImages(cardId),
+          db.cards.get(cardId),
+          liveCardImages(db, cardId),
         ]);
         if (cancelled) return;
+        if (!card || card.deleted_at !== "") {
+          setLoadError("Failed to load card.");
+          return;
+        }
         setForm(formFromCard(card));
         setImages(imgs);
       } catch (err) {

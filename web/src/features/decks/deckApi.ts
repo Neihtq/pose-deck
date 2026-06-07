@@ -1,20 +1,27 @@
 /**
- * Data-access primitives for `decks`.
+ * Data-access primitives for `decks` (M3 local-first).
  *
- * Thin async wrappers around `collections.decks()` (the official PocketBase JS
- * SDK record service). These are the CRUD primitives every deck page builds on.
+ * As of M3 these are local-first: a mutation writes the optimistic row into
+ * Dexie immediately and enqueues a coalesced outbox entry (drained by the sync
+ * engine). Reads come from Dexie live queries in the pages (`liveDecks` etc.),
+ * so this module no longer exposes `listDecks`/`getDeck` fetchers — the UI never
+ * blocks on the network for a read.
  *
- * Conventions (see web CLAUDE.md / ARCHITECTURE.md §3.2):
- *  - Every mutation stamps `client_updated_at` with the current ISO time
- *    (last-write-wins prep).
- *  - Soft delete = set `deleted_at` to the current ISO time. We never
- *    hard-delete decks from the UI.
- *  - List queries exclude soft-deleted records via a `deleted_at = ""` filter.
- *
- * For M1 these call PocketBase directly; the Dexie cache / outbox sync lands in
- * M3, so we keep the surface area minimal and typed.
+ * Conventions (see web CLAUDE.md / ARCHITECTURE.md §3.2, §4.2):
+ *  - Creates mint a client-supplied PB-shaped id (`newClientId`) so the record
+ *    identity is stable across the optimistic write and the eventual server
+ *    insert (no temp-id reconciliation).
+ *  - Every mutation stamps `client_updated_at` with the current ISO time (LWW).
+ *  - Soft delete = set `deleted_at`; we never hard-delete decks.
+ *  - `owner` is set explicitly from the authenticated user: the deck
+ *    `createRule` only authorizes the request and no server hook populates the
+ *    required `owner` relation (a load-bearing M1 fix — do not drop).
  */
-import { collections, pb } from "@/lib/pocketbase";
+import { db } from "@/lib/db";
+import { newClientId } from "@/lib/ids";
+import { enqueueCoalesced } from "@/lib/outbox";
+import { pb } from "@/lib/pocketbase";
+import { wakeSync } from "@/sync";
 import type { Card, Deck, ISODateString } from "@/lib/types";
 
 /** Current wall-clock time as an ISO 8601 string. */
@@ -50,123 +57,171 @@ export interface CreateDeckInput {
 }
 
 /**
- * List the current user's decks that are not soft-deleted.
- *
- * The PocketBase `listRule` (ARCHITECTURE.md §3.2) already scopes results to
- * decks the authenticated user owns *or* has been granted guest access to, so
- * the SDK returns both owner and guest decks. We only filter out the
- * soft-deleted ones here and sort newest-updated first as a stable default
- * (page-level grouping/sorting happens in `deckGrouping`).
+ * Build a fully-populated optimistic deck row. Server-managed `created`/
+ * `updated` are seeded from the client clock; the sync engine reconciles the
+ * canonical values into Dexie on the create's 2xx.
  */
-export async function listDecks(): Promise<Deck[]> {
-  return collections.decks().getFullList({
-    filter: 'deleted_at = ""',
-    sort: "-updated",
-  });
+function optimisticDeck(input: {
+  id: string;
+  owner: string;
+  name: string;
+  shoot_date: ISODateString;
+  client_updated_at: ISODateString;
+}): Deck {
+  return {
+    id: input.id,
+    owner: input.owner,
+    name: input.name,
+    shoot_date: input.shoot_date,
+    deleted_at: "",
+    client_updated_at: input.client_updated_at,
+    created: input.client_updated_at,
+    updated: input.client_updated_at,
+  };
 }
 
 /**
- * Fetch a single non-soft-deleted deck by id.
- *
- * The PocketBase `viewRule` mirrors the `listRule` (owner/guest scoping) but
- * has no `deleted_at = ""` condition, so a plain `getOne(id)` would happily
- * return a trashed deck — letting a stale tab/bookmark/direct URL render and
- * edit a record that should only live in Trash. We scope the fetch with
- * `deleted_at = ""` so a soft-deleted deck reads as not-found, matching the
- * list paths and the soft-delete model (DESIGN.md §3).
- */
-export async function getDeck(id: string): Promise<Deck> {
-  return collections
-    .decks()
-    .getFirstListItem(pb.filter("id = {:id} && deleted_at = ''", { id }));
-}
-
-/**
- * Create a new deck for the current user.
- *
- * `owner` is a required relation that the server does NOT auto-populate, so we
- * set it from the authenticated user. An empty `shoot_date` is sent as `""` to
- * match the PocketBase "unset datetime" representation.
+ * Create a new deck for the current user. Writes the optimistic row into Dexie
+ * and enqueues a `create` outbox entry; returns the optimistic record.
  */
 export async function createDeck(input: CreateDeckInput): Promise<Deck> {
-  return collections.decks().create({
-    owner: currentUserId(),
+  const owner = currentUserId();
+  const stamp = nowIso();
+  const deck = optimisticDeck({
+    id: newClientId(),
+    owner,
     name: input.name,
     shoot_date: input.shoot_date ?? "",
-    deleted_at: "",
-    client_updated_at: nowIso(),
+    client_updated_at: stamp,
   });
+  await db.decks.put(deck);
+  await enqueueCoalesced(db, {
+    type: "create",
+    entity: "decks",
+    recordId: deck.id,
+    payload: {
+      owner: deck.owner,
+      name: deck.name,
+      shoot_date: deck.shoot_date,
+      deleted_at: "",
+      client_updated_at: stamp,
+    },
+  });
+  wakeSync();
+  return deck;
 }
 
-/** Rename a deck. */
+/** Rename a deck (optimistic Dexie write + coalesced update enqueue). */
 export async function renameDeck(id: string, name: string): Promise<Deck> {
-  return collections.decks().update(id, {
+  const stamp = nowIso();
+  const existing = await db.decks.get(id);
+  const updated: Deck = {
+    ...(existing as Deck),
+    id,
     name,
-    client_updated_at: nowIso(),
+    client_updated_at: stamp,
+  };
+  await db.decks.put(updated);
+  await enqueueCoalesced(db, {
+    type: "update",
+    entity: "decks",
+    recordId: id,
+    payload: { name, client_updated_at: stamp },
   });
+  wakeSync();
+  return updated;
 }
 
 /** Soft-delete a deck (move to trash). Never hard-deletes. */
 export async function softDeleteDeck(id: string): Promise<Deck> {
-  return collections.decks().update(id, {
-    deleted_at: nowIso(),
-    client_updated_at: nowIso(),
+  const stamp = nowIso();
+  const existing = await db.decks.get(id);
+  const updated: Deck = {
+    ...(existing as Deck),
+    id,
+    deleted_at: stamp,
+    client_updated_at: stamp,
+  };
+  await db.decks.put(updated);
+  await enqueueCoalesced(db, {
+    type: "update",
+    entity: "decks",
+    recordId: id,
+    payload: { deleted_at: stamp, client_updated_at: stamp },
   });
+  wakeSync();
+  return updated;
 }
 
 /** Restore a soft-deleted deck (clear `deleted_at`). */
 export async function restoreDeck(id: string): Promise<Deck> {
-  return collections.decks().update(id, {
+  const stamp = nowIso();
+  const existing = await db.decks.get(id);
+  const updated: Deck = {
+    ...(existing as Deck),
+    id,
     deleted_at: "",
-    client_updated_at: nowIso(),
+    client_updated_at: stamp,
+  };
+  await db.decks.put(updated);
+  await enqueueCoalesced(db, {
+    type: "update",
+    entity: "decks",
+    recordId: id,
+    payload: { deleted_at: "", client_updated_at: stamp },
   });
-}
-
-/** List the current user's soft-deleted decks (the trash view). */
-export async function listTrashedDecks(): Promise<Deck[]> {
-  return collections.decks().getFullList({
-    filter: 'deleted_at != ""',
-    sort: "-deleted_at",
-  });
+  wakeSync();
+  return updated;
 }
 
 /**
  * Duplicate a deck (poor-man's templates, DESIGN.md §3.3).
  *
- * Copies the deck metadata into a fresh deck (name suffixed with "(copy)", no
- * `shoot_date` carried over — the copy is a template starting point) and copies
- * every non-soft-deleted card with freshly striped integer-gap positions,
- * preserving their original order. Card completion state and images are not
- * copied (completions are per-user/permanent per DESIGN.md §3; images are
- * handled by the image-pipeline unit and not duplicated in M1).
- *
- * Duplication is only valid for *live* source decks. `getDeck` already filters
- * out soft-deleted decks, but we also assert it explicitly so a trashed deck
- * can never be resurrected into a fresh live copy outside the restore workflow
- * (DESIGN.md §3.3 / soft-delete model), even if `getDeck`'s scoping changes.
+ * Reads the source deck + its live cards from Dexie, then creates a fresh deck
+ * (name suffixed with "(copy)", no `shoot_date`) and a copy of every
+ * non-soft-deleted card with freshly striped integer-gap positions, preserving
+ * order. All writes are optimistic (Dexie + outbox); images and completions are
+ * not copied (DESIGN.md §3.3). Duplication is only valid for *live* source
+ * decks — a trashed source throws so it can't be resurrected outside restore.
  */
 export async function duplicateDeck(id: string): Promise<Deck> {
-  const source = await getDeck(id);
-  if (source.deleted_at !== "") {
+  const source = await db.decks.get(id);
+  if (!source || source.deleted_at !== "") {
     throw new Error("Cannot duplicate a deck that is in Trash.");
   }
 
-  const copy = await collections.decks().create({
-    owner: currentUserId(),
+  const owner = currentUserId();
+  const stamp = nowIso();
+  const copy = optimisticDeck({
+    id: newClientId(),
+    owner,
     name: `${source.name} (copy)`,
     shoot_date: "",
-    deleted_at: "",
-    client_updated_at: nowIso(),
+    client_updated_at: stamp,
+  });
+  await db.decks.put(copy);
+  await enqueueCoalesced(db, {
+    type: "create",
+    entity: "decks",
+    recordId: copy.id,
+    payload: {
+      owner,
+      name: copy.name,
+      shoot_date: "",
+      deleted_at: "",
+      client_updated_at: stamp,
+    },
   });
 
-  const sourceCards = await collections.cards().getFullList({
-    filter: pb.filter("deck = {:deck} && deleted_at = ''", { deck: id }),
-    sort: "position",
-  });
+  const sourceCards = (await db.cards.where("deck").equals(id).toArray())
+    .filter((c) => c.deleted_at === "")
+    .sort((a, b) => a.position - b.position);
 
   let position = POSITION_GAP;
   for (const card of sourceCards) {
-    await collections.cards().create({
+    const cardStamp = nowIso();
+    const newCard: Card = {
+      id: newClientId(),
       deck: copy.id,
       position,
       title: card.title,
@@ -175,11 +230,31 @@ export async function duplicateDeck(id: string): Promise<Deck> {
       direction: card.direction,
       notes: card.notes,
       deleted_at: "",
-      client_updated_at: nowIso(),
+      client_updated_at: cardStamp,
+      created: cardStamp,
+      updated: cardStamp,
+    };
+    await db.cards.put(newCard);
+    await enqueueCoalesced(db, {
+      type: "create",
+      entity: "cards",
+      recordId: newCard.id,
+      payload: {
+        deck: copy.id,
+        position,
+        title: newCard.title,
+        time_slot: newCard.time_slot,
+        subjects: newCard.subjects,
+        direction: newCard.direction,
+        notes: newCard.notes,
+        deleted_at: "",
+        client_updated_at: cardStamp,
+      },
     });
     position += POSITION_GAP;
   }
 
+  wakeSync();
   return copy;
 }
 

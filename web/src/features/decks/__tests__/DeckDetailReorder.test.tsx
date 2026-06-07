@@ -1,16 +1,12 @@
 /**
- * Regression test for the optimistic-reorder revert race (finding C3).
+ * Regression test for the optimistic-reorder serialization (finding C3).
  *
- * `DeckDetailPage` reorders cards optimistically and persists with
- * `reorderCards`. The original implementation captured the pre-drag card list
- * as a local revert snapshot and restored it on failure. Under overlapping
- * drags (a second drop committed before the first request settled) that
- * snapshot was an intermediate, non-server-confirmed order, so a later failure
- * could restore a stale ordering that diverged from the server.
- *
- * The fix serializes reorders (a second drop is ignored while one is in flight)
- * and, on failure, re-fetches the authoritative order via `listCards` instead
- * of trusting a local snapshot. These tests exercise both behaviours.
+ * `DeckDetailPage` reorders cards by writing the new positions to Dexie + the
+ * outbox via `reorderCards`; the live card query re-renders the new order, so
+ * there is no local optimistic snapshot to revert. We still serialize reorders
+ * (a second drop is ignored while one is in flight) so two restripes can't
+ * interleave, and a failed reorder surfaces a destructive toast (the live query
+ * is the reconciliation path — a rollback/resync corrects the local order).
  *
  * `DndContext` is mocked so the test can invoke the captured `onDragEnd`
  * directly (driving real dnd-kit pointer drags under jsdom is impractical);
@@ -23,6 +19,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { db } from "@/lib/db";
 import type { Card, Deck } from "@/lib/types";
 
 // --- Capture the DndContext onDragEnd handler ------------------------------
@@ -48,19 +45,15 @@ vi.mock("@dnd-kit/core", async () => {
 });
 
 // --- Mock the data-access + auth modules -----------------------------------
-const getDeck = vi.fn();
-const listCards = vi.fn();
 const reorderCards = vi.fn();
 const createCard = vi.fn();
 
 vi.mock("@/features/cards/cardApi", () => ({
-  listCards: (...args: unknown[]) => listCards(...args),
   reorderCards: (...args: unknown[]) => reorderCards(...args),
   createCard: (...args: unknown[]) => createCard(...args),
 }));
 
 vi.mock("@/features/decks/deckApi", () => ({
-  getDeck: (...args: unknown[]) => getDeck(...args),
   duplicateDeck: vi.fn(),
   renameDeck: vi.fn(),
   softDeleteDeck: vi.fn(),
@@ -68,7 +61,6 @@ vi.mock("@/features/decks/deckApi", () => ({
 
 vi.mock("@/features/images/imageApi", () => ({
   imageDisplayUrl: vi.fn(async () => null),
-  listCardImages: vi.fn(async () => []),
 }));
 
 vi.mock("@/features/auth/AuthContext", () => ({
@@ -136,30 +128,28 @@ function dragEvent(activeId: string, overId: string) {
   return { active: { id: activeId }, over: { id: overId } };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   capturedOnDragEnd = null;
-  getDeck.mockReset().mockResolvedValue(DECK);
   reorderCards.mockReset().mockResolvedValue(undefined);
   createCard.mockReset();
   toast.mockReset();
-  // Initial server order: a, b, c.
-  listCards
-    .mockReset()
-    .mockResolvedValue([
-      makeCard("a", 1000),
-      makeCard("b", 2000),
-      makeCard("c", 3000),
-    ]);
+  await Promise.all([db.decks.clear(), db.cards.clear(), db.card_images.clear()]);
+  // Initial local order: a, b, c.
+  await db.decks.put(DECK);
+  await db.cards.bulkPut([
+    makeCard("a", 1000),
+    makeCard("b", 2000),
+    makeCard("c", 3000),
+  ]);
 });
 
-describe("DeckDetailPage reorder race (C3)", () => {
+describe("DeckDetailPage reorder (C3)", () => {
   it("ignores a second drop while the first reorder is still in flight", async () => {
     const first = deferred<void>();
     reorderCards.mockReturnValueOnce(first.promise);
 
     renderPage();
-    // Wait for the load effect (deck + cards + thumbnails) to fully settle so
-    // later state updates aren't attributed to un-acted async work.
+    // Wait for the live card query to render the rows.
     await screen.findByText("a");
     await waitFor(() => expect(capturedOnDragEnd).not.toBeNull());
 
@@ -171,15 +161,13 @@ describe("DeckDetailPage reorder race (C3)", () => {
     expect(reorderCards.mock.calls[0][1]).toEqual(["b", "a", "c"]);
 
     // Second drag committed BEFORE the first resolves must be ignored, so we
-    // never stack an optimistic reorder on an unconfirmed one.
+    // never stack a second reorder on an unconfirmed one.
     act(() => {
       capturedOnDragEnd!(dragEvent("c", "a"));
     });
     expect(reorderCards).toHaveBeenCalledTimes(1);
 
     // Let the first request settle; reorders are accepted again afterwards.
-    // Flush an extra task so the page's `.finally(setReordering(false))`
-    // microtask runs inside this act() before we assert.
     await act(async () => {
       first.resolve();
       await first.promise;
@@ -192,46 +180,28 @@ describe("DeckDetailPage reorder race (C3)", () => {
     expect(reorderCards).toHaveBeenCalledTimes(2);
   });
 
-  it("re-fetches the authoritative order on failure instead of reverting to a local snapshot", async () => {
+  it("surfaces a destructive toast when the reorder write fails", async () => {
     const failing = deferred<void>();
     reorderCards.mockReturnValueOnce(failing.promise);
-
-    // When the failed reorder triggers a re-fetch, the server reports a
-    // DIFFERENT authoritative order than any local snapshot the client held.
-    const serverTruth = [
-      makeCard("c", 1000),
-      makeCard("b", 2000),
-      makeCard("a", 3000),
-    ];
 
     renderPage();
     await screen.findByText("a");
     await waitFor(() => expect(capturedOnDragEnd).not.toBeNull());
-    // Drain the initial load's listCards call(s) so the next resolution is ours.
-    await waitFor(() => expect(listCards).toHaveBeenCalled());
-    listCards.mockResolvedValueOnce(serverTruth);
 
     act(() => {
       capturedOnDragEnd!(dragEvent("a", "b"));
     });
     expect(reorderCards).toHaveBeenCalledTimes(1);
 
-    const listCallsBeforeFailure = listCards.mock.calls.length;
-
     await act(async () => {
       failing.reject(new Error("network"));
       await failing.promise.catch(() => {});
     });
 
-    // On failure the page MUST re-fetch authoritative order via listCards,
-    // not silently revert to a captured local snapshot.
     await waitFor(() =>
-      expect(listCards.mock.calls.length).toBeGreaterThan(
-        listCallsBeforeFailure,
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: "destructive" }),
       ),
-    );
-    expect(toast).toHaveBeenCalledWith(
-      expect.objectContaining({ variant: "destructive" }),
     );
   });
 });

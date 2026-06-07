@@ -3,9 +3,14 @@
  *
  * Thin wrappers over the shared PocketBase client for the `card_images`
  * collection: upload a compressed blob, list a card's images ordered by
- * position, delete one, and build a display URL. M1 talks to PocketBase
- * directly (outbox sync is M3).
+ * position, delete one, and build a display URL.
+ *
+ * Images stay PocketBase-direct (both upload AND delete) — they carry binary
+ * payloads and are not routed through the offline outbox (M3 plan, option A).
+ * We mirror the result into Dexie (`put` on upload, `delete` on delete) so the
+ * local live queries that drive thumbnails and the editor stay consistent.
  */
+import { db } from "@/lib/db";
 import { collections, fileUrlWithToken, pb } from "@/lib/pocketbase";
 import type { CardImage } from "@/lib/types";
 
@@ -50,7 +55,10 @@ export async function uploadCardImage(
   // Note: `created` is a server-managed autodate; we deliberately do NOT send
   // it (PocketBase ignores client-supplied values for it anyway).
 
-  return collections.card_images().create(form);
+  const record = await collections.card_images().create(form);
+  // Mirror into Dexie so live queries (thumbnails, editor) reflect it at once.
+  await db.card_images.put(record);
+  return record;
 }
 
 /**
@@ -67,6 +75,8 @@ export async function listCardImages(cardId: string): Promise<CardImage[]> {
 /** Delete a `card_images` record by id (hard delete — images have no soft-delete). */
 export async function deleteCardImage(id: string): Promise<void> {
   await collections.card_images().delete(id);
+  // Mirror the hard-delete into Dexie so live queries drop the row immediately.
+  await db.card_images.delete(id);
 }
 
 /**

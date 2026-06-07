@@ -19,12 +19,12 @@ import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { CardImage } from "@/lib/types";
+import { db } from "@/lib/db";
+import type { Card, CardImage } from "@/lib/types";
 
 // --- Mock data-access + side-effect modules -------------------------------
-const getFirstListItem = vi.fn();
+// The card + its images are read from Dexie; only the URL resolver is mocked.
 const imageDisplayUrl = vi.fn();
-const listCardImages = vi.fn();
 
 vi.mock("@/features/cards/cardApi", () => ({
   createCard: vi.fn(),
@@ -36,7 +36,6 @@ vi.mock("@/features/images/imageApi", () => ({
   MAX_IMAGES_PER_CARD: 5,
   deleteCardImage: vi.fn(),
   imageDisplayUrl: (...args: unknown[]) => imageDisplayUrl(...args),
-  listCardImages: (...args: unknown[]) => listCardImages(...args),
 }));
 
 vi.mock("@/features/images/useImageUpload", () => ({
@@ -48,17 +47,26 @@ vi.mock("@/features/images/useImageUpload", () => ({
   }),
 }));
 
-vi.mock("@/lib/pocketbase", () => ({
-  collections: {
-    cards: () => ({ getFirstListItem: (...args: unknown[]) => getFirstListItem(...args) }),
-  },
-}));
-
 vi.mock("@/components/ui/use-toast", () => ({
   toast: vi.fn(),
 }));
 
 import CardEditor from "@/features/cards/CardEditor";
+
+const CARD: Card = {
+  id: "card1",
+  deck: "deck1",
+  position: 1000,
+  title: "Shot",
+  time_slot: "",
+  subjects: "",
+  direction: "",
+  notes: "",
+  client_updated_at: "",
+  created: "",
+  updated: "",
+  deleted_at: "",
+};
 
 const IMAGE: CardImage = {
   id: "img1",
@@ -77,12 +85,11 @@ function renderEditPage() {
   );
 }
 
-beforeEach(() => {
-  getFirstListItem.mockReset();
-  getFirstListItem.mockResolvedValue({ id: "card1", title: "Shot" });
-  listCardImages.mockReset();
-  listCardImages.mockResolvedValue([IMAGE]);
+beforeEach(async () => {
   imageDisplayUrl.mockReset();
+  await Promise.all([db.cards.clear(), db.card_images.clear()]);
+  await db.cards.put(CARD);
+  await db.card_images.put(IMAGE);
 });
 
 describe("CardEditor image token refresh (react-1)", () => {

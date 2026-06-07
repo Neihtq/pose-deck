@@ -1,39 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { Deck } from "@/lib/types";
+import { db } from "@/lib/db";
+import { decodeOutboxPayload } from "@/lib/outbox";
+import type { Card, Deck } from "@/lib/types";
 
-// Mock the PocketBase client wrapper so deckApi never touches the network.
-const getOne = vi.fn();
-const getFirstListItem = vi.fn();
-const getFullList = vi.fn();
-const create = vi.fn();
-const cardsGetFullList = vi.fn();
-const cardsCreate = vi.fn();
+// Mock the sync wake() seam (the engine is wired separately).
+vi.mock("@/sync", () => ({ wakeSync: vi.fn() }));
 
-// Mirror PocketBase's `pb.filter()` autoescaping so the binding-based filters
-// (finding SEC-1) build a real, escaped clause in these tests. Defined via
-// vi.hoisted so it exists when the (hoisted) vi.mock factory runs.
-const { filter } = vi.hoisted(() => ({
-  filter: vi.fn((raw: string, params?: Record<string, unknown>) =>
-    raw.replace(/\{:(\w+)\}/g, (_match, key: string) => {
-      const value = params?.[key];
-      if (typeof value === "string") {
-        return `'${value.replace(/'/g, "\\'")}'`;
-      }
-      return String(value);
-    }),
-  ),
-}));
-
+// Provide an authenticated user so `currentUserId()` can stamp `owner`.
 vi.mock("@/lib/pocketbase", () => ({
-  collections: {
-    decks: () => ({ getOne, getFirstListItem, getFullList, create }),
-    cards: () => ({ getFullList: cardsGetFullList, create: cardsCreate }),
-  },
-  pb: { authStore: { record: { id: "user1" } }, filter },
+  pb: { authStore: { record: { id: "user1" } } },
 }));
 
-import { duplicateDeck, getDeck } from "@/features/decks/deckApi";
+import {
+  createDeck,
+  duplicateDeck,
+  renameDeck,
+  restoreDeck,
+  softDeleteDeck,
+} from "@/features/decks/deckApi";
 
 function makeDeck(id: string, deletedAt: string): Deck {
   return {
@@ -45,93 +30,126 @@ function makeDeck(id: string, deletedAt: string): Deck {
     client_updated_at: "",
     created: "",
     updated: "",
-  } as Deck;
+  };
 }
 
-beforeEach(() => {
-  getOne.mockReset();
-  getFirstListItem.mockReset();
-  getFullList.mockReset();
-  create.mockReset();
-  cardsGetFullList.mockReset();
-  cardsCreate.mockReset();
-  filter.mockClear();
+function makeCard(id: string, deck: string, position: number): Card {
+  return {
+    id,
+    deck,
+    position,
+    title: id,
+    time_slot: "",
+    subjects: "",
+    direction: "",
+    notes: "",
+    client_updated_at: "",
+    created: "",
+    updated: "",
+    deleted_at: "",
+  };
+}
+
+beforeEach(async () => {
+  await Promise.all([db.decks.clear(), db.cards.clear(), db.outbox.clear()]);
 });
 
-describe("getDeck (soft-delete leak regression, finding C1)", () => {
-  it("scopes the fetch with deleted_at = \"\" so trashed decks read as not-found", async () => {
-    getFirstListItem.mockResolvedValue(makeDeck("deck1", ""));
+describe("createDeck (local-first)", () => {
+  it("stamps owner from the auth store, writes Dexie + enqueues a create", async () => {
+    const deck = await createDeck({ name: "Smith Wedding" });
 
-    const deck = await getDeck("deck1");
+    expect(deck.owner).toBe("user1");
+    expect(deck.name).toBe("Smith Wedding");
+    expect(deck.deleted_at).toBe("");
+    expect(deck.client_updated_at).not.toBe("");
+    // Client-supplied PB-shaped id (15 chars).
+    expect(deck.id).toHaveLength(15);
 
-    // Must not use the unscoped single-record fetch, which would return a
-    // soft-deleted deck and let a direct URL render/edit it.
-    expect(getOne).not.toHaveBeenCalled();
-    expect(getFirstListItem).toHaveBeenCalledTimes(1);
-    const builtFilter = getFirstListItem.mock.calls[0][0] as string;
-    expect(builtFilter).toContain("id = 'deck1'");
-    expect(builtFilter).toContain("deleted_at = ''");
-    expect(deck.id).toBe("deck1");
+    const stored = await db.decks.get(deck.id);
+    expect(stored?.name).toBe("Smith Wedding");
+
+    const entries = await db.outbox.where("recordId").equals(deck.id).toArray();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].type).toBe("create");
+    expect(entries[0].entity).toBe("decks");
+    const payload = decodeOutboxPayload<{ owner: string; name: string }>(
+      entries[0],
+    );
+    // owner MUST be carried in the create payload (load-bearing M1 fix).
+    expect(payload.owner).toBe("user1");
+    expect(payload.name).toBe("Smith Wedding");
+  });
+});
+
+describe("renameDeck / softDeleteDeck / restoreDeck (local-first)", () => {
+  it("rename writes the new name + enqueues an update", async () => {
+    await db.decks.put(makeDeck("d1", ""));
+    await renameDeck("d1", "Renamed");
+    expect((await db.decks.get("d1"))?.name).toBe("Renamed");
+    const entries = await db.outbox.where("recordId").equals("d1").toArray();
+    expect(entries[0].type).toBe("update");
+    expect(decodeOutboxPayload<{ name: string }>(entries[0]).name).toBe(
+      "Renamed",
+    );
   });
 
-  // Regression (finding SEC-1): the deck id comes from a URL route param
-  // (useParams) and is attacker-controllable. It MUST be bound via
-  // `pb.filter()` rather than string-interpolated into the filter clause.
-  it("binds the id via pb.filter instead of raw interpolation", async () => {
-    getFirstListItem.mockResolvedValue(makeDeck("deck1", ""));
-
-    await getDeck('x" || deleted_at != ""');
-
-    expect(filter).toHaveBeenCalled();
-    const filterCall = filter.mock.calls.find(([raw]) => raw.includes("id ="));
-    expect(filterCall).toBeDefined();
-    const [raw, params] = filterCall!;
-    expect(raw).toContain("{:id}");
-    expect(params).toEqual({ id: 'x" || deleted_at != ""' });
-
-    const builtFilter = getFirstListItem.mock.calls[0][0] as string;
-    expect(builtFilter).not.toContain('id = "x" || deleted_at != ""');
-    expect(builtFilter).toContain("deleted_at = ''");
-  });
-
-  it("propagates not-found when a soft-deleted deck is requested by id", async () => {
-    // PocketBase getFirstListItem rejects (404) when the filtered query has no
-    // match — i.e. the deck exists but is in Trash. DeckDetailPage surfaces
-    // this as "Deck not found." rather than rendering an editable trashed deck.
-    const notFound = new Error("The requested resource wasn't found.");
-    getFirstListItem.mockRejectedValue(notFound);
-
-    await expect(getDeck("trashed")).rejects.toThrow(notFound);
-    expect(getOne).not.toHaveBeenCalled();
+  it("softDelete sets deleted_at; restore clears it (coalesced into one update)", async () => {
+    await db.decks.put(makeDeck("d1", ""));
+    await softDeleteDeck("d1");
+    expect((await db.decks.get("d1"))?.deleted_at).not.toBe("");
+    await restoreDeck("d1");
+    expect((await db.decks.get("d1"))?.deleted_at).toBe("");
+    // The two updates coalesce into a single pending update entry.
+    const entries = await db.outbox.where("recordId").equals("d1").toArray();
+    expect(entries).toHaveLength(1);
+    expect(decodeOutboxPayload<{ deleted_at: string }>(entries[0]).deleted_at).toBe(
+      "",
+    );
   });
 });
 
 describe("duplicateDeck (soft-deleted source guard, finding C2)", () => {
   it("refuses to duplicate a soft-deleted source deck and creates no copy", async () => {
-    // Even if the source read resolves a trashed deck (e.g. getDeck scoping is
-    // weakened in a future refactor), duplicateDeck must not resurrect it into
-    // a fresh live deck outside the restore workflow.
-    getFirstListItem.mockResolvedValue(makeDeck("deck1", "2026-01-01T00:00:00Z"));
+    await db.decks.put(makeDeck("deck1", "2026-01-01T00:00:00Z"));
 
     await expect(duplicateDeck("deck1")).rejects.toThrow(/Trash/i);
 
-    // No fresh deck or card copies were created from a trashed source.
-    expect(create).not.toHaveBeenCalled();
-    expect(cardsCreate).not.toHaveBeenCalled();
-    expect(cardsGetFullList).not.toHaveBeenCalled();
+    // Only the trashed source exists; no fresh deck/card copies were written.
+    expect(await db.decks.count()).toBe(1);
+    expect(await db.cards.count()).toBe(0);
+    expect(await db.outbox.count()).toBe(0);
   });
 
-  it("duplicates a live source deck into a fresh live copy", async () => {
-    getFirstListItem.mockResolvedValue(makeDeck("deck1", ""));
-    create.mockResolvedValue(makeDeck("deck1-copy", ""));
-    cardsGetFullList.mockResolvedValue([]);
+  it("refuses to duplicate a missing deck", async () => {
+    await expect(duplicateDeck("nope")).rejects.toThrow(/Trash/i);
+  });
+
+  it("duplicates a live source deck + its live cards into a fresh local copy", async () => {
+    await db.decks.put(makeDeck("deck1", ""));
+    await db.cards.bulkPut([
+      makeCard("c1", "deck1", 1000),
+      makeCard("c2", "deck1", 2000),
+      { ...makeCard("c3", "deck1", 3000), deleted_at: "2026-01-01T00:00:00Z" },
+    ]);
 
     const copy = await duplicateDeck("deck1");
 
-    expect(create).toHaveBeenCalledTimes(1);
-    const createdData = create.mock.calls[0][0] as { name: string; deleted_at: string };
-    expect(createdData.name).toBe("deck1 (copy)");
-    expect(createdData.deleted_at).toBe("");
-    expect(copy.id).toBe("deck1-copy");
+    expect(copy.name).toBe("deck1 (copy)");
+    expect(copy.deleted_at).toBe("");
+    expect(copy.id).not.toBe("deck1");
+
+    // The copy + its two LIVE cards (the trashed one is not copied).
+    const copiedCards = await db.cards.where("deck").equals(copy.id).toArray();
+    expect(copiedCards).toHaveLength(2);
+    expect(copiedCards.map((c) => c.position).sort((a, b) => a - b)).toEqual([
+      1000, 2000,
+    ]);
+
+    // Outbox: one deck create + two card creates.
+    const entries = await db.outbox.toArray();
+    const deckCreates = entries.filter((e) => e.entity === "decks");
+    const cardCreates = entries.filter((e) => e.entity === "cards");
+    expect(deckCreates).toHaveLength(1);
+    expect(cardCreates).toHaveLength(2);
   });
 });

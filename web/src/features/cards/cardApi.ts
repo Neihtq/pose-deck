@@ -1,17 +1,23 @@
 /**
- * Data-access primitives for `cards`.
+ * Data-access primitives for `cards` (M3 local-first).
  *
- * Thin async wrappers around `collections.cards()`. Cards live in a flat,
- * ordered list within a deck; ordering uses integer-gap `position` values
- * (1000, 2000, …) so a single card can usually be re-placed by computing a
- * midpoint without restriping the whole deck (ARCHITECTURE.md §3.3).
+ * As of M3 these are local-first: a mutation writes the optimistic row into
+ * Dexie immediately and enqueues a coalesced outbox entry (drained by the sync
+ * engine). Reads come from Dexie live queries in the pages (`liveCards`), so
+ * this module no longer exposes a `listCards` fetcher.
+ *
+ * Cards live in a flat, ordered list within a deck; ordering uses integer-gap
+ * `position` values (1000, 2000, …) (ARCHITECTURE.md §3.3).
  *
  * Conventions (see web CLAUDE.md):
- *  - Every mutation stamps `client_updated_at` with the current ISO time.
- *  - Soft delete = set `deleted_at`; never hard-delete from the UI.
- *  - List queries exclude soft-deleted cards.
+ *  - Creates mint a client-supplied PB-shaped id (`newClientId`).
+ *  - Every mutation stamps `client_updated_at` with the current ISO time (LWW).
+ *  - Soft delete = set `deleted_at`; never hard-delete.
  */
-import { collections, pb } from "@/lib/pocketbase";
+import { db } from "@/lib/db";
+import { newClientId } from "@/lib/ids";
+import { enqueueCoalesced } from "@/lib/outbox";
+import { wakeSync } from "@/sync";
 import type { Card, ISODateString } from "@/lib/types";
 
 /** Integer gap between adjacent card positions. */
@@ -29,14 +35,6 @@ export interface CardFields {
   subjects?: string;
   direction?: string;
   notes?: string;
-}
-
-/** List a deck's non-soft-deleted cards, ordered by `position`. */
-export async function listCards(deckId: string): Promise<Card[]> {
-  return collections.cards().getFullList({
-    filter: pb.filter("deck = {:deck} && deleted_at = ''", { deck: deckId }),
-    sort: "position",
-  });
 }
 
 /**
@@ -59,16 +57,18 @@ export function nextPosition(existing: Pick<Card, "position">[]): number {
 /**
  * Create a card at the end of the deck.
  *
- * Reads the deck's current cards to compute the next integer-gap position, then
- * creates the record. Optional fields default to `""` to match PocketBase's
- * empty-string representation.
+ * Computes the next integer-gap position from the deck's live cards in Dexie
+ * (not the network), writes the optimistic row, and enqueues a `create`.
  */
 export async function createCard(
   deckId: string,
   fields: CardFields,
 ): Promise<Card> {
-  const existing = await listCards(deckId);
-  return collections.cards().create({
+  const existing = (await db.cards.where("deck").equals(deckId).toArray())
+    .filter((c) => c.deleted_at === "");
+  const stamp = nowIso();
+  const card: Card = {
+    id: newClientId(),
     deck: deckId,
     position: nextPosition(existing),
     title: fields.title,
@@ -77,8 +77,29 @@ export async function createCard(
     direction: fields.direction ?? "",
     notes: fields.notes ?? "",
     deleted_at: "",
-    client_updated_at: nowIso(),
+    client_updated_at: stamp,
+    created: stamp,
+    updated: stamp,
+  };
+  await db.cards.put(card);
+  await enqueueCoalesced(db, {
+    type: "create",
+    entity: "cards",
+    recordId: card.id,
+    payload: {
+      deck: deckId,
+      position: card.position,
+      title: card.title,
+      time_slot: card.time_slot,
+      subjects: card.subjects,
+      direction: card.direction,
+      notes: card.notes,
+      deleted_at: "",
+      client_updated_at: stamp,
+    },
   });
+  wakeSync();
+  return card;
 }
 
 /** Update editable fields on a card. Only provided keys are written. */
@@ -86,23 +107,48 @@ export async function updateCard(
   id: string,
   fields: Partial<CardFields>,
 ): Promise<Card> {
+  const stamp = nowIso();
   const patch: Partial<Card> & { client_updated_at: ISODateString } = {
-    client_updated_at: nowIso(),
+    client_updated_at: stamp,
   };
   if (fields.title !== undefined) patch.title = fields.title;
   if (fields.time_slot !== undefined) patch.time_slot = fields.time_slot;
   if (fields.subjects !== undefined) patch.subjects = fields.subjects;
   if (fields.direction !== undefined) patch.direction = fields.direction;
   if (fields.notes !== undefined) patch.notes = fields.notes;
-  return collections.cards().update(id, patch);
+
+  const existing = await db.cards.get(id);
+  const updated: Card = { ...(existing as Card), id, ...patch };
+  await db.cards.put(updated);
+  await enqueueCoalesced(db, {
+    type: "update",
+    entity: "cards",
+    recordId: id,
+    payload: patch,
+  });
+  wakeSync();
+  return updated;
 }
 
 /** Soft-delete a card. Never hard-deletes. */
 export async function softDeleteCard(id: string): Promise<Card> {
-  return collections.cards().update(id, {
-    deleted_at: nowIso(),
-    client_updated_at: nowIso(),
+  const stamp = nowIso();
+  const existing = await db.cards.get(id);
+  const updated: Card = {
+    ...(existing as Card),
+    id,
+    deleted_at: stamp,
+    client_updated_at: stamp,
+  };
+  await db.cards.put(updated);
+  await enqueueCoalesced(db, {
+    type: "update",
+    entity: "cards",
+    recordId: id,
+    payload: { deleted_at: stamp, client_updated_at: stamp },
   });
+  wakeSync();
+  return updated;
 }
 
 /**
@@ -123,17 +169,16 @@ export function computeReorderedPositions(
 /**
  * Reorder a deck's cards to match `orderedIds`.
  *
- * Restripes positions to clean integer gaps (1000, 2000, …) following the
- * given order and persists only the cards whose position actually changes.
- * Skipping no-op writes avoids bumping `client_updated_at` on untouched cards,
- * which under the last-write-wins model (ARCHITECTURE.md §4.3) could otherwise
- * clobber the ordering metadata of a concurrent edit that should have won.
+ * Restripes positions to clean integer gaps following the given order and
+ * enqueues ONE coalesced `update` per card that actually moved (per invariant
+ * #8: one entry per moved card). Skipping no-op writes avoids bumping
+ * `client_updated_at` on untouched cards, which under last-write-wins
+ * (ARCHITECTURE.md §4.3) could clobber a concurrent edit. Each moved card is
+ * written optimistically to Dexie too, so the live card list reflects the new
+ * order immediately.
  *
  * `currentPositions` maps each card id to its position before the reorder so
- * unmoved cards can be skipped. Ids absent from the map are always written
- * (treated as having an unknown/changed position). `deckId` is accepted for a
- * future scoping/validation hook and to keep the call site self-documenting;
- * the ordering itself is fully described by `orderedIds`.
+ * unmoved cards can be skipped. Ids absent from the map are always written.
  */
 export async function reorderCards(
   _deckId: string,
@@ -153,9 +198,16 @@ export async function reorderCards(
     if (positionOf(id) === position) {
       continue;
     }
-    await collections.cards().update(id, {
-      position,
-      client_updated_at: stamp,
+    const existing = await db.cards.get(id);
+    if (existing) {
+      await db.cards.put({ ...existing, position, client_updated_at: stamp });
+    }
+    await enqueueCoalesced(db, {
+      type: "update",
+      entity: "cards",
+      recordId: id,
+      payload: { position, client_updated_at: stamp },
     });
   }
+  wakeSync();
 }

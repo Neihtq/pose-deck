@@ -21,6 +21,7 @@ import {
   isAuthenticated,
   pb,
 } from "@/lib/pocketbase";
+import { startSync, stopSync } from "@/sync";
 import type { User } from "@/lib/types";
 
 /** Value exposed by {@link useAuth}. */
@@ -61,17 +62,41 @@ export function AuthProvider({
 
   React.useEffect(() => {
     // Sync once on mount in case the store changed before this effect ran.
-    setState(readAuthState());
+    const initial = readAuthState();
+    setState(initial);
     setLoading(false);
+
+    // Drive the sync runtime off auth transitions. We start the engine +
+    // realtime + hydrate when we become authenticated and stop + wipe the
+    // local store when we sign out, gating on the *edge* (was→now) so a token
+    // refresh (still authenticated) doesn't restart sync. Sign-out's purge is
+    // intentionally async here (fire-and-forget) so `clearAuthOnUnauthorized`
+    // and `signOut` stay synchronous — the purge is triggered via this
+    // onChange, not inline in those callers.
+    let wasAuthed = initial.isAuthenticated;
+    if (wasAuthed) {
+      void startSync();
+    }
 
     // Keep React state in lock-step with the PocketBase auth store. The
     // callback fires on sign-in, sign-out, token refresh, and cross-tab
     // localStorage changes. `onChange` returns an unsubscribe function.
     const unsubscribe = pb.authStore.onChange(() => {
-      setState(readAuthState());
+      const next = readAuthState();
+      setState(next);
+      if (next.isAuthenticated && !wasAuthed) {
+        void startSync();
+      } else if (!next.isAuthenticated && wasAuthed) {
+        void stopSync();
+      }
+      wasAuthed = next.isAuthenticated;
     });
 
-    return unsubscribe;
+    return () => {
+      unsubscribe();
+      // Tearing down the provider (e.g. unmount) stops sync defensively.
+      void stopSync();
+    };
   }, []);
 
   const signIn = React.useCallback(

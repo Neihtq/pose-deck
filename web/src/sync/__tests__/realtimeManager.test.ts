@@ -14,7 +14,7 @@ function freshDb(): PoseDeckDB {
   return new PoseDeckDB(`test-${crypto.randomUUID()}`);
 }
 
-function deck(over: Partial<Deck> = {}): Deck {
+function deck(over: Partial<Deck> = {}): Deck & Record<string, unknown> {
   return {
     id: "d1",
     owner: "u1",

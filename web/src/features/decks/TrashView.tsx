@@ -14,7 +14,10 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import { toast } from "@/components/ui/use-toast";
 import { clearAuthOnUnauthorized } from "@/features/auth/AuthContext";
-import { listTrashedDecks, restoreDeck } from "@/features/decks/deckApi";
+import { restoreDeck } from "@/features/decks/deckApi";
+import { db } from "@/lib/db";
+import { liveTrashedDecks } from "@/lib/localStore";
+import { useLiveQuery } from "@/lib/useLiveQuery";
 import { cn } from "@/lib/utils";
 import type { Deck } from "@/lib/types";
 
@@ -35,35 +38,17 @@ function formatDate(value: string): string | null {
 }
 
 export default function TrashView(): React.JSX.Element {
-  const [decks, setDecks] = React.useState<Deck[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [loadError, setLoadError] = React.useState<string | null>(null);
+  // Local-first read: trashed decks come from Dexie via a live query.
+  const liveRows = useLiveQuery(() => liveTrashedDecks(db), []);
+  const decks = liveRows ?? [];
+  const loading = liveRows === undefined;
   const [restoringId, setRestoringId] = React.useState<string | null>(null);
-
-  const refresh = React.useCallback(async (): Promise<void> => {
-    try {
-      const next = await listTrashedDecks();
-      setDecks(next);
-      setLoadError(null);
-    } catch (error) {
-      if (clearAuthOnUnauthorized(error)) {
-        return;
-      }
-      setLoadError("Could not load Trash. Please try again.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refresh();
-  }, [refresh]);
 
   const handleRestore = async (deck: Deck): Promise<void> => {
     setRestoringId(deck.id);
     try {
       await restoreDeck(deck.id);
-      setDecks((prev) => prev.filter((d) => d.id !== deck.id));
+      // The live query drops the row automatically once `deleted_at` clears.
       toast({
         title: "Deck restored",
         description: `“${deck.name}” is back in your decks.`,
@@ -106,13 +91,6 @@ export default function TrashView(): React.JSX.Element {
         <p className="py-12 text-center text-sm text-muted-foreground">
           Loading Trash…
         </p>
-      ) : loadError !== null ? (
-        <div className="flex flex-col items-center gap-3 py-12">
-          <p className="text-sm text-destructive">{loadError}</p>
-          <Button variant="outline" onClick={() => void refresh()}>
-            Retry
-          </Button>
-        </div>
       ) : decks.length === 0 ? (
         <p className="py-16 text-center text-sm text-muted-foreground">
           Trash is empty.

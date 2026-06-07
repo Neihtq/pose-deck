@@ -22,6 +22,7 @@ import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { db } from "@/lib/db";
 import type { Card, CardImage, Deck } from "@/lib/types";
 
 // dnd-kit's DndContext renders the card list inertly here.
@@ -38,21 +39,16 @@ vi.mock("@dnd-kit/core", async () => {
 });
 
 // --- Mock the data-access + auth modules -----------------------------------
-const getDeck = vi.fn();
-const listCards = vi.fn();
-const reorderCards = vi.fn();
-const createCard = vi.fn();
-const listCardImages = vi.fn();
+// The deck/cards/images are read from Dexie via live queries; only the URL
+// resolver is mocked so we can drive the token-expiry refresh.
 const imageDisplayUrl = vi.fn();
 
 vi.mock("@/features/cards/cardApi", () => ({
-  listCards: (...args: unknown[]) => listCards(...args),
-  reorderCards: (...args: unknown[]) => reorderCards(...args),
-  createCard: (...args: unknown[]) => createCard(...args),
+  reorderCards: vi.fn(),
+  createCard: vi.fn(),
 }));
 
 vi.mock("@/features/decks/deckApi", () => ({
-  getDeck: (...args: unknown[]) => getDeck(...args),
   duplicateDeck: vi.fn(),
   renameDeck: vi.fn(),
   softDeleteDeck: vi.fn(),
@@ -60,7 +56,6 @@ vi.mock("@/features/decks/deckApi", () => ({
 
 vi.mock("@/features/images/imageApi", () => ({
   imageDisplayUrl: (...args: unknown[]) => imageDisplayUrl(...args),
-  listCardImages: (...args: unknown[]) => listCardImages(...args),
 }));
 
 vi.mock("@/features/auth/AuthContext", () => ({
@@ -117,16 +112,12 @@ function renderPage() {
   );
 }
 
-beforeEach(() => {
-  getDeck.mockReset();
-  getDeck.mockResolvedValue(DECK);
-  listCards.mockReset();
-  listCards.mockResolvedValue([CARD]);
-  reorderCards.mockReset();
-  createCard.mockReset();
-  listCardImages.mockReset();
-  listCardImages.mockResolvedValue([IMAGE]);
+beforeEach(async () => {
   imageDisplayUrl.mockReset();
+  await Promise.all([db.decks.clear(), db.cards.clear(), db.card_images.clear()]);
+  await db.decks.put(DECK);
+  await db.cards.put(CARD);
+  await db.card_images.put(IMAGE);
 });
 
 describe("DeckDetailPage thumbnail token refresh (react-2)", () => {

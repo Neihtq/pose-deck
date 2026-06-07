@@ -3,38 +3,29 @@
  * auto-thumbnail — the first image of the first (lowest-position) card
  * (DESIGN.md §3.3 "Auto-thumbnail (derived): First image of first card").
  *
- * Before the fix `DeckCard` rendered only the name + shoot date and
- * `DeckListPage` never joined cards/images, so no thumbnail (and no
- * placeholder) ever appeared. These tests assert the full join
- * (listCards → listCardImages → imageDisplayUrl) reaches an `<img>` tag, and
- * that decks without an image fall back to a placeholder.
+ * As of M3 the join is local-first: `DeckListPage` reads cards/images from
+ * Dexie (`liveCards` → `liveCardImages`) and resolves the display URL via
+ * `imageDisplayUrl`. These tests seed the real (fake-indexeddb) `db` and assert
+ * the resolved URL reaches an `<img>` tag, and that a deck with no image falls
+ * back to a placeholder.
  */
 import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { db } from "@/lib/db";
 import type { Card, CardImage, Deck } from "@/lib/types";
 
-// --- Mock the data-access + auth modules -----------------------------------
-const listDecks = vi.fn();
-const listCards = vi.fn();
-const listCardImages = vi.fn();
 const imageDisplayUrl = vi.fn();
 
 vi.mock("@/features/decks/deckApi", () => ({
-  listDecks: (...args: unknown[]) => listDecks(...args),
   createDeck: vi.fn(),
   duplicateDeck: vi.fn(),
   renameDeck: vi.fn(),
   softDeleteDeck: vi.fn(),
 }));
 
-vi.mock("@/features/cards/cardApi", () => ({
-  listCards: (...args: unknown[]) => listCards(...args),
-}));
-
 vi.mock("@/features/images/imageApi", () => ({
-  listCardImages: (...args: unknown[]) => listCardImages(...args),
   imageDisplayUrl: (...args: unknown[]) => imageDisplayUrl(...args),
 }));
 
@@ -93,27 +84,24 @@ function renderPage() {
   );
 }
 
-beforeEach(() => {
-  listDecks.mockReset();
-  listCards.mockReset();
-  listCardImages.mockReset();
+beforeEach(async () => {
   imageDisplayUrl.mockReset();
+  await Promise.all([db.decks.clear(), db.cards.clear(), db.card_images.clear()]);
 });
 
 describe("deck-list auto-thumbnail (DESIGN.md §3.3)", () => {
   it("renders the first image of the first card as the deck tile thumbnail", async () => {
-    listDecks.mockResolvedValue([makeDeck("d1", "Smith Wedding")]);
+    await db.decks.put(makeDeck("d1", "Smith Wedding"));
     // Two cards out of order; the lowest-position card (c-first) is the deck's
     // first card, and its lowest-position image is the auto-thumbnail.
-    listCards.mockResolvedValue([
+    await db.cards.bulkPut([
       makeCard("c-first", "d1", 1000),
       makeCard("c-second", "d1", 2000),
     ]);
-    listCardImages.mockImplementation(async (cardId: string) =>
-      cardId === "c-first"
-        ? [makeImage("img-a", "c-first", 1000), makeImage("img-b", "c-first", 2000)]
-        : [],
-    );
+    await db.card_images.bulkPut([
+      makeImage("img-a", "c-first", 1000),
+      makeImage("img-b", "c-first", 2000),
+    ]);
     imageDisplayUrl.mockResolvedValue("https://cdn.test/thumb-a.jpg");
 
     const { container } = renderPage();
@@ -127,15 +115,15 @@ describe("deck-list auto-thumbnail (DESIGN.md §3.3)", () => {
     });
     expect(img.getAttribute("src")).toBe("https://cdn.test/thumb-a.jpg");
 
-    // Resolved the thumbnail from the FIRST card's first image, not the second.
-    expect(listCardImages).toHaveBeenCalledWith("c-first");
-    expect(listCardImages).not.toHaveBeenCalledWith("c-second");
+    // Resolved the thumbnail from the FIRST card's first image (img-a).
+    expect(imageDisplayUrl).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "img-a" }),
+      expect.anything(),
+    );
   });
 
   it("falls back to a placeholder when the deck has no card image", async () => {
-    listDecks.mockResolvedValue([makeDeck("d2", "Empty Deck")]);
-    listCards.mockResolvedValue([]);
-    listCardImages.mockResolvedValue([]);
+    await db.decks.put(makeDeck("d2", "Empty Deck"));
     imageDisplayUrl.mockResolvedValue("should-not-be-used");
 
     const { container } = renderPage();

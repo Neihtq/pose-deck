@@ -5,8 +5,10 @@
  * filters by a name search. A "New deck" dialog creates a deck and navigates
  * into it. Each deck tile (DeckCard) exposes rename / duplicate / delete.
  *
- * For M1 mutations call deckApi directly; the list is refetched after each
- * mutation to keep grouping/sorting consistent with the server.
+ * As of M3 the deck list is local-first: decks are read from Dexie via a live
+ * query (`liveDecks`), so realtime/sync writes propagate to the UI without
+ * manual refetching. Mutations (create/rename/duplicate/delete) write Dexie +
+ * enqueue an outbox entry and the live query re-renders automatically.
  */
 import * as React from "react";
 
@@ -30,15 +32,16 @@ import { clearAuthOnUnauthorized } from "@/features/auth/AuthContext";
 import {
   createDeck,
   duplicateDeck,
-  listDecks,
   renameDeck,
   softDeleteDeck,
 } from "@/features/decks/deckApi";
 import { DeckCard } from "@/features/decks/DeckCard";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { groupDecks, searchDecks } from "@/features/decks/deckGrouping";
-import { listCards } from "@/features/cards/cardApi";
-import { imageDisplayUrl, listCardImages } from "@/features/images/imageApi";
+import { imageDisplayUrl } from "@/features/images/imageApi";
+import { db } from "@/lib/db";
+import { liveCardImages, liveCards, liveDecks } from "@/lib/localStore";
+import { useLiveQuery } from "@/lib/useLiveQuery";
 import { cn } from "@/lib/utils";
 import type { Deck } from "@/lib/types";
 
@@ -130,12 +133,12 @@ function DeckSection({
  */
 async function resolveDeckThumbnail(deckId: string): Promise<string | null> {
   try {
-    const cards = await listCards(deckId);
+    const cards = await liveCards(db, deckId);
     const firstCard = cards[0];
     if (!firstCard) {
       return null;
     }
-    const images = await listCardImages(firstCard.id);
+    const images = await liveCardImages(db, firstCard.id);
     const firstImage = images[0];
     if (!firstImage) {
       return null;
@@ -149,12 +152,15 @@ async function resolveDeckThumbnail(deckId: string): Promise<string | null> {
 export default function DeckListPage(): React.JSX.Element {
   const navigate = useNavigate();
 
-  const [decks, setDecks] = React.useState<Deck[]>([]);
+  // Local-first read: the deck list comes from Dexie via a live query, so sync
+  // / realtime writes re-render the UI automatically. `undefined` = loading.
+  const liveDeckRows = useLiveQuery(() => liveDecks(db), []);
+  const decks = React.useMemo<Deck[]>(() => liveDeckRows ?? [], [liveDeckRows]);
+  const loading = liveDeckRows === undefined;
+
   const [thumbnails, setThumbnails] = React.useState<
     Record<string, string | null>
   >({});
-  const [loading, setLoading] = React.useState(true);
-  const [loadError, setLoadError] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState("");
 
   // Create-deck dialog state.
@@ -173,25 +179,6 @@ export default function DeckListPage(): React.JSX.Element {
   // re-fire a non-idempotent mutation (e.g. Duplicate) on the same deck while
   // it is still rendered. Mirrors TrashView's `restoringId` guard.
   const [pendingDeckId, setPendingDeckId] = React.useState<string | null>(null);
-
-  const refresh = React.useCallback(async (): Promise<void> => {
-    try {
-      const next = await listDecks();
-      setDecks(next);
-      setLoadError(null);
-    } catch (error) {
-      if (clearAuthOnUnauthorized(error)) {
-        return;
-      }
-      setLoadError("Could not load your decks. Please try again.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    void refresh();
-  }, [refresh]);
 
   // Best-effort: resolve each deck's auto-thumbnail (first image of first card,
   // DESIGN.md §3.3) once the decks load. Isolated per deck and cancellable so a
@@ -218,6 +205,9 @@ export default function DeckListPage(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
+    // Re-resolve when the set of decks (or their identity) changes. The live
+    // query hands back a fresh array on any deck row change, which is the right
+    // trigger for picking up a newly-synced first-card image.
   }, [decks]);
 
   const grouped = React.useMemo(() => {
@@ -283,7 +273,6 @@ export default function DeckListPage(): React.JSX.Element {
     try {
       await renameDeck(renameTarget.id, name);
       setRenameTarget(null);
-      await refresh();
     } catch (error) {
       if (!clearAuthOnUnauthorized(error)) {
         toast({
@@ -307,7 +296,6 @@ export default function DeckListPage(): React.JSX.Element {
       setPendingDeckId(deck.id);
       try {
         const copy = await duplicateDeck(deck.id);
-        await refresh();
         toast({
           title: "Deck duplicated",
           description: `Created “${copy.name}”.`,
@@ -324,7 +312,7 @@ export default function DeckListPage(): React.JSX.Element {
         setPendingDeckId(null);
       }
     },
-    [pendingDeckId, refresh],
+    [pendingDeckId],
   );
 
   const handleDelete = React.useCallback(
@@ -336,7 +324,6 @@ export default function DeckListPage(): React.JSX.Element {
       setPendingDeckId(deck.id);
       try {
         await softDeleteDeck(deck.id);
-        await refresh();
         toast({
           title: "Deck moved to Trash",
           description: `“${deck.name}” can be restored for 30 days.`,
@@ -353,7 +340,7 @@ export default function DeckListPage(): React.JSX.Element {
         setPendingDeckId(null);
       }
     },
-    [pendingDeckId, refresh],
+    [pendingDeckId],
   );
 
   return (
@@ -393,13 +380,6 @@ export default function DeckListPage(): React.JSX.Element {
         <p className="py-12 text-center text-sm text-muted-foreground">
           Loading decks…
         </p>
-      ) : loadError !== null ? (
-        <div className="flex flex-col items-center gap-3 py-12">
-          <p className="text-sm text-destructive">{loadError}</p>
-          <Button variant="outline" onClick={() => void refresh()}>
-            Retry
-          </Button>
-        </div>
       ) : decks.length === 0 ? (
         <div className="flex flex-col items-center gap-3 py-16 text-center">
           <p className="text-sm text-muted-foreground">

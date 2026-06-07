@@ -9,12 +9,20 @@
 	  lacks — Keychain SecItem calls then fail with errSecMissingEntitlement
 	  (-34018). Declaring a group lets the app reach the Keychain when ad-hoc
 	  signed for the simulator (UI tests) and is harmless on a provisioned
-	  device. The group name is the bundle id; on device the team prefix is
-	  added automatically by codesign.
+	  device.
+
+	  Use Apple's standard variable form, NOT a hardcoded string:
+	  `$(AppIdentifierPrefix)$(CFBundleIdentifier)` expands to the team-prefixed,
+	  bundle-id-matching group that the automatic provisioning profile expects on
+	  a real device. A hardcoded literal (e.g. `dev.posedeck.app`) breaks
+	  automatic signing the moment the bundle id is customized (e.g. made unique
+	  for a free Personal Team) — the profile's keychain group no longer matches
+	  the entitlement. On the simulator AppIdentifierPrefix resolves to empty, so
+	  the group is just the bundle id and ad-hoc Keychain access still works.
 	-->
 	<key>keychain-access-groups</key>
 	<array>
-		<string>dev.posedeck.app</string>
+		<string>$(AppIdentifierPrefix)$(CFBundleIdentifier)</string>
 	</array>
 </dict>
 </plist>

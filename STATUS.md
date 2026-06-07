@@ -14,8 +14,11 @@
 | **M4** — iOS shoot mode | ✅ **DONE + gauntlet + sim-verified** (15/15 XCUITests; app raised to Swift 6 lang mode) |
 | **M5** — sharing (deck_guests) | ✅ **DONE + both gauntlets** — grant/revoke by email + realtime; gauntlet caught a real sharing-breaking rule bug (back-relation migration 1700000009) |
 | **M6** — PDF export (web) | ✅ **DONE** (@react-pdf/renderer; built early in parallel w/ M4) |
-| **M7** — SideStore distribution | ⬜ next (mostly 👤 device/CI; agent scaffolds CI + apps.json) |
-| **M8** — polish + dry run | ⬜ pending (a11y/error states agent-doable; e2e dry run 👤) |
+| **M7** — SideStore distribution | ✅ CI archive job + apps.json + exportOptions + SIDESTORE.md authored; **on-device install = 👤** (docs/HANDOFF.md) |
+| **M8** — polish + dry run | ✅ web a11y + error states done (334 tests); **end-to-end device dry run = 👤** (docs/HANDOFF.md) |
+
+**All agent-buildable work for M0–M8 is complete and verified.** Remaining work
+is device-only / deploy / sign-off — see `docs/HANDOFF.md`.
 
 Working tree clean, all on `main`, nothing pushed (push only when asked).
 Latest commit: `4b77882 M3 iOS: fix SwiftData @Model crash + verify on sim`.

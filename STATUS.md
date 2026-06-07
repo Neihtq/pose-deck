@@ -10,7 +10,7 @@
 | **M0** — backend foundation | ✅ done (PocketBase, 6 collections, migrations, seed, compose) |
 | **M1** — web prep MVP | ✅ done + gauntlet passed (auth, deck/card CRUD, images, dnd reorder, dark mode, inline card delete) |
 | **M2** — iOS prep MVP | ✅ **DONE + simulator-verified** — 14 XCUITests green on iPhone 16 Pro against live PocketBase |
-| **M3** — sync layer (outbox + realtime + offline) | ⬜ next |
+| **M3** — sync layer (outbox + realtime + offline) | 🟡 in progress — web sync DONE + gauntlet PASSED (242 tests, 4 layers, 9 adversarial fixes); iOS core DONE (225 tests); iOS app wiring (step 10) + iOS gauntlet next |
 | M4 shoot mode (iOS) · M5 sharing · M6 PDF · M7 SideStore · M8 polish | ⬜ pending |
 
 Working tree clean, all on `main`, nothing pushed (push only when asked).

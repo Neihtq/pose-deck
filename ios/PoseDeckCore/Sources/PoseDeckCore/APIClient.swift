@@ -50,7 +50,10 @@ public struct ListResponse<T: Codable & Sendable>: Codable, Sendable {
 /// `Sendable` and safe to share across tasks.
 public actor APIClient {
     /// Base URL of the PocketBase instance, e.g. `http://localhost:8090`.
-    public let baseURL: URL
+    ///
+    /// `nonisolated` because it is an immutable value set at init; the app's
+    /// realtime wiring reads it synchronously to build its own SSE transport.
+    public nonisolated let baseURL: URL
     private let session: URLSession
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -85,6 +88,11 @@ public actor APIClient {
     public func setAuthToken(_ token: String?) {
         self.authToken = token
     }
+
+    /// The current bearer token, if any. Exposed so the app's realtime wiring
+    /// (which opens its own SSE transport) can authenticate with the same token
+    /// the REST client holds, without the app duplicating session state.
+    public func currentAuthToken() -> String? { authToken }
 
     // MARK: - Auth
 

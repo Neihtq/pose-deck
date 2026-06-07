@@ -48,6 +48,16 @@ targets:
         # Pulled from Config.xcconfig (API_BASE_URL) and read at runtime via
         # Bundle.main.object(forInfoDictionaryKey:).
         APIBaseURL: $(API_BASE_URL)
+        # Background pre-cache (M3 sync): fetch wakes for the periodic refresh,
+        # processing for the longer pre-cache work. The permitted-identifiers
+        # list MUST contain the single shared BackgroundRefresh.taskIdentifier
+        # ("dev.posedeck.app.precache") or BGTaskScheduler.register traps —
+        # there's a DEBUG assertion in BackgroundRefresh enforcing this.
+        UIBackgroundModes:
+          - fetch
+          - processing
+        BGTaskSchedulerPermittedIdentifiers:
+          - dev.posedeck.app.precache
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.posedeck.app

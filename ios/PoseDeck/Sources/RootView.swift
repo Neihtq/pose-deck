@@ -3,27 +3,35 @@ import PoseDeckCore
 
 /// Composition root + auth gate for the app.
 ///
-/// Owns the single shared ``APIClient`` and ``AuthService`` and decides which
-/// top-level screen to show based on the observable session state:
+/// Owns the shared ``APIClient``, ``AuthService``, and ``SyncCoordinator`` and
+/// decides which top-level screen to show based on the observable session state:
 ///  - signed out → ``LoginView``
 ///  - signed in  → the deck list (``DeckListView``, which hosts its own
 ///    `NavigationStack`), with deck-detail and card-editor destinations wired
 ///    through factory closures, plus Trash (mounted inside ``DeckListView``) and
 ///    a Sign Out affordance.
 ///
-/// Repositories are constructed here from the shared client and the authenticated
-/// user id so every screen mutates through the same backend with the correct
-/// `owner` stamping.
+/// Repositories are now **mirror-backed** (offline-first): every screen reads
+/// from the SwiftData mirror and writes optimistically through the outbox, built
+/// from the ``SyncCoordinator`` rather than the raw API client. The coordinator
+/// is driven through the auth/scene lifecycle so the mirror backfills, realtime
+/// connects, and the outbox drains for the signed-in session.
 struct RootView: View {
     private let apiClient: APIClient
     @State private var auth: AuthService
+    @State private var sync: SyncCoordinator
+    @Environment(\.scenePhase) private var scenePhase
     /// Tracks whether the launch-time session restore has completed so we don't
     /// flash the login screen before the keychain is consulted.
     @State private var didAttemptRestore = false
+    /// Tracks whether the sync lifecycle has started for the current session, so
+    /// we start it exactly once per sign-in.
+    @State private var didStartSync = false
 
-    init(apiClient: APIClient, authService: AuthService) {
+    init(apiClient: APIClient, authService: AuthService, sync: SyncCoordinator) {
         self.apiClient = apiClient
         self._auth = State(initialValue: authService)
+        self._sync = State(initialValue: sync)
     }
 
     var body: some View {
@@ -44,12 +52,28 @@ struct RootView: View {
                 didAttemptRestore = true
             }
         }
+        // Drive the sync lifecycle off the observable auth state: start on the
+        // first authenticated render, tear down (await quiesce + purge) on signout.
+        .task(id: auth.isAuthenticated) {
+            if auth.isAuthenticated, let ownerId = auth.currentUserId, !didStartSync {
+                didStartSync = true
+                // Token is read from the API client inside the coordinator (the
+                // auth service already applied it on sign-in / restore).
+                await sync.onAuthenticated(token: nil, ownerId: ownerId)
+            } else if !auth.isAuthenticated, didStartSync {
+                didStartSync = false
+                await sync.onSignedOut()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            sync.onScenePhase(phase)
+        }
     }
 
     // MARK: - Authenticated content
 
     private func deckList(ownerId: String) -> some View {
-        let deckRepo = DeckRepository(client: apiClient)
+        let deckRepo = sync.makeDeckRepository()
         let model = DeckListViewModel(repo: deckRepo, ownerId: ownerId)
         return DeckListView(
             model: model,
@@ -63,9 +87,9 @@ struct RootView: View {
     }
 
     private func makeDetail(deck: Deck, ownerId: String) -> DeckDetailView {
-        let deckRepo = DeckRepository(client: apiClient)
-        let cardRepo = CardRepository(client: apiClient)
-        let imageRepo = ImageRepository(client: apiClient)
+        let deckRepo = sync.makeDeckRepository()
+        let cardRepo = sync.makeCardRepository()
+        let imageRepo = sync.makeImageRepository()
         let detailModel = DeckDetailViewModel(
             deck: deck,
             deckRepo: deckRepo,
@@ -73,7 +97,6 @@ struct RootView: View {
             imageRepo: imageRepo,
             ownerId: ownerId
         )
-        let client = apiClient
         return DeckDetailView(
             model: detailModel,
             cardEditorFactory: { card in
@@ -82,7 +105,7 @@ struct RootView: View {
                         deckId: deck.id,
                         cardId: card?.id,
                         cardRepo: cardRepo,
-                        apiClient: client
+                        imageRepo: imageRepo
                     )
                 )
             }
@@ -93,13 +116,16 @@ struct RootView: View {
 /// Bridges the injected ``CardEditorView`` (which signals completion via an
 /// `onClose` closure) onto the deck-detail `NavigationStack`: it captures the
 /// environment `dismiss` so an edit-mode save or a delete pops back to the deck.
+///
+/// Both the card repository and the image repository are the mirror-backed
+/// (offline-first) implementations injected from the ``SyncCoordinator``.
 private struct CardEditorHost: View {
     @Environment(\.dismiss) private var dismiss
 
     let deckId: String
     let cardId: String?
-    let cardRepo: CardRepository
-    let apiClient: APIClient
+    let cardRepo: any CardRepositoring
+    let imageRepo: MirrorImageRepository
 
     var body: some View {
         CardEditorView(
@@ -111,7 +137,7 @@ private struct CardEditorHost: View {
             makeImagesModel: { resolvedCardId in
                 CardImagesViewModel(
                     cardId: resolvedCardId,
-                    repository: ImageRepository(client: apiClient)
+                    repository: imageRepo
                 )
             },
             onClose: { dismiss() }

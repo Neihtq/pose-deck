@@ -18,7 +18,7 @@ final class CardEditorViewModel {
     /// Set once the card exists (edit mode, or after first save in create mode).
     private(set) var cardId: String?
 
-    private let repository: CardRepository
+    private let repository: any CardRepositoring
 
     // Form fields
     var title = ""
@@ -40,7 +40,7 @@ final class CardEditorViewModel {
     var titleTooLong: Bool { title.count > Self.titleMax }
     var canSave: Bool { !titleTrimmed.isEmpty && !titleTooLong && !isSaving }
 
-    init(deckId: String, cardId: String? = nil, repository: CardRepository) {
+    init(deckId: String, cardId: String? = nil, repository: any CardRepositoring) {
         self.deckId = deckId
         self.cardId = cardId
         self.repository = repository

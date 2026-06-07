@@ -12,8 +12,8 @@
  * The header shows the deck name with inline rename, a back link to the deck
  * list ("/"), and a duplicate / delete menu. Each card row shows its
  * title / time slot / subjects / direction plus a thumbnail (the first card
- * image, via `images.imageDisplayUrl`). "Add card" creates a card and opens
- * the card editor; clicking a row opens the editor for that card.
+ * image, via `<OfflineImage>` so a pinned deck renders offline). "Add card"
+ * creates a card and opens the card editor; clicking a row opens the editor.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -78,6 +78,8 @@ import {
   softDeleteCard,
 } from "@/features/cards/cardApi";
 import { duplicateDeck, renameDeck, softDeleteDeck } from "@/features/decks/deckApi";
+import { OfflineToggle } from "@/features/offline/OfflineToggle";
+import { OfflineImage } from "@/features/offline/OfflineImage";
 import { imageDisplayUrl } from "@/features/images/imageApi";
 import { db } from "@/lib/db";
 import { liveCardImages, liveCards, liveDeck } from "@/lib/localStore";
@@ -95,15 +97,12 @@ const restrictToVerticalAxis: Modifier = ({ transform }) => ({
 });
 
 /**
- * Per-card thumbnail state keyed by card id: the resolved (token-carrying)
- * display URL plus the source {@link CardImage} so an expired-token `<img>`
- * `onError` can re-mint a fresh URL (see {@link handleThumbnailError}).
+ * Per-card thumbnail state keyed by card id: the FIRST card image record (or
+ * `null` when the card has no images). The actual source resolution — pinned
+ * blob vs. token URL, plus expired-token retry — is owned by `<OfflineImage>`,
+ * so this map only needs to identify which image to show.
  */
-interface Thumbnail {
-  url: string;
-  image: CardImage;
-}
-type ThumbnailMap = Record<string, Thumbnail | null>;
+type ThumbnailMap = Record<string, CardImage | null>;
 
 export default function DeckDetailPage(): React.JSX.Element {
   const { id } = useParams<{ id: string }>();
@@ -158,21 +157,18 @@ export default function DeckDetailPage(): React.JSX.Element {
     }),
   );
 
-  // Best-effort: resolve each card's first-image thumbnail from Dexie. Re-runs
+  // Best-effort: pick each card's first-image record from Dexie. Re-runs
   // whenever the live card list changes (e.g. a card or its image syncs in).
+  // `<OfflineImage>` owns the actual source resolution (pinned blob vs. token
+  // URL) and the expired-token retry, so we only need the image record here.
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       const thumbEntries = await Promise.all(
-        cards.map(async (card): Promise<[string, Thumbnail | null]> => {
+        cards.map(async (card): Promise<[string, CardImage | null]> => {
           try {
             const imgs: CardImage[] = await liveCardImages(db, card.id);
-            const first = imgs[0];
-            if (!first) {
-              return [card.id, null];
-            }
-            const url = await imageDisplayUrl(first, { thumb: "200x200" });
-            return [card.id, { url, image: first }];
+            return [card.id, imgs[0] ?? null];
           } catch {
             return [card.id, null];
           }
@@ -186,32 +182,6 @@ export default function DeckDetailPage(): React.JSX.Element {
       cancelled = true;
     };
   }, [cards]);
-
-  // Re-mint a thumbnail's display URL when its <img> fails to load. The load
-  // effect resolves each URL once (deps `[id]`) with a short-lived `?token=`
-  // (FILE_TOKEN_TTL_MS in pocketbase.ts), so on a long-lived deck-detail view a
-  // browser re-fetch after the token expires (lazy reveal, cache eviction,
-  // reconnect) 4xxs and the thumbnail breaks. Re-resolving gets a fresh token.
-  // Mirrors CardEditor's handleImageError (react-1): we only update state when
-  // the refreshed URL actually differs, so a genuine 404 (unchanged URL) does
-  // not spin in an error → re-render → error loop.
-  const handleThumbnailError = React.useCallback(
-    async (cardId: string, image: CardImage) => {
-      try {
-        const fresh = await imageDisplayUrl(image, { thumb: "200x200" });
-        setThumbnails((prev) => {
-          const current = prev[cardId];
-          if (!current || current.url === fresh) {
-            return prev;
-          }
-          return { ...prev, [cardId]: { url: fresh, image } };
-        });
-      } catch {
-        // Leave the broken thumbnail as-is; nothing more we can do here.
-      }
-    },
-    [],
-  );
 
   const handleDragEnd = React.useCallback(
     (event: DragEndEvent) => {
@@ -426,6 +396,7 @@ export default function DeckDetailPage(): React.JSX.Element {
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          <OfflineToggle deckId={deck.id} />
           <Button onClick={handleAddCard} disabled={creating}>
             {creating ? "Adding…" : "Add card"}
           </Button>
@@ -476,7 +447,6 @@ export default function DeckDetailPage(): React.JSX.Element {
                   key={card.id}
                   card={card}
                   thumbnail={thumbnails[card.id] ?? null}
-                  onThumbnailError={handleThumbnailError}
                   onOpen={openCard}
                   onDelete={setCardToDelete}
                   dragDisabled={reordering}
@@ -592,9 +562,8 @@ export default function DeckDetailPage(): React.JSX.Element {
 /** Props for a single sortable card row. */
 interface SortableCardRowProps {
   card: CardRecord;
-  thumbnail: Thumbnail | null;
-  /** Re-mints the thumbnail URL when its <img> fails to load (expired token). */
-  onThumbnailError: (cardId: string, image: CardImage) => void;
+  /** The card's first image record, or null when it has none. */
+  thumbnail: CardImage | null;
   onOpen: (cardId: string) => void;
   /** Request inline deletion of this card (opens a confirmation). */
   onDelete: (card: CardRecord) => void;
@@ -609,7 +578,6 @@ interface SortableCardRowProps {
 function SortableCardRow({
   card,
   thumbnail,
-  onThumbnailError,
   onOpen,
   onDelete,
   dragDisabled = false,
@@ -658,12 +626,15 @@ function SortableCardRow({
         className="flex min-w-0 flex-1 items-center gap-3 text-left"
       >
         {thumbnail ? (
-          <img
-            src={thumbnail.url}
-            alt=""
+          <OfflineImage
+            image={thumbnail}
+            thumb="200x200"
+            networkUrl={imageDisplayUrl}
             className="h-12 w-12 shrink-0 rounded-md object-cover"
             loading="lazy"
-            onError={() => onThumbnailError(card.id, thumbnail.image)}
+            fallback={
+              <div className="h-12 w-12 shrink-0 animate-pulse rounded-md bg-muted" />
+            }
           />
         ) : (
           <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-md bg-muted text-xs text-muted-foreground">

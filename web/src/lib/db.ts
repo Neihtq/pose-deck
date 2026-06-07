@@ -77,6 +77,36 @@ export interface SyncMeta {
   value: string;
 }
 
+/**
+ * Cached image BYTES for offline "Download for offline" (M3 STEP 6).
+ *
+ * Keyed by a TOKEN-STRIPPED, thumb-preserving key (`offlineKeys.blobKey`):
+ * `${collectionName}/${recordId}/${filename}` plus an optional `@thumb=…` suffix.
+ * The volatile `?token=` is deliberately NOT part of the key (invariant #5) so a
+ * refreshed token never thrashes the cache. `card` is indexed so a deck/card's
+ * blobs can be bulk-removed on unpin without scanning the whole table.
+ */
+export interface ImageBlob {
+  /** Stable cache key (token-stripped, thumb-preserving). */
+  key: string;
+  /** Parent card id, for bulk eviction on unpin / reconcile. */
+  card: string;
+  /** Source `card_images` record id, for orphan reconciliation. */
+  recordId: string;
+  /** The cached image bytes. */
+  blob: Blob;
+  /** When the bytes were cached (ms epoch), for diagnostics / future LRU. */
+  cachedAt: number;
+}
+
+/** A deck the user has explicitly pinned for offline use (M3 STEP 6). */
+export interface PinnedDeck {
+  /** The pinned deck's id. */
+  deckId: string;
+  /** When the pin was created (ms epoch). */
+  pinnedAt: number;
+}
+
 /** The app's Dexie database with typed tables. */
 export class PoseDeckDB extends Dexie {
   decks!: EntityTable<Deck, "id">;
@@ -86,6 +116,8 @@ export class PoseDeckDB extends Dexie {
   deck_guests!: EntityTable<DeckGuest, "id">;
   outbox!: EntityTable<OutboxEntry, "id">;
   _meta!: EntityTable<SyncMeta, "key">;
+  image_blobs!: EntityTable<ImageBlob, "key">;
+  pinned_decks!: EntityTable<PinnedDeck, "deckId">;
 
   constructor(name = "pose-deck") {
     super(name);
@@ -107,6 +139,19 @@ export class PoseDeckDB extends Dexie {
       deck_guests: "id, deck, user, granted_at",
       outbox: "++id, status, next_attempt_at, entity, recordId, idempotency_key",
       _meta: "key",
+    });
+    // v3 (M3 STEP 6 — offline pin): a per-deck "Download for offline" toggle
+    // caches image bytes locally so pinned decks render with no network. The
+    // service worker only precaches the static shell (NetworkOnly for all
+    // API/auth/file requests, since PB is cross-origin), so this explicit Dexie
+    // pin is the SOLE offline-image mechanism. `image_blobs` is keyed by a
+    // token-stripped key (see offlineKeys.blobKey) and indexed by `card` so a
+    // deck's blobs evict in bulk on unpin. `pinned_decks` records which decks
+    // are pinned; the pinned-image COUNT is derived from `image_blobs.count()`,
+    // never an in-memory counter.
+    this.version(3).stores({
+      image_blobs: "key, card, recordId",
+      pinned_decks: "deckId, pinnedAt",
     });
   }
 }

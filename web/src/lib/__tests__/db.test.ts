@@ -19,7 +19,9 @@ describe("PoseDeckDB schema", () => {
           "cards",
           "deck_guests",
           "decks",
+          "image_blobs",
           "outbox",
+          "pinned_decks",
         ].sort(),
       );
     } finally {
@@ -84,6 +86,32 @@ describe("PoseDeckDB schema", () => {
 
       await db._meta.put({ key: "cursor:decks", value: "2026-06-07" });
       expect((await db._meta.get("cursor:decks"))?.value).toBe("2026-06-07");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("exposes image_blobs + pinned_decks tables (v3) and round-trips them", async () => {
+    const db = new PoseDeckDB(`test-${crypto.randomUUID()}`);
+    await db.open();
+    try {
+      const bytes = new Blob(["fake"], { type: "image/jpeg" });
+      await db.image_blobs.put({
+        key: "card_images/img1/photo.jpg@thumb=200x200",
+        card: "card1",
+        recordId: "img1",
+        blob: bytes,
+        cachedAt: 123,
+      });
+      const loaded = await db.image_blobs.get(
+        "card_images/img1/photo.jpg@thumb=200x200",
+      );
+      expect(loaded?.recordId).toBe("img1");
+      // The `card` index supports bulk eviction on unpin.
+      expect(await db.image_blobs.where("card").equals("card1").count()).toBe(1);
+
+      await db.pinned_decks.put({ deckId: "deck1", pinnedAt: 456 });
+      expect((await db.pinned_decks.get("deck1"))?.pinnedAt).toBe(456);
     } finally {
       db.close();
     }

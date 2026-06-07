@@ -211,6 +211,10 @@ export async function clearLocalStore(db: PoseDeckDB): Promise<void> {
     db.deck_guests.clear(),
     db.outbox.clear(),
     db._meta.clear(),
+    // Offline-pin tables (M3 STEP 6): a different user must never inherit the
+    // prior session's cached image bytes or pin set.
+    db.image_blobs.clear(),
+    db.pinned_decks.clear(),
   ]);
 }
 

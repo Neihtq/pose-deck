@@ -58,6 +58,7 @@ import {
   imageDisplayUrl,
 } from "@/features/images/imageApi";
 import { useImageUpload } from "@/features/images/useImageUpload";
+import { OfflineImage } from "@/features/offline/OfflineImage";
 
 // Product cap for card titles: DESIGN.md §3.1 specifies "≤60 chars". The DB
 // field (ARCHITECTURE.md §3.3 / PocketBase `cards.title`) allows up to 200 as
@@ -92,8 +93,6 @@ export default function CardEditor(): JSX.Element {
 
   const [form, setForm] = useState<Required<CardFields>>(EMPTY_FORM);
   const [images, setImages] = useState<CardImage[]>([]);
-  // Resolved (token-carrying) display URLs keyed by image id; populated async.
-  const [imageUrls, setImageUrls] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState<boolean>(isEdit);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -155,48 +154,11 @@ export default function CardEditor(): JSX.Element {
     };
   }, [cardId]);
 
-  // Resolve token-carrying display URLs for the current images. `card_images`
-  // files are protected, so URLs are minted async (see imageDisplayUrl).
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const entries = await Promise.all(
-        images.map(async (image): Promise<[string, string] | null> => {
-          try {
-            return [image.id, await imageDisplayUrl(image, { thumb: "300x300" })];
-          } catch {
-            return null;
-          }
-        }),
-      );
-      if (cancelled) return;
-      setImageUrls(Object.fromEntries(entries.filter((e): e is [string, string] => e !== null)));
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [images]);
-
-  // Re-mint a display URL for a single image whose <img> failed to load. The
-  // most common cause on a long-lived editor session is an expired file token:
-  // imageDisplayUrl embeds a short-lived `?token=` (FILE_TOKEN_TTL_MS) that the
-  // resolve effect only mints once per `images` change, so a browser re-fetch
-  // after expiry (lazy reveal, cache eviction, reconnect) 4xxs. Re-resolving
-  // gets a fresh token. We guard against an infinite reload loop by only
-  // updating state when the refreshed URL actually differs from the one we are
-  // already showing (a new token changes the URL; an unchanged URL means a
-  // genuine error, e.g. a 404, so re-rendering it would just loop).
-  const handleImageError = useCallback(async (image: CardImage) => {
-    try {
-      const fresh = await imageDisplayUrl(image, { thumb: "300x300" });
-      setImageUrls((prev) => {
-        if (prev[image.id] === fresh) return prev;
-        return { ...prev, [image.id]: fresh };
-      });
-    } catch {
-      // Leave the broken image as-is; nothing more we can do here.
-    }
-  }, []);
+  // Image source resolution (pinned blob vs. token URL) + expired-token retry
+  // is owned by `<OfflineImage>` below, so the editor no longer mints/refreshes
+  // display URLs itself. `imageDisplayUrl` is passed as the network resolver so
+  // a pinned deck's editor renders offline while un-pinned images still load
+  // (and refresh) over the network.
 
   const onUploaded = useCallback((image: CardImage) => {
     setImages((prev) =>
@@ -469,17 +431,16 @@ export default function CardEditor(): JSX.Element {
                         key={image.id}
                         className="group relative aspect-square overflow-hidden rounded-md border bg-muted"
                       >
-                        {imageUrls[image.id] ? (
-                          <img
-                            src={imageUrls[image.id]}
-                            alt=""
-                            className="h-full w-full object-cover"
-                            loading="lazy"
-                            onError={() => void handleImageError(image)}
-                          />
-                        ) : (
-                          <div className="h-full w-full animate-pulse bg-muted" />
-                        )}
+                        <OfflineImage
+                          image={image}
+                          thumb="300x300"
+                          networkUrl={imageDisplayUrl}
+                          className="h-full w-full object-cover"
+                          loading="lazy"
+                          fallback={
+                            <div className="h-full w-full animate-pulse bg-muted" />
+                          }
+                        />
                         <button
                           type="button"
                           aria-label="Remove image"

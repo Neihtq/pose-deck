@@ -58,10 +58,7 @@ class PoseDeckUITestCase: XCTestCase {
         password.typeText(Self.password)
 
         app.buttons["login.submit"].tap()
-        XCTAssertTrue(
-            app.navigationBars["Decks"].waitForExistence(timeout: Self.timeout),
-            "Did not land on the deck list after sign-in"
-        )
+        XCTAssertTrue(app.navigationBars["Decks"].waitForExistence(timeout: Self.timeout), "Did not land on the deck list after sign-in")
     }
 
     /// Launch fresh, reset the session, and sign in. The common test preamble.

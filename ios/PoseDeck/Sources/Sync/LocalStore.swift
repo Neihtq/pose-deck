@@ -44,8 +44,50 @@ enum LocalMirrorStore {
             let storeURL = try mirrorStoreURL()
             try MirrorStoreProtection.protectDirectory(at: storeURL.deletingLastPathComponent())
             configuration = ModelConfiguration(schema: schema, url: storeURL)
+            return try makeOnDiskContainer(configuration: configuration, storeURL: storeURL)
         }
         return try ModelContainer(for: schema, configurations: [configuration])
+    }
+
+    /// Open the on-disk container, and if it fails to load because the persisted
+    /// store is incompatible with the current schema (a schema change shipped
+    /// without a migration plan), delete the store files and recreate from
+    /// scratch. The mirror is a disposable cache of server state — a fresh sync
+    /// rebuilds it — so trading a stale, unopenable store for an empty one is the
+    /// right call for this dev app and avoids a hard launch crash on any future
+    /// incompatible schema bump.
+    private static func makeOnDiskContainer(
+        configuration: ModelConfiguration,
+        storeURL: URL
+    ) throws -> ModelContainer {
+        do {
+            return try ModelContainer(for: schema, configurations: [configuration])
+        } catch {
+            destroyStoreFiles(at: storeURL)
+            // One clean retry. If this also fails the error is not a stale-store
+            // problem and should surface.
+            return try ModelContainer(for: schema, configurations: [configuration])
+        }
+    }
+
+    /// Remove the SQLite store and its companion / external-storage files so a
+    /// fresh container can be created.
+    private static func destroyStoreFiles(at storeURL: URL) {
+        let fm = FileManager.default
+        let dir = storeURL.deletingLastPathComponent()
+        // The store, its -wal/-shm companions, and the `.externalStorage`
+        // sidecars all live under the `Mirror` directory we own, so removing the
+        // directory's contents reclaims everything.
+        if let contents = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            for url in contents { try? fm.removeItem(at: url) }
+        } else {
+            // Fall back to removing the known store files individually.
+            let base = storeURL.lastPathComponent
+            for suffix in ["", "-wal", "-shm"] {
+                try? fm.removeItem(at: storeURL.deletingLastPathComponent()
+                    .appendingPathComponent(base + suffix))
+            }
+        }
     }
 
     /// The on-disk location of the mirror's SQLite store: a dedicated `Mirror`

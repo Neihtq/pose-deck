@@ -15,7 +15,12 @@ import PoseDeckCore
 ///    and the image `blob` / `blobETag` live only on-device. The mirror→server
 ///    write path (the outbox payloads built in PoseDeckCore) never reads them.
 ///  - The image `blob` uses `.externalStorage` so large JPEG bytes are stored as
-///    a sidecar file rather than bloating the SQLite store.
+///    a sidecar file rather than bloating the SQLite store. It is a **non-optional**
+///    `Data` (defaulting to empty) paired with an `isCached` flag: `.externalStorage`
+///    on an *optional* `Data?` makes SwiftData emit a `decodeIfPresent` that fails a
+///    dynamic cast and aborts on the NSManagedObjectContext queue when a row is
+///    materialized. `isCached` preserves the "not-yet-precached" semantics (no bytes)
+///    without the optional payload.
 ///
 /// Each model conforms to ``MirrorRow`` so the shared ``MirrorMerge`` LWW rule
 /// applies uniformly (images/guests report a `nil` clock → always-apply insert).
@@ -118,7 +123,16 @@ final class LocalCardImage: MirrorRow, BlobBearingMirrorRow {
     var created: Date?
 
     /// Local-only pre-cached JPEG bytes; stored as a sidecar file (never synced).
-    @Attribute(.externalStorage) var blob: Data?
+    ///
+    /// Non-optional `Data` defaulting to empty: `.externalStorage` on an *optional*
+    /// `Data?` makes SwiftData generate a `decodeIfPresent` that fails a dynamic
+    /// cast and aborts when a row is materialized on the NSManagedObjectContext
+    /// queue. "Not yet pre-cached" is expressed by `isCached == false` (and an
+    /// empty `blob`), never by a nil payload. Read cached bytes via `cachedBlob`.
+    @Attribute(.externalStorage) var blob: Data
+    /// Whether `blob` holds genuine pre-cached bytes (vs. the empty default).
+    /// Local-only; preserves the prior `blob != nil` semantics.
+    var isCached: Bool
     /// Local-only ETag/validator for the cached `blob`, so a stale blob can be
     /// invalidated on a re-cache. Never synced. (No `clientUpdatedAt` — images
     /// have no LWW clock per invariant #3.)
@@ -126,6 +140,11 @@ final class LocalCardImage: MirrorRow, BlobBearingMirrorRow {
 
     /// Images have no LWW clock → always-apply insert / hard-delete.
     var mirrorOrderingTimestamp: Date? { nil }
+
+    /// The cached bytes if present, else `nil` — preserves the old `blob: Data?`
+    /// read semantics for callers (the offline view layer) that treat "no cached
+    /// bytes" as a distinct state from "empty bytes".
+    var cachedBlob: Data? { isCached ? blob : nil }
 
     init(
         id: String,
@@ -141,7 +160,8 @@ final class LocalCardImage: MirrorRow, BlobBearingMirrorRow {
         self.position = position
         self.file = file
         self.created = created
-        self.blob = blob
+        self.blob = blob ?? Data()
+        self.isCached = blob != nil
         self.blobETag = blobETag
     }
 }
@@ -197,7 +217,16 @@ final class LocalOutboxEntry {
     @Attribute(.unique) var id: UUID
     /// Raw `OutboxMutationType` rawValue (`create`/`update`/`delete`).
     var typeRaw: String
-    var entity: String
+    /// The target collection name (`decks`/`cards`/`card_images`/…).
+    ///
+    /// NOTE: this property must NOT be named `entity`. `NSManagedObject` (which a
+    /// SwiftData `@Model` is bridged onto) already exposes an `entity` accessor
+    /// returning an `NSEntityDescription`; a stored `@Model` attribute named
+    /// `entity` shadows it, so when SwiftData materializes a row it reads the
+    /// `NSEntityDescription` for the `entity` key and aborts trying to
+    /// dynamic-cast it to `String` ("Could not cast value of type
+    /// 'NSEntityDescription' to 'NSString'") on the NSManagedObjectContext queue.
+    var entityName: String
     var payload: Data
     var idempotencyKey: UUID
     var localTimestamp: Date
@@ -207,7 +236,7 @@ final class LocalOutboxEntry {
     init(
         id: UUID,
         typeRaw: String,
-        entity: String,
+        entityName: String,
         payload: Data,
         idempotencyKey: UUID,
         localTimestamp: Date,
@@ -216,7 +245,7 @@ final class LocalOutboxEntry {
     ) {
         self.id = id
         self.typeRaw = typeRaw
-        self.entity = entity
+        self.entityName = entityName
         self.payload = payload
         self.idempotencyKey = idempotencyKey
         self.localTimestamp = localTimestamp
@@ -307,7 +336,8 @@ extension LocalCardImage {
     /// bulk delete so a previous user's cached image bytes don't survive as
     /// orphaned sidecars in the shared store directory (SEC-2).
     func clearCachedBlob() {
-        blob = nil
+        blob = Data()
+        isCached = false
         blobETag = nil
     }
 }

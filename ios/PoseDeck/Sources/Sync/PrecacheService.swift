@@ -142,6 +142,7 @@ actor PrecacheService {
             return
         }
         row.blob = bytes
+        row.isCached = true
     }
 
     private func stampPrecached(deckId: String, at date: Date) {

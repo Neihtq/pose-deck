@@ -45,7 +45,7 @@ actor SwiftDataOutbox: OutboxQueue {
         let row = LocalOutboxEntry(
             id: entry.id,
             typeRaw: entry.type.rawValue,
-            entity: entry.entity,
+            entityName: entry.entity,
             payload: entry.payload,
             idempotencyKey: entry.idempotencyKey,
             localTimestamp: entry.localTimestamp,
@@ -150,7 +150,7 @@ actor SwiftDataOutbox: OutboxQueue {
         return OutboxEntry(
             id: row.id,
             type: type,
-            entity: row.entity,
+            entity: row.entityName,
             payload: row.payload,
             idempotencyKey: row.idempotencyKey,
             localTimestamp: row.localTimestamp,

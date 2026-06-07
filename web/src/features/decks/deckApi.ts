@@ -19,6 +19,7 @@
  */
 import { db } from "@/lib/db";
 import { newClientId } from "@/lib/ids";
+import { markRecentlyCreated } from "@/lib/localStore";
 import { enqueueCoalesced } from "@/lib/outbox";
 import { pb } from "@/lib/pocketbase";
 import { wakeSync } from "@/sync";
@@ -47,6 +48,9 @@ function currentUserId(): string {
 
 /** Integer gap between card positions (1000, 2000, …). */
 const POSITION_GAP = 1000;
+
+/** Max length of a deck `name` (ARCHITECTURE.md §3.2 — server rejects >200). */
+const DECK_NAME_MAX = 200;
 
 /** Fields a caller may provide when creating a deck. */
 export interface CreateDeckInput {
@@ -95,6 +99,10 @@ export async function createDeck(input: CreateDeckInput): Promise<Deck> {
     client_updated_at: stamp,
   });
   await db.decks.put(deck);
+  // Protect this optimistic row from a racing hydrate whose server snapshot
+  // predates the create's commit (see markRecentlyCreated). The pending-outbox
+  // exemption only covers the still-queued window.
+  markRecentlyCreated("decks", deck.id);
   await enqueueCoalesced(db, {
     type: "create",
     entity: "decks",
@@ -192,14 +200,20 @@ export async function duplicateDeck(id: string): Promise<Deck> {
 
   const owner = currentUserId();
   const stamp = nowIso();
+  // Clamp the copy name to the DB ceiling (ARCHITECTURE.md §3.2, max 200): a
+  // source name within 7 chars of 200 would otherwise overflow once the
+  // " (copy)" suffix is appended and the create would be rejected server-side.
+  const suffix = " (copy)";
+  const base = source.name.slice(0, DECK_NAME_MAX - suffix.length);
   const copy = optimisticDeck({
     id: newClientId(),
     owner,
-    name: `${source.name} (copy)`,
+    name: `${base}${suffix}`,
     shoot_date: "",
     client_updated_at: stamp,
   });
   await db.decks.put(copy);
+  markRecentlyCreated("decks", copy.id);
   await enqueueCoalesced(db, {
     type: "create",
     entity: "decks",
@@ -235,6 +249,7 @@ export async function duplicateDeck(id: string): Promise<Deck> {
       updated: cardStamp,
     };
     await db.cards.put(newCard);
+    markRecentlyCreated("cards", newCard.id);
     await enqueueCoalesced(db, {
       type: "create",
       entity: "cards",

@@ -2,7 +2,7 @@ import { ClientResponseError } from "pocketbase";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { PoseDeckDB } from "../db";
-import { enqueue, pending } from "../outbox";
+import { enqueue, markInflight, pending } from "../outbox";
 import type { MutationTransport } from "../serverEntities";
 import { SyncEngine } from "../syncEngine";
 
@@ -21,6 +21,11 @@ function okTransport(over: Partial<MutationTransport> = {}): MutationTransport {
 
 function pbError(status: number, data: Record<string, unknown> = {}): ClientResponseError {
   return new ClientResponseError({ status, response: { data } });
+}
+
+/** An SDK auto-cancel / abort (classifyError → {kind:"retry", reason:"aborted"}). */
+function abortError(): ClientResponseError {
+  return new ClientResponseError({ isAbort: true });
 }
 
 describe("SyncEngine.drain", () => {
@@ -131,6 +136,31 @@ describe("SyncEngine.drain", () => {
     expect(await pending(db)).toHaveLength(0);
   });
 
+  it("routes a 401 through onAuthError so a background drain clears the dead session (regression: SEC-1)", async () => {
+    // A pure background outbox drain hits a 401 (rejected token) with NO
+    // concurrent foreground fetch to clear the store. The engine must surface
+    // the rejected session via the onAuthError hook (which the app wires to
+    // clearAuthOnUnauthorized / pb.authStore.clear) so it doesn't silently
+    // pause with a dead token and no re-auth signal.
+    await enqueue(db, { type: "update", entity: "cards", recordId: "c1", payload: {} });
+    const transport = okTransport({
+      update: vi.fn(async () => {
+        throw pbError(401);
+      }),
+    });
+    const onAuthError = vi.fn();
+    const engine = new SyncEngine({ db, transport, hooks: { onAuthError }, pollMs: 0 });
+
+    await engine.drain();
+
+    expect(engine.state).toBe("paused");
+    expect(onAuthError).toHaveBeenCalledTimes(1);
+    expect(onAuthError).toHaveBeenCalledWith(
+      expect.objectContaining({ recordId: "c1" }),
+    );
+    expect(await pending(db)).toHaveLength(1); // entry preserved for re-send
+  });
+
   it("drops an entry after exceeding maxRetries", async () => {
     await enqueue(db, { type: "update", entity: "cards", recordId: "c1", payload: {} });
     const transport = okTransport({
@@ -158,6 +188,72 @@ describe("SyncEngine.drain", () => {
     }
     expect(await pending(db)).toHaveLength(0);
     expect(onError).toHaveBeenCalledWith(expect.anything(), expect.stringContaining("max retries"));
+  });
+
+  it("does not count SDK aborts against the retry budget (regression: C3)", async () => {
+    await enqueue(db, { type: "update", entity: "cards", recordId: "c1", payload: {} });
+    let succeed = false;
+    const transport = okTransport({
+      update: vi.fn(async (_e, id) => {
+        if (!succeed) throw abortError();
+        return { id, updated: "u" };
+      }),
+    });
+    const rollback = vi.fn();
+    const onError = vi.fn();
+    let clock = 0;
+    const engine = new SyncEngine({
+      db,
+      transport,
+      hooks: { rollback, onError },
+      pollMs: 0,
+      maxRetries: 3,
+      backoff: { baseMs: 1, maxMs: 1 },
+      now: () => clock,
+    });
+
+    // Abort the head far more times than maxRetries. Each pass backs off but the
+    // entry must NOT be dropped, rolled back, or have its retry_count bumped:
+    // an abort is not a genuine failure attempt.
+    for (let i = 0; i < 10; i++) {
+      await engine.drain();
+      clock += 10;
+    }
+    const rows = await pending(db);
+    expect(rows).toHaveLength(1); // still queued, never dropped
+    expect(rows[0].retry_count).toBe(0); // aborts don't erode the budget
+    expect(rows[0].status).toBe("pending");
+    expect(rollback).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+
+    // Once the underlying call succeeds, the valid mutation finally lands.
+    succeed = true;
+    await engine.drain();
+    expect(await pending(db)).toHaveLength(0);
+  });
+
+  it("recovers an entry orphaned inflight by a prior runtime on start()", async () => {
+    // Simulate a crash mid-send: the row persisted as `inflight` and was never
+    // resolved. A fresh engine starting over the same durable db must re-send
+    // it instead of leaving it silently stranded.
+    const id = await enqueue(db, {
+      type: "create",
+      entity: "decks",
+      recordId: "d1",
+      payload: { name: "A" },
+    });
+    await markInflight(db, id);
+
+    const transport = okTransport();
+    const engine = new SyncEngine({ db, transport, pollMs: 0 });
+
+    engine.start();
+    // start() resets inflight→pending then drains; await the in-flight pass.
+    await engine.drain();
+    engine.stop();
+
+    expect(transport.create).toHaveBeenCalledTimes(1);
+    expect(await pending(db)).toHaveLength(0);
   });
 
   it("is single-flight: concurrent drains do not double-send", async () => {

@@ -11,6 +11,7 @@
  * local live queries that drive thumbnails and the editor stay consistent.
  */
 import { db } from "@/lib/db";
+import { markRecentlyUploadedImage } from "@/lib/localStore";
 import { collections, fileUrlWithToken, pb } from "@/lib/pocketbase";
 import type { CardImage } from "@/lib/types";
 
@@ -58,6 +59,10 @@ export async function uploadCardImage(
   const record = await collections.card_images().create(form);
   // Mirror into Dexie so live queries (thumbnails, editor) reflect it at once.
   await db.card_images.put(record);
+  // Images are PB-direct (never in the outbox), so the only thing that can keep
+  // a racing resync — whose server snapshot predates this create — from pruning
+  // the row above is a recently-uploaded mark consulted by hydrateFromServer.
+  markRecentlyUploadedImage(record.id);
   return record;
 }
 

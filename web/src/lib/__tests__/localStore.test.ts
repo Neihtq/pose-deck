@@ -5,6 +5,8 @@ import type { OutboxEntity } from "../db";
 import { enqueue } from "../outbox";
 import {
   clearLocalStore,
+  clearRecentlyCreated,
+  clearRecentlyUploadedImages,
   hydrateFromServer,
   incomingWins,
   liveCards,
@@ -12,6 +14,8 @@ import {
   liveDeck,
   liveDecks,
   liveTrashedDecks,
+  markRecentlyCreated,
+  markRecentlyUploadedImage,
   mergeRecord,
   reconcileEntity,
 } from "../localStore";
@@ -135,6 +139,47 @@ describe("reconcileEntity prune", () => {
     const ids = (await db.decks.toArray()).map((r) => r.id).sort();
     expect(ids).toEqual(["d-local", "d1"]); // optimistic local create survives
   });
+
+  // Regression (E2E "Deck not found", root cause): the prune re-reads exemptions
+  // via `lateKeep` RIGHT BEFORE the destructive bulkDelete, not from a snapshot
+  // taken up front. We model a row that appears AND becomes exempt only after
+  // the call begins (created mid-hydrate): the static `keepIds` does NOT cover
+  // it, only the late re-read does. Without the late re-read this row is pruned.
+  it("re-reads exemptions at prune time via lateKeep (covers mid-hydrate creates)", async () => {
+    await db.decks.bulkPut([deck({ id: "d1" }), deck({ id: "d-late" })]);
+    let lateKeepCalls = 0;
+    await reconcileEntity(
+      db,
+      "decks",
+      [deck({ id: "d1" })], // server snapshot lacks d-late
+      new Set(), // early exemptions are EMPTY (d-late not yet known)
+      () => {
+        lateKeepCalls += 1;
+        // Evaluated just before the prune — by now d-late is exempt.
+        return new Set(["d-late"]);
+      },
+    );
+    const ids = (await db.decks.toArray()).map((r) => r.id).sort();
+    expect(lateKeepCalls).toBe(1); // late exemptions were consulted
+    expect(ids).toEqual(["d-late", "d1"]); // late-exempted row survived the prune
+  });
+
+  it("lateKeep unions with the static keepIds (neither alone is enough)", async () => {
+    await db.decks.bulkPut([
+      deck({ id: "d1" }),
+      deck({ id: "d-early" }),
+      deck({ id: "d-late" }),
+    ]);
+    await reconcileEntity(
+      db,
+      "decks",
+      [deck({ id: "d1" })],
+      new Set(["d-early"]), // exempt via the early snapshot
+      () => new Set(["d-late"]), // exempt via the late re-read
+    );
+    const ids = (await db.decks.toArray()).map((r) => r.id).sort();
+    expect(ids).toEqual(["d-early", "d-late", "d1"]); // both kept
+  });
 });
 
 describe("hydrateFromServer", () => {
@@ -142,6 +187,109 @@ describe("hydrateFromServer", () => {
   beforeEach(async () => {
     db = freshDb();
     await db.open();
+    clearRecentlyUploadedImages();
+    clearRecentlyCreated();
+  });
+
+  // Regression (finding C5): a directly-uploaded image (PB-direct, never in the
+  // outbox) must not be pruned by a hydrate/resync whose server snapshot was
+  // captured before the upload's create committed. Since images never enter the
+  // outbox, `keepIds` from pendingRecordIds is empty — the recently-uploaded
+  // mark is the only thing that can protect the optimistic row.
+  it("does not prune a just-uploaded image absent from a racing server snapshot", async () => {
+    // Optimistic row written by uploadCardImage's db.card_images.put(...).
+    await db.card_images.put(image({ id: "i-fresh", card: "c1" }));
+    markRecentlyUploadedImage("i-fresh");
+
+    const server: Record<OutboxEntity, unknown[]> = {
+      decks: [],
+      cards: [],
+      // Stale snapshot: the fresh upload is NOT in the server list yet.
+      card_images: [image({ id: "i-old", card: "c1" })],
+      deck_guests: [],
+      card_completions: [],
+    };
+    await hydrateFromServer(db, async (e) => server[e] as never);
+
+    const ids = (await db.card_images.toArray()).map((r) => r.id).sort();
+    expect(ids).toEqual(["i-fresh", "i-old"]); // fresh upload survived the prune
+  });
+
+  it("prunes a stale (un-marked) image absent from the server snapshot", async () => {
+    // Without a recent-upload mark, an absent local image is a genuine
+    // hard-delete / orphan and must still be pruned (no over-retention).
+    await db.card_images.put(image({ id: "i-stale", card: "c1" }));
+
+    const server: Record<OutboxEntity, unknown[]> = {
+      decks: [],
+      cards: [],
+      card_images: [image({ id: "i-old", card: "c1" })],
+      deck_guests: [],
+      card_completions: [],
+    };
+    await hydrateFromServer(db, async (e) => server[e] as never);
+
+    const ids = (await db.card_images.toArray()).map((r) => r.id).sort();
+    expect(ids).toEqual(["i-old"]); // unmarked stale row pruned
+  });
+
+  // Regression (E2E "Deck not found" flake): a freshly-created deck/card whose
+  // create has been CONFIRMED and dequeued from the outbox must not be pruned by
+  // an in-flight hydrate whose `getFullList` snapshot was captured BEFORE the
+  // server committed the insert. `pendingRecordIds` only covers the still-queued
+  // window; the recently-created mark covers the post-dequeue gap.
+  it("does not prune a just-created deck absent from a racing server snapshot", async () => {
+    // Optimistic deck create with NO pending outbox entry (already confirmed +
+    // dequeued) — only the recently-created mark can protect it.
+    await db.decks.put(deck({ id: "d-fresh", name: "fresh" }));
+    markRecentlyCreated("decks", "d-fresh");
+
+    const server: Record<OutboxEntity, unknown[]> = {
+      decks: [deck({ id: "d-old", name: "old" })], // stale: d-fresh not yet present
+      cards: [],
+      card_images: [],
+      deck_guests: [],
+      card_completions: [],
+    };
+    await hydrateFromServer(db, async (e) => server[e] as never);
+
+    const ids = (await db.decks.toArray()).map((d) => d.id).sort();
+    expect(ids).toEqual(["d-fresh", "d-old"]); // fresh create survived the prune
+  });
+
+  it("does not prune a just-created card absent from a racing server snapshot", async () => {
+    await db.cards.put(card({ id: "c-fresh", deck: "d1" }));
+    markRecentlyCreated("cards", "c-fresh");
+
+    const server: Record<OutboxEntity, unknown[]> = {
+      decks: [],
+      cards: [card({ id: "c-old", deck: "d1" })], // stale: c-fresh not yet present
+      card_images: [],
+      deck_guests: [],
+      card_completions: [],
+    };
+    await hydrateFromServer(db, async (e) => server[e] as never);
+
+    const ids = (await db.cards.toArray()).map((c) => c.id).sort();
+    expect(ids).toEqual(["c-fresh", "c-old"]);
+  });
+
+  it("still prunes an un-marked deck absent from the server snapshot", async () => {
+    // No recent-create mark: an absent local deck is a genuine remote delete and
+    // must still be pruned (no over-retention regression).
+    await db.decks.put(deck({ id: "d-stale", name: "stale" }));
+
+    const server: Record<OutboxEntity, unknown[]> = {
+      decks: [deck({ id: "d-old", name: "old" })],
+      cards: [],
+      card_images: [],
+      deck_guests: [],
+      card_completions: [],
+    };
+    await hydrateFromServer(db, async (e) => server[e] as never);
+
+    const ids = (await db.decks.toArray()).map((d) => d.id).sort();
+    expect(ids).toEqual(["d-old"]); // unmarked stale row pruned
   });
 
   it("merges all entities and preserves a pending optimistic create", async () => {

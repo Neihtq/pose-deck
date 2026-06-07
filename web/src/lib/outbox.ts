@@ -102,6 +102,27 @@ export async function markPending(db: PoseDeckDB, id: number): Promise<void> {
   await db.outbox.update(id, { status: "pending" });
 }
 
+/**
+ * Reset any rows left `inflight` by a previous runtime back to `pending`.
+ *
+ * `status: "inflight"` is set just before a send and cleared (deleted /
+ * returned to pending) just after. If the runtime dies mid-send (crash, tab
+ * close, reload), the durable Dexie row stays `inflight` forever — `peekFifo`
+ * and `enqueueCoalesced` both exclude `inflight` rows, so that mutation is
+ * silently orphaned (never re-sent, deleted, or rolled back). Re-arming it to
+ * `pending` on the next engine start lets the drain loop retry it. Replays are
+ * safe: creates carry client-supplied ids and the transport treats a duplicate
+ * create as success (idempotent). Returns the number of rows reset.
+ *
+ * Only call this when no send is in progress in THIS runtime (i.e. at engine
+ * start), so it cannot clobber a genuinely in-flight entry.
+ */
+export async function requeueInflight(db: PoseDeckDB): Promise<number> {
+  return db.outbox.where("status").equals("inflight").modify({
+    status: "pending",
+  });
+}
+
 /** Remove an entry once its mutation is confirmed by the server. */
 export async function deleteEntry(db: PoseDeckDB, id: number): Promise<void> {
   await db.outbox.delete(id);
@@ -137,6 +158,33 @@ export async function bumpRetry(
     next_attempt_at: now() + delay,
   });
   return nextRetry;
+}
+
+/**
+ * Back off an entry WITHOUT counting the attempt against its retry budget.
+ *
+ * Used for non-counting transients (e.g. an SDK auto-cancel / abort) that are
+ * not genuine failures: the request never reached a server verdict, so it must
+ * not erode `maxRetries` (which would wrongly drop + roll back a valid
+ * mutation). Returns the entry to `pending` with the same backoff curve as
+ * {@link bumpRetry}, keyed off the existing `retry_count` (left unchanged), so
+ * repeated aborts still throttle but can never exhaust the budget.
+ */
+export async function bumpBackoff(
+  db: PoseDeckDB,
+  entry: OutboxEntry,
+  error: string,
+  opts: BackoffOptions = {},
+  now: () => number = () => Date.now(),
+): Promise<void> {
+  const baseMs = opts.baseMs ?? 1000;
+  const maxMs = opts.maxMs ?? 60_000;
+  const delay = Math.min(maxMs, baseMs * 2 ** entry.retry_count);
+  await db.outbox.update(entry.id as number, {
+    last_error: error,
+    status: "pending",
+    next_attempt_at: now() + delay,
+  });
 }
 
 /**

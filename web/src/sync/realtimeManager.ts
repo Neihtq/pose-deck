@@ -24,6 +24,7 @@ import {
   hydrateFromServer,
   mergeRecord,
 } from "@/lib/localStore";
+import { lwwKey } from "@/lib/serverEntities";
 import type { RecentlyConfirmed } from "./recentlyConfirmed";
 
 /** A realtime event as delivered by the PocketBase SDK. */
@@ -144,8 +145,17 @@ export class RealtimeManager {
     entity: OutboxEntity,
     event: RealtimeEvent,
   ): Promise<void> {
-    // Suppress the echo of our own just-confirmed mutation.
-    if (this.recentlyConfirmed?.shouldSuppress(entity, event.record.id)) {
+    // Suppress the echo of our own just-confirmed mutation — but NOT a
+    // concurrent remote write that is strictly newer than what we confirmed.
+    // Pass the event's LWW clock so a genuinely-newer same-record edit from
+    // another writer still flows through mergeRecord's LWW path.
+    if (
+      this.recentlyConfirmed?.shouldSuppress(
+        entity,
+        event.record.id,
+        incomingClock(entity, event.record),
+      )
+    ) {
       return;
     }
     await mergeRecord(this.db, entity, event.record as never, {
@@ -153,4 +163,19 @@ export class RealtimeManager {
     });
     this.onApplied?.(entity, event);
   }
+}
+
+/**
+ * The realtime event's LWW ordering clock for `entity`, or `undefined` for
+ * non-LWW entities (images/guests) or a missing/non-string value. Used to let
+ * a strictly-newer concurrent remote write escape self-echo suppression.
+ */
+function incomingClock(
+  entity: OutboxEntity,
+  record: RealtimeEvent["record"],
+): string | undefined {
+  const key = lwwKey(entity);
+  if (!key) return undefined;
+  const v = record[key];
+  return typeof v === "string" ? v : undefined;
 }

@@ -83,6 +83,60 @@ describe("createSyncRuntime hook wiring", () => {
     expect(recentlyConfirmed.shouldSuppress("decks", "deck1")).toBe(true);
   });
 
+  // Regression (finding C2): in the REAL create flow the optimistic row seeds
+  // created = updated = client_updated_at = stamp and sends that SAME stamp to
+  // the server. The 2xx echo therefore carries an IDENTICAL client_updated_at —
+  // a tie under LWW that the merge would skip — so the server-canonical
+  // created/updated (which differ from the optimistic placeholders) must still
+  // be written. Before the fix, reconcileEntry went through plain LWW and the
+  // tie was skipped, leaving the optimistic created/updated in Dexie.
+  it("writes server-canonical created/updated on 2xx even when client_updated_at ties", async () => {
+    const stamp = "2026-06-07T12:00:00.000Z";
+    const server = {
+      id: "deck2",
+      owner: "u1",
+      name: "Server Name",
+      shoot_date: "",
+      deleted_at: "",
+      // Server echoes back the exact client clock the client sent.
+      client_updated_at: stamp,
+      // ...but its OWN canonical created/updated differ from the optimistic
+      // placeholders the client seeded with `stamp`.
+      created: "2026-06-07T11:59:59.500Z",
+      updated: "2026-06-07T11:59:59.700Z",
+    };
+    const transport: MutationTransport = {
+      create: vi.fn(async () => server),
+      update: vi.fn(),
+      delete: vi.fn(),
+    };
+    const { engine } = createSyncRuntime(db, { transport });
+
+    // optimisticDeck seeds created = updated = client_updated_at = stamp.
+    await db.decks.put({
+      id: "deck2",
+      owner: "u1",
+      name: "Server Name",
+      shoot_date: "",
+      deleted_at: "",
+      client_updated_at: stamp,
+      created: stamp,
+      updated: stamp,
+    });
+    await enqueue(db, {
+      type: "create",
+      entity: "decks",
+      recordId: "deck2",
+      payload: { name: "Server Name" },
+    });
+    await engine.drain();
+
+    const reconciled = await db.decks.get("deck2");
+    expect(reconciled?.created).toBe(server.created);
+    expect(reconciled?.updated).toBe(server.updated);
+    expect(await db.outbox.count()).toBe(0);
+  });
+
   it("rolls back (removes) a dropped optimistic create on a 4xx", async () => {
     const err = new ClientResponseError({ status: 403, data: {} });
     const transport: MutationTransport = {

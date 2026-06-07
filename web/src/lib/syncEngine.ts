@@ -26,11 +26,13 @@
 import type { PoseDeckDB } from "./db";
 import type { OutboxEntry } from "./db";
 import {
+  bumpBackoff,
   bumpRetry,
   deleteEntry,
   markInflight,
   markPending,
   peekFifo,
+  requeueInflight,
 } from "./outbox";
 import { type MutationTransport, pocketBaseTransport, send } from "./serverEntities";
 
@@ -47,6 +49,15 @@ export interface SyncEngineHooks {
    * suppresses the echo of our own mutation (ARCHITECTURE.md §4.4 self-echo).
    */
   onConfirmed?(entry: OutboxEntry, serverRecord: unknown): void;
+  /**
+   * A send hit a 401: the persisted token has been rejected. The engine has
+   * already returned the entry to pending and paused; this hook routes the
+   * rejected session through the app's auth-clear path (e.g.
+   * `clearAuthOnUnauthorized` / `pb.authStore.clear()`) so a background-only
+   * drain deterministically lands the user back at /login instead of leaving
+   * the engine silently paused with a dead token (regression: SEC-1).
+   */
+  onAuthError?(entry: OutboxEntry): void;
 }
 
 export interface SyncEngineOptions {
@@ -77,6 +88,12 @@ export class SyncEngine {
 
   private running = false;
   private paused = false;
+  /**
+   * Set on start(): the next drain pass first resets rows orphaned `inflight`
+   * by a prior (crashed) runtime back to `pending` before draining, so they
+   * re-send instead of being silently stranded. Cleared once recovery runs.
+   */
+  private needsInflightRecovery = false;
   /** In-flight drain promise; concurrent callers await the same pass. */
   private drainPromise: Promise<void> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -106,6 +123,10 @@ export class SyncEngine {
     if (this.pollMs > 0) {
       this.pollTimer = setInterval(this.boundWake, this.pollMs);
     }
+    // The first drain after start recovers entries orphaned `inflight` by a
+    // prior runtime that died mid-send (crash / tab close / reload) so they
+    // re-send instead of being silently stranded (see `requeueInflight`).
+    this.needsInflightRecovery = true;
     void this.drain();
   }
 
@@ -154,6 +175,12 @@ export class SyncEngine {
   }
 
   private async runDrain(): Promise<void> {
+    if (this.needsInflightRecovery) {
+      // Clear the flag first so a concurrent/later pass doesn't re-run recovery
+      // and clobber an entry this runtime has since marked genuinely inflight.
+      this.needsInflightRecovery = false;
+      await requeueInflight(this.db);
+    }
     // Loop until no eligible entry OR a transient failure halts the pass.
     for (;;) {
       if (this.paused) break;
@@ -174,6 +201,12 @@ export class SyncEngine {
         // Return to pending (so it re-sends after re-auth) and pause.
         await markPending(this.db, entry.id as number);
         this.paused = true;
+        // Surface the rejected token to the app so it can clear the dead
+        // session and prompt re-auth. Without this, a background-only drain
+        // (no concurrent foreground fetch hitting the same 401) would leave the
+        // engine silently paused with a persisted-but-rejected token and no UI
+        // signal (regression: SEC-1).
+        this.hooks.onAuthError?.(entry);
         break;
       }
 
@@ -182,6 +215,16 @@ export class SyncEngine {
         await this.hooks.rollback?.(entry, outcome.reason);
         this.hooks.onError?.(entry, outcome.reason);
         continue; // the bad entry is gone; keep draining the rest
+      }
+
+      // An SDK auto-cancel / abort is a non-counting transient: the request
+      // never got a server verdict, so it must NOT erode the retry budget
+      // (otherwise enough aborts would wrongly drop + roll back a valid
+      // mutation). Back off without incrementing retry_count, then stop the
+      // pass like any other transient (head-of-line).
+      if (outcome.reason === "aborted") {
+        await bumpBackoff(this.db, entry, outcome.reason, this.backoff, this.now);
+        break;
       }
 
       // retry: bump backoff on this entry and STOP this pass (head-of-line).

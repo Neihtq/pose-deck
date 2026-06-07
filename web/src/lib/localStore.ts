@@ -100,16 +100,27 @@ function readClock(record: AnyRecord, key: string): string {
  * action): the row is removed regardless of clocks. Soft-deletes for
  * decks/cards arrive as ordinary updates with a non-empty `deleted_at` and flow
  * through the normal LWW path (the row stays, the UI filters it out).
+ *
+ * `force` bypasses the LWW rule and writes `record` unconditionally. The post-2xx
+ * reconcile uses this: the server echo of our OWN confirmed mutation carries the
+ * SAME `client_updated_at` we sent, which is a tie under LWW and would otherwise
+ * be skipped — so the server-canonical `created`/`updated`/`id` would never land
+ * in Dexie (ARCHITECTURE.md §4.2 step 5). For our own confirmed record the
+ * server values are authoritative, so we write them directly.
  */
 export async function mergeRecord(
   db: PoseDeckDB,
   entity: OutboxEntity,
   record: AnyRecord,
-  opts: { deleted?: boolean } = {},
+  opts: { deleted?: boolean; force?: boolean } = {},
 ): Promise<void> {
   const table = tableFor(db, entity);
   if (opts.deleted) {
     await table.delete(record.id);
+    return;
+  }
+  if (opts.force) {
+    await table.put(record as never);
     return;
   }
   const local = (await table.get(record.id)) as AnyRecord | undefined;
@@ -136,19 +147,36 @@ export async function mergeMany(
  * that produce no soft-delete tombstone — an additive merge would resurrect
  * them. `keepIds` lets callers exempt rows that are still pending in the outbox
  * (so we don't prune an optimistic create the server hasn't seen yet).
+ *
+ * `lateKeep`, if provided, is evaluated IMMEDIATELY before the destructive
+ * `bulkDelete` and unioned into the exemption set. This closes a
+ * time-of-check/time-of-use window: the caller computes `keepIds` up front, but
+ * the server fetch + merge are async and can take seconds, during which the user
+ * may create a new record. Without a late re-check, that brand-new optimistic
+ * row — created after `keepIds` was snapshotted — is absent from the (stale)
+ * server set and not in `keepIds`, so it would be wrongly pruned. Re-reading the
+ * live exemptions at prune time keeps just-created rows safe.
  */
 export async function reconcileEntity(
   db: PoseDeckDB,
   entity: OutboxEntity,
   serverRecords: AnyRecord[],
   keepIds: ReadonlySet<string> = new Set(),
+  lateKeep?: () => Promise<ReadonlySet<string>> | ReadonlySet<string>,
 ): Promise<void> {
   await mergeMany(db, entity, serverRecords);
   const serverIds = new Set(serverRecords.map((r) => r.id));
   const table = tableFor(db, entity);
   const localIds = (await table.toCollection().primaryKeys()) as string[];
+  let exempt: ReadonlySet<string> = keepIds;
+  if (lateKeep) {
+    const late = await lateKeep();
+    const union = new Set(keepIds);
+    for (const id of late) union.add(id);
+    exempt = union;
+  }
   const toPrune = localIds.filter(
-    (id) => !serverIds.has(id) && !keepIds.has(id),
+    (id) => !serverIds.has(id) && !exempt.has(id),
   );
   if (toPrune.length > 0) {
     await table.bulkDelete(toPrune);
@@ -165,6 +193,117 @@ export async function pendingRecordIds(
 ): Promise<Set<string>> {
   const entries = await db.outbox.where("entity").equals(entity).toArray();
   return new Set(entries.map((e) => e.recordId));
+}
+
+/**
+ * Short-TTL set of just-uploaded `card_images` ids that must NOT be pruned by a
+ * reconciling resync that races ahead of the server list.
+ *
+ * Images are PocketBase-direct (never enqueued to the outbox — see
+ * imageApi.ts), so `pendingRecordIds("card_images")` is always empty and cannot
+ * exempt a fresh upload. If a resync/reconnect captured its `getFullList`
+ * snapshot BEFORE an upload's server create committed but runs its prune AFTER
+ * the optimistic Dexie `put`, `reconcileEntity` would delete the new row. We
+ * record each uploaded id here for a short window so `hydrateFromServer` exempts
+ * it; the row then converges to the server truth on the next (post-create)
+ * resync once the TTL lapses. Module-level (not per-db) because the live app has
+ * a single shared `db`; the TTL bounds memory and lets the set stay small.
+ */
+const recentlyUploadedImageIds = new Map<string, number>();
+const RECENT_UPLOAD_TTL_MS = 30_000;
+
+/** Mark a just-uploaded `card_images` id so a racing resync won't prune it. */
+export function markRecentlyUploadedImage(
+  id: string,
+  now: () => number = () => Date.now(),
+): void {
+  recentlyUploadedImageIds.set(id, now() + RECENT_UPLOAD_TTL_MS);
+}
+
+/** The set of un-expired recently-uploaded image ids (lazily evicting). */
+export function recentlyUploadedImageKeepIds(
+  now: () => number = () => Date.now(),
+): Set<string> {
+  const t = now();
+  const live = new Set<string>();
+  for (const [id, expiry] of recentlyUploadedImageIds) {
+    if (expiry < t) {
+      recentlyUploadedImageIds.delete(id);
+    } else {
+      live.add(id);
+    }
+  }
+  return live;
+}
+
+/** Test seam: forget all recently-uploaded image marks. */
+export function clearRecentlyUploadedImages(): void {
+  recentlyUploadedImageIds.clear();
+}
+
+/**
+ * Short-TTL set of just-created OPTIMISTIC record ids per entity (decks/cards)
+ * that must NOT be pruned by a reconciling resync whose server snapshot
+ * predates the create's server commit.
+ *
+ * `pendingRecordIds` already exempts an optimistic create while its outbox
+ * entry is queued. But there is a race once the create is CONFIRMED and the
+ * outbox entry deleted: an in-flight `hydrateFromServer` whose `getFullList`
+ * snapshot was captured BEFORE the server committed the insert will not see the
+ * new id, and — now that it is no longer "pending" — `reconcileEntity` would
+ * prune the freshly-created local row (deck → "Deck not found"; card → vanishes
+ * from the deck). This is the deck/card analogue of the documented
+ * `card_images` race; we protect against it with the same mark-on-create +
+ * consult-in-hydrate mechanism. The row converges to server truth on the next
+ * resync once the TTL lapses. Module-level because the live app shares one `db`.
+ */
+const recentlyCreatedIds: Record<string, Map<string, number>> = {
+  decks: new Map(),
+  cards: new Map(),
+};
+const RECENT_CREATE_TTL_MS = 30_000;
+
+/**
+ * Mark a just-created optimistic `decks`/`cards` id so a racing resync whose
+ * snapshot predates the server commit won't prune it. No-op for entities
+ * without a create-prune race (images use their own mark; guests/completions
+ * are never optimistically created through this path).
+ */
+export function markRecentlyCreated(
+  entity: OutboxEntity,
+  id: string,
+  now: () => number = () => Date.now(),
+): void {
+  const bucket = recentlyCreatedIds[entity];
+  if (bucket) {
+    bucket.set(id, now() + RECENT_CREATE_TTL_MS);
+  }
+}
+
+/** Un-expired recently-created ids for an entity (lazily evicting). */
+export function recentlyCreatedKeepIds(
+  entity: OutboxEntity,
+  now: () => number = () => Date.now(),
+): Set<string> {
+  const bucket = recentlyCreatedIds[entity];
+  const live = new Set<string>();
+  if (!bucket) return live;
+  const t = now();
+  for (const [id, expiry] of bucket) {
+    if (expiry < t) {
+      bucket.delete(id);
+    } else {
+      live.add(id);
+    }
+  }
+  return live;
+}
+
+/** Test seam: forget all recently-created marks (all entities). */
+export function clearRecentlyCreated(): void {
+  for (const bucket of Object.values(recentlyCreatedIds)) {
+    bucket.clear();
+  }
 }
 
 /** The five data collections we mirror + sync, in dependency order. */
@@ -193,11 +332,27 @@ export async function hydrateFromServer(
   fetchAll: EntityFetcher,
 ): Promise<void> {
   for (const entity of SYNCED_ENTITIES) {
-    const [records, keep] = await Promise.all([
-      fetchAll(entity),
-      pendingRecordIds(db, entity),
-    ]);
-    await reconcileEntity(db, entity, records, keep);
+    const records = await fetchAll(entity);
+    // The exemption set is re-read RIGHT BEFORE the prune (via `lateKeep`), not
+    // captured here: `fetchAll` may take seconds, and a record the user creates
+    // during that window would be absent from this (now-stale) server snapshot.
+    // Re-reading pending-outbox + recently-created/uploaded ids at prune time
+    // keeps those just-created optimistic rows from being wrongly pruned (see
+    // reconcileEntity's `lateKeep` and `markRecentlyCreated`).
+    const liveKeep = async (): Promise<ReadonlySet<string>> => {
+      const keep = await pendingRecordIds(db, entity);
+      // Images are PB-direct (never in the outbox), so exempt any just-uploaded
+      // image whose server create may not be in this snapshot yet.
+      if (entity === "card_images") {
+        for (const id of recentlyUploadedImageKeepIds()) keep.add(id);
+      }
+      // Decks/cards: exempt freshly-created optimistic rows whose server commit
+      // may post-date this snapshot (covers both the still-queued window and the
+      // gap after the create is confirmed + dequeued).
+      for (const id of recentlyCreatedKeepIds(entity)) keep.add(id);
+      return keep;
+    };
+    await reconcileEntity(db, entity, records, undefined, liveKeep);
   }
 }
 

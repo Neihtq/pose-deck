@@ -15,16 +15,17 @@
  * Both are idempotent and safe to call when already (not) running.
  */
 import { db } from "@/lib/db";
-import type { OutboxEntity, PoseDeckDB } from "@/lib/db";
+import type { OutboxEntity, OutboxEntry, PoseDeckDB } from "@/lib/db";
+import { decodeOutboxPayload } from "@/lib/outbox";
 import {
   type EntityFetcher,
   clearLocalStore,
   hydrateFromServer,
   mergeRecord,
 } from "@/lib/localStore";
-import { collections, pb } from "@/lib/pocketbase";
+import { clearFileToken, collections, pb } from "@/lib/pocketbase";
 import { SyncEngine } from "@/lib/syncEngine";
-import type { MutationTransport } from "@/lib/serverEntities";
+import { type MutationTransport, lwwKey } from "@/lib/serverEntities";
 import { toast } from "@/components/ui/use-toast";
 
 /** Any stored collection row (all carry a string `id`). */
@@ -80,7 +81,7 @@ async function reconcileEntry(
 ): Promise<void> {
   // A delete has no canonical record to merge; for images/guests the engine's
   // delete already removed the row locally. For create/update we merge the
-  // server record (carrying canonical created/updated) under the LWW rule.
+  // server record (carrying canonical created/updated).
   if (!serverRecord || typeof serverRecord !== "object") {
     return;
   }
@@ -88,7 +89,27 @@ async function reconcileEntry(
   if (typeof rec.id !== "string" || rec.id === "") {
     return;
   }
-  await mergeRecord(database, entity, rec as never);
+  // `force`: this is the server echo of OUR OWN just-confirmed mutation, which
+  // carries the SAME `client_updated_at` we sent — a tie under LWW that would be
+  // skipped, leaving the server-canonical created/updated/id unwritten. For our
+  // own confirmed record the server values are authoritative, so bypass LWW and
+  // write them directly (ARCHITECTURE.md §4.2 step 5).
+  await mergeRecord(database, entity, rec as never, { force: true });
+}
+
+/**
+ * The LWW clock we sent for a confirmed mutation, read from the queued payload
+ * (`client_updated_at` for decks/cards, `changed_at` for card_completions), or
+ * `undefined` for non-LWW entities (images/guests) or a delete with no clock.
+ * Used to mark the self-echo so a strictly-newer concurrent remote write is not
+ * suppressed.
+ */
+function confirmedClock(entry: OutboxEntry): string | undefined {
+  const key = lwwKey(entry.entity);
+  if (!key) return undefined;
+  const payload = decodeOutboxPayload(entry);
+  const v = (payload as Record<string, unknown>)[key];
+  return typeof v === "string" ? v : undefined;
 }
 
 /** The bootstrapped sync runtime: engine + realtime + self-echo set. */
@@ -120,7 +141,11 @@ export function createSyncRuntime(
       reconcile: (entry, serverRecord) =>
         reconcileEntry(database, entry.entity, serverRecord),
       onConfirmed: (entry) => {
-        recentlyConfirmed.mark(entry.entity, entry.recordId);
+        recentlyConfirmed.mark(
+          entry.entity,
+          entry.recordId,
+          confirmedClock(entry),
+        );
       },
       rollback: async (entry) => {
         // A dropped create never reached the server: remove the optimistic row.
@@ -136,6 +161,17 @@ export function createSyncRuntime(
           title: "A change could not be saved",
           description: `${entry.entity} ${entry.type} failed (${reason}).`,
         });
+      },
+      onAuthError: () => {
+        // A background outbox send hit a 401: the persisted token is dead.
+        // Clear the session the same way the foreground page handlers do
+        // (`clearAuthOnUnauthorized`): drop the cached file token and clear the
+        // auth store. Clearing the store fires `authStore.onChange`, which the
+        // AuthProvider observes to run `stopSync()` and route the user back to
+        // /login — so a background-only 401 no longer strands the engine paused
+        // with a dead token and no UI signal (SEC-1).
+        clearFileToken();
+        pb.authStore.clear();
       },
     },
   });

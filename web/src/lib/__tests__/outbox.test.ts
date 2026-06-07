@@ -9,6 +9,7 @@ import {
   markInflight,
   peekFifo,
   pending,
+  requeueInflight,
 } from "../outbox";
 
 function freshDb(): PoseDeckDB {
@@ -68,6 +69,44 @@ describe("outbox enqueue + FIFO", () => {
     await db.outbox.update(id, { next_attempt_at: 10_000 });
     expect(await peekFifo(db, () => 5_000)).toBeUndefined();
     expect((await peekFifo(db, () => 20_000))?.recordId).toBe("d1");
+  });
+});
+
+describe("requeueInflight (stale-inflight recovery)", () => {
+  let db: PoseDeckDB;
+  beforeEach(async () => {
+    db = freshDb();
+    await db.open();
+  });
+
+  it("resets rows orphaned inflight by a dead runtime back to pending so they re-send", async () => {
+    // Simulate a crash mid-send: an entry left `inflight`, plus a later pending
+    // entry behind it.
+    const stuck = await enqueue(db, {
+      type: "create",
+      entity: "decks",
+      recordId: "d1",
+      payload: {},
+    });
+    await enqueue(db, { type: "create", entity: "decks", recordId: "d2", payload: {} });
+    await markInflight(db, stuck);
+
+    // Before recovery, the orphan is skipped by FIFO peek (never re-attempted).
+    expect((await peekFifo(db))?.recordId).toBe("d2");
+    expect((await db.outbox.get(stuck))!.status).toBe("inflight");
+
+    const reset = await requeueInflight(db);
+    expect(reset).toBe(1);
+
+    // After recovery the orphan is pending again and is the FIFO head once more.
+    expect((await db.outbox.get(stuck))!.status).toBe("pending");
+    expect((await peekFifo(db))?.recordId).toBe("d1");
+  });
+
+  it("is a no-op when nothing is inflight", async () => {
+    await enqueue(db, { type: "create", entity: "decks", recordId: "d1", payload: {} });
+    expect(await requeueInflight(db)).toBe(0);
+    expect((await pending(db))[0].status).toBe("pending");
   });
 });
 

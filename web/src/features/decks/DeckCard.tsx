@@ -32,8 +32,10 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { imageDisplayUrl } from "@/features/images/imageApi";
+import { OfflineImage } from "@/features/offline/OfflineImage";
 import { cn } from "@/lib/utils";
-import type { Deck } from "@/lib/types";
+import type { CardImage, Deck } from "@/lib/types";
 
 /** Format an ISO shoot date for display, or null when unset/unparseable. */
 function formatShootDate(shootDate: string): string | null {
@@ -56,10 +58,14 @@ export interface DeckCardProps {
   deck: Deck;
   /**
    * Auto-thumbnail (DESIGN.md §3.3): the first image of the deck's first card,
-   * resolved to a display URL by the parent. `null`/omitted renders a
-   * placeholder (deck has no cards/images, or the URL is still resolving).
+   * resolved to a `CardImage` record by the parent. The tile renders it through
+   * `<OfflineImage>`, which consults the offline `image_blobs` pin first and
+   * only falls back to a network token URL — so a pinned deck's tile works
+   * offline (DESIGN.md §2.2 / §5), mirroring deck detail / the card editor.
+   * `null`/omitted renders a placeholder (deck has no cards/images, or the
+   * lookup is still resolving).
    */
-  thumbnailUrl?: string | null;
+  thumbnailImage?: CardImage | null;
   /**
    * True while a mutation (duplicate/delete) for this deck is in flight in the
    * parent. The destructive actions are disabled so the user cannot re-fire a
@@ -75,7 +81,7 @@ export interface DeckCardProps {
 
 export function DeckCard({
   deck,
-  thumbnailUrl = null,
+  thumbnailImage = null,
   pending = false,
   onOpen,
   onRename,
@@ -104,12 +110,17 @@ export function DeckCard({
         onClick={() => onOpen(deck)}
         className="block w-full rounded-xl text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
       >
-        {thumbnailUrl ? (
-          <img
-            src={thumbnailUrl}
+        {thumbnailImage ? (
+          <OfflineImage
+            image={thumbnailImage}
+            thumb="400x300"
+            networkUrl={imageDisplayUrl}
             alt=""
             className="aspect-video w-full rounded-t-xl object-cover"
             loading="lazy"
+            fallback={
+              <div className="aspect-video w-full animate-pulse rounded-t-xl bg-muted" />
+            }
           />
         ) : (
           <div className="flex aspect-video w-full items-center justify-center rounded-t-xl bg-muted text-xs text-muted-foreground">

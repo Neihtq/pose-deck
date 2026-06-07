@@ -20,6 +20,10 @@ export default defineConfig({
     environment: "node",
     include: ["src/**/*.integration.{test,spec}.ts"],
     globalSetup: ["./src/integration/globalSetup.ts"],
+    // Runs in the worker fork (globalSetup runs in the main process, so a
+    // global it sets would not reach the fork). Installs the SSE EventSource
+    // polyfill the realtime tests need in the node environment.
+    setupFiles: ["./src/integration/setup.ts"],
     pool: "forks",
     poolOptions: { forks: { singleFork: true } },
     // Spawning a server + many HTTP round-trips can exceed the 5s default.

@@ -155,4 +155,46 @@ describe("RealtimeManager event application", () => {
     expect(onApplied).not.toHaveBeenCalled();
     expect(await db.decks.get("d1")).toBeUndefined(); // echo suppressed
   });
+
+  // Regression (C4): a CONCURRENT remote write that is strictly newer than the
+  // mutation we confirmed must be applied via LWW, not swallowed as our echo,
+  // even when it arrives within the suppression TTL before our own echo.
+  it("does NOT suppress a strictly-newer concurrent remote write within the TTL", async () => {
+    const f = fakeProvider();
+    const rc = new RecentlyConfirmed(5000, () => 0);
+    const onApplied = vi.fn();
+    const rm = new RealtimeManager({
+      db,
+      provider: f.provider,
+      fetchAll: emptyFetch,
+      recentlyConfirmed: rc,
+      onApplied,
+    });
+    await rm.start();
+
+    // Our optimistic local row + the clock we confirmed to the server.
+    const confirmedClock = "2026-06-07T00:00:00.000Z";
+    await db.decks.put(deck({ id: "d1", name: "ours", client_updated_at: confirmedClock }));
+    rc.mark("decks", "d1", confirmedClock);
+
+    // A guest's genuinely-newer edit to the same deck arrives first.
+    f.emit("decks", {
+      action: "update",
+      record: deck({ id: "d1", name: "guest", client_updated_at: "2026-06-07T00:00:05.000Z" }),
+    });
+    await vi.waitFor(async () => {
+      expect((await db.decks.get("d1"))?.name).toBe("guest");
+    });
+    expect(onApplied).toHaveBeenCalledTimes(1);
+
+    // Our own echo (same clock we sent) still lands afterwards and is
+    // suppressed — it must not clobber the newer guest value.
+    f.emit("decks", {
+      action: "update",
+      record: deck({ id: "d1", name: "ours", client_updated_at: confirmedClock }),
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect((await db.decks.get("d1"))?.name).toBe("guest");
+    expect(onApplied).toHaveBeenCalledTimes(1); // echo did not apply
+  });
 });

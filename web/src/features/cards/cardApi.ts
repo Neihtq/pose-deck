@@ -16,6 +16,7 @@
  */
 import { db } from "@/lib/db";
 import { newClientId } from "@/lib/ids";
+import { markRecentlyCreated } from "@/lib/localStore";
 import { enqueueCoalesced } from "@/lib/outbox";
 import { wakeSync } from "@/sync";
 import type { Card, ISODateString } from "@/lib/types";
@@ -82,6 +83,9 @@ export async function createCard(
     updated: stamp,
   };
   await db.cards.put(card);
+  // Protect this optimistic row from a racing hydrate whose server snapshot
+  // predates the create's commit (see markRecentlyCreated).
+  markRecentlyCreated("cards", card.id);
   await enqueueCoalesced(db, {
     type: "create",
     entity: "cards",

@@ -2,11 +2,13 @@ import { expect, test } from "@playwright/test";
 
 import {
   OWNER_PASSWORD,
+  addCard,
   createDeck,
   dateOffset,
   signIn,
   tinyPngBuffer,
   uniqueDeckName,
+  waitForOutboxDrained,
 } from "./helpers";
 
 /**
@@ -147,22 +149,7 @@ test.describe("M1 prep flow", () => {
     // Create three cards with distinct titles.
     const titles = ["Card Alpha", "Card Bravo", "Card Charlie"];
     for (const title of titles) {
-      await page.getByRole("button", { name: /^Add card$/ }).click();
-      await expect(
-        page.getByRole("heading", { name: "Edit card" }),
-      ).toBeVisible();
-      const field = page.getByRole("textbox", { name: /Title/ });
-      // Wait for the async card load to seed the field before overwriting.
-      await expect(field).toHaveValue("Untitled card");
-      await field.fill(title);
-      await page.getByRole("button", { name: "Save" }).click();
-      await expect(
-        page.getByRole("heading", { name: "Edit card" }),
-      ).toBeHidden();
-      // Confirm the saved card appears in the list before adding the next.
-      await expect(
-        page.locator("ul > li").filter({ hasText: title }),
-      ).toHaveCount(1);
+      await addCard(page, title);
     }
 
     const rows = page.locator("ul > li");
@@ -208,6 +195,10 @@ test.describe("M1 prep flow", () => {
 
     // Capture the post-reorder order, then reload and confirm it persisted.
     const orderAfter = await page.locator("ul > li").allInnerTexts();
+    // The reorder writes Dexie optimistically + enqueues outbox updates. Wait
+    // for the queue to drain (mutations confirmed to the live backend) so the
+    // post-reload hydrate sees the new positions, not a stale server snapshot.
+    await waitForOutboxDrained(page);
     await page.reload();
     await expect(page.locator("ul > li")).toHaveCount(3);
     const orderReloaded = await page.locator("ul > li").allInnerTexts();

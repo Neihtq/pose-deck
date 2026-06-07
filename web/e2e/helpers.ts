@@ -59,6 +59,82 @@ export async function createDeck(
   return name;
 }
 
+/**
+ * Add a card to the open deck detail and save it with the given title.
+ *
+ * Robust against the deck-detail re-render churn: the "Add card" button
+ * briefly relabels to "Adding…" while the create is in flight and the card
+ * list re-renders after each save, which can detach the button mid-click. We
+ * wait for the button to be enabled before clicking, wait for the editor to
+ * seed the async-loaded title before overwriting it (so the load doesn't
+ * clobber our input), then confirm the saved row appears in the list before
+ * returning so the caller can safely add the next card.
+ */
+export async function addCard(page: Page, title: string): Promise<void> {
+  const addButton = page.getByRole("button", { name: /^Add card$/ });
+  await expect(addButton).toBeEnabled();
+  await addButton.click();
+
+  await expect(page.getByRole("heading", { name: "Edit card" })).toBeVisible();
+  const field = page.getByRole("textbox", { name: /Title/ });
+  // The editor loads the card async; wait for it to seed the title with the
+  // server value before overwriting so the load doesn't clobber our input.
+  await expect(field).toHaveValue("Untitled card");
+  await field.fill(title);
+  await page.getByRole("button", { name: "Save" }).click();
+
+  // Back on the deck detail: confirm the saved row rendered before continuing.
+  await expect(page.getByRole("heading", { name: "Edit card" })).toBeHidden();
+  await expect(
+    page.locator("ul > li").filter({ hasText: title }),
+  ).toHaveCount(1);
+}
+
+/**
+ * Wait until the Dexie outbox queue is empty — i.e. every queued mutation has
+ * been confirmed to the live backend. Reads the `outbox` table directly via the
+ * raw IndexedDB API in the page context (DB name `pose-deck`, see lib/db.ts).
+ *
+ * The app is local-first: a mutation writes Dexie optimistically and enqueues
+ * an outbox entry that the sync engine drains to PocketBase. Reloading before
+ * the queue drains races the post-reload `hydrateFromServer`, which can read a
+ * server snapshot that predates the un-flushed mutation. Awaiting an empty
+ * outbox makes "persisted across reload" deterministic.
+ */
+export async function waitForOutboxDrained(page: Page): Promise<void> {
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(
+          () =>
+            new Promise<number>((resolve, reject) => {
+              const open = indexedDB.open("pose-deck");
+              open.onerror = () => reject(open.error);
+              open.onsuccess = () => {
+                const dbConn = open.result;
+                if (!dbConn.objectStoreNames.contains("outbox")) {
+                  dbConn.close();
+                  resolve(0);
+                  return;
+                }
+                const tx = dbConn.transaction("outbox", "readonly");
+                const countReq = tx.objectStore("outbox").count();
+                countReq.onerror = () => {
+                  dbConn.close();
+                  reject(countReq.error);
+                };
+                countReq.onsuccess = () => {
+                  dbConn.close();
+                  resolve(countReq.result);
+                };
+              };
+            }),
+        ),
+      { timeout: 30_000, intervals: [100, 250, 500] },
+    )
+    .toBe(0);
+}
+
 /** A YYYY-MM-DD string offset from today by `days` (local time). */
 export function dateOffset(days: number): string {
   const d = new Date();

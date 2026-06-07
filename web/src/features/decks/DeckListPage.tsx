@@ -38,12 +38,11 @@ import {
 import { DeckCard } from "@/features/decks/DeckCard";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { groupDecks, searchDecks } from "@/features/decks/deckGrouping";
-import { imageDisplayUrl } from "@/features/images/imageApi";
 import { db } from "@/lib/db";
 import { liveCardImages, liveCards, liveDecks } from "@/lib/localStore";
 import { useLiveQuery } from "@/lib/useLiveQuery";
 import { cn } from "@/lib/utils";
-import type { Deck } from "@/lib/types";
+import type { CardImage, Deck } from "@/lib/types";
 
 /**
  * Convert an HTML `<input type="date">` value (YYYY-MM-DD) to an ISO string.
@@ -75,8 +74,13 @@ function dateInputToIso(value: string): string {
 interface DeckSectionProps {
   title: string;
   decks: Deck[];
-  /** Map of deck id → resolved auto-thumbnail URL (DESIGN.md §3.3). */
-  thumbnails: Record<string, string | null>;
+  /**
+   * Map of deck id → the deck's auto-thumbnail `CardImage` record (DESIGN.md
+   * §3.3). The tile renders it through `<OfflineImage>` so a pinned deck's
+   * thumbnail resolves from the offline `image_blobs` cache, not just the
+   * network token URL.
+   */
+  thumbnails: Record<string, CardImage | null>;
   /** Id of the deck with an in-flight duplicate/delete mutation, if any. */
   pendingDeckId: string | null;
   onOpen: (deck: Deck) => void;
@@ -111,7 +115,7 @@ function DeckSection({
           <DeckCard
             key={deck.id}
             deck={deck}
-            thumbnailUrl={thumbnails[deck.id] ?? null}
+            thumbnailImage={thumbnails[deck.id] ?? null}
             pending={pendingDeckId === deck.id}
             onOpen={onOpen}
             onRename={onRename}
@@ -126,12 +130,16 @@ function DeckSection({
 
 /**
  * Resolve a deck's auto-thumbnail (DESIGN.md §3.3): the first image of the
- * deck's first (lowest-position) card, as a display URL. Returns `null` when
- * the deck has no cards, the first card has no images, or anything fails — the
- * tile then renders its placeholder. Best-effort and isolated per deck so one
- * failing deck never blocks the others.
+ * deck's first (lowest-position) card, as a `CardImage` record. Returns `null`
+ * when the deck has no cards, the first card has no images, or anything fails —
+ * the tile then renders its placeholder. Best-effort and isolated per deck so
+ * one failing deck never blocks the others.
+ *
+ * We return the record (not a URL) so the tile can render it via
+ * `<OfflineImage>`, which consults the offline `image_blobs` pin first and only
+ * falls back to a network token URL — so a pinned deck's tile works offline.
  */
-async function resolveDeckThumbnail(deckId: string): Promise<string | null> {
+async function resolveDeckThumbnail(deckId: string): Promise<CardImage | null> {
   try {
     const cards = await liveCards(db, deckId);
     const firstCard = cards[0];
@@ -139,11 +147,7 @@ async function resolveDeckThumbnail(deckId: string): Promise<string | null> {
       return null;
     }
     const images = await liveCardImages(db, firstCard.id);
-    const firstImage = images[0];
-    if (!firstImage) {
-      return null;
-    }
-    return await imageDisplayUrl(firstImage, { thumb: "400x300" });
+    return images[0] ?? null;
   } catch {
     return null;
   }
@@ -159,7 +163,7 @@ export default function DeckListPage(): React.JSX.Element {
   const loading = liveDeckRows === undefined;
 
   const [thumbnails, setThumbnails] = React.useState<
-    Record<string, string | null>
+    Record<string, CardImage | null>
   >({});
   const [query, setQuery] = React.useState("");
 
@@ -182,7 +186,10 @@ export default function DeckListPage(): React.JSX.Element {
 
   // Best-effort: resolve each deck's auto-thumbnail (first image of first card,
   // DESIGN.md §3.3) once the decks load. Isolated per deck and cancellable so a
-  // refetch never commits stale URLs.
+  // refetch never commits stale records. We resolve the `CardImage` *record*
+  // (not a URL); the tile renders it via `<OfflineImage>`, which consults the
+  // offline pin first — so a pinned deck's tile works without connectivity and
+  // token refresh is owned in one place (mirrors deck detail / the card editor).
   React.useEffect(() => {
     if (decks.length === 0) {
       setThumbnails({});
@@ -192,7 +199,7 @@ export default function DeckListPage(): React.JSX.Element {
     void (async () => {
       const entries = await Promise.all(
         decks.map(
-          async (deck): Promise<[string, string | null]> => [
+          async (deck): Promise<[string, CardImage | null]> => [
             deck.id,
             await resolveDeckThumbnail(deck.id),
           ],

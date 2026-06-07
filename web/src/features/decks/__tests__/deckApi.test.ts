@@ -152,4 +152,22 @@ describe("duplicateDeck (soft-deleted source guard, finding C2)", () => {
     expect(deckCreates).toHaveLength(1);
     expect(cardCreates).toHaveLength(2);
   });
+
+  it("clamps the copy name to the 200-char DB ceiling (finding spec-dup-name-overflow)", async () => {
+    // A source name at the 200-char ceiling: `<name> (copy)` would be 207 chars
+    // and the server (ARCHITECTURE.md §3.2, max 200) rejects it with a 400.
+    const longName = "x".repeat(200);
+    await db.decks.put({ ...makeDeck("deck1", ""), name: longName });
+
+    const copy = await duplicateDeck("deck1");
+
+    expect(copy.name.length).toBeLessThanOrEqual(200);
+    expect(copy.name.endsWith(" (copy)")).toBe(true);
+
+    // The create payload (what the sync engine sends verbatim) is also clamped.
+    const entries = await db.outbox.where("recordId").equals(copy.id).toArray();
+    const payload = decodeOutboxPayload<{ name: string }>(entries[0]);
+    expect(payload.name.length).toBeLessThanOrEqual(200);
+    expect(payload.name.endsWith(" (copy)")).toBe(true);
+  });
 });

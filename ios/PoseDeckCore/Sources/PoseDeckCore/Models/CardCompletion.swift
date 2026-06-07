@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Mirrors the PocketBase `card_completions` collection (ARCHITECTURE.md §3.6).
 ///
@@ -42,5 +43,33 @@ public struct CardCompletion: Codable, Identifiable, Hashable, Sendable {
         case user
         case state
         case changedAt = "changed_at"
+    }
+
+    /// Derive the stable PocketBase record id for the `(card, user)` pair.
+    ///
+    /// A completion is uniquely keyed by `(card, user)` (composite unique in the
+    /// schema, ARCHITECTURE.md §3.6), so the client can mint the *same* id for the
+    /// same pair on every device and on every replay. That makes the offline
+    /// `.create` idempotent without a server round-trip: a second device (or a
+    /// lost-ack replay) computes the identical id, and PocketBase's composite
+    /// unique constraint collapses the duplicate (``MutationSender`` then issues a
+    /// state PATCH — see `[FIX-C1]`).
+    ///
+    /// The id is the SHA-256 of `"\(card)|\(user)"` mapped through
+    /// ``IDGenerator``'s exact alphabet (`[a-z0-9]`) and length (15), so it is
+    /// indistinguishable from a server-minted id and satisfies `^[a-z0-9]{15}$`.
+    /// We map hash *bytes* into the alphabet rather than emitting hex so the id
+    /// stays within PocketBase's record-id charset (hex would include no letters
+    /// beyond `a–f` but, more importantly, the raw-hex length/shape would not
+    /// match a real id).
+    public static func deterministicId(card: String, user: String) -> String {
+        let digest = SHA256.hash(data: Data("\(card)|\(user)".utf8))
+        let alphabet = IDGenerator.alphabet
+        var out = ""
+        out.reserveCapacity(IDGenerator.idLength)
+        for byte in digest.prefix(IDGenerator.idLength) {
+            out.append(alphabet[Int(byte) % alphabet.count])
+        }
+        return out
     }
 }

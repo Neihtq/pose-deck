@@ -48,6 +48,11 @@ public struct MutationSender: Sendable {
     /// The entry's `payload` is the raw PocketBase record body (already
     /// snake-cased, datetimes in wire format, and for creates carrying the
     /// client-supplied `id`). It is sent verbatim.
+    /// The one collection whose deterministic-id creates carry mutable state, so
+    /// a duplicate-id 400 must trigger a follow-up state PATCH rather than a bare
+    /// success (`[FIX-C1]`).
+    private static let completionsEntity = "card_completions"
+
     public func send(_ entry: OutboxEntry) async -> MutationOutcome {
         do {
             switch entry.type {
@@ -87,6 +92,20 @@ public struct MutationSender: Sendable {
                 return .success
             }
         } catch let APIClientError.httpError(status, body) {
+            // `[FIX-C1]`: a `card_completions` create whose deterministic id
+            // already exists carries a NEW state (the row was first created on
+            // another device / an earlier session). A bare `.success` here would
+            // silently drop that state change, so instead PATCH `{state,
+            // changed_at}` onto the existing record id and report the PATCH's
+            // outcome. Only completions need this; for every other entity a
+            // duplicate-id create is a pure lost-ack replay with no new data, so
+            // the existing bare-success behavior is correct.
+            if status == 400,
+               entry.type == .create,
+               entry.entity == Self.completionsEntity,
+               Self.isDuplicateIdError(body) {
+                return await sendCompletionFollowUpPatch(for: entry)
+            }
             return Self.classify(status: status, body: body, type: entry.type)
         } catch APIClientError.notAuthenticated {
             // No token at all — same remedy as a 401: pause and refresh.
@@ -95,6 +114,57 @@ public struct MutationSender: Sendable {
             // URLSession transport errors (offline, DNS, timeout) surface here.
             return .retry(reason: String(describing: error))
         }
+    }
+
+    /// Follow-up PATCH for a `card_completions` create that hit an existing row
+    /// (`[FIX-C1]`).
+    ///
+    /// Re-uses the create payload's own `id`, `state`, and `changed_at` (the
+    /// create body is a superset of the update body) and PATCHes them onto the
+    /// existing record so the new state is persisted instead of dropped. The
+    /// PATCH carries the same idempotency key; its outcome is classified normally
+    /// (a transient failure stays queued, a clean 2xx removes the entry).
+    private func sendCompletionFollowUpPatch(for entry: OutboxEntry) async -> MutationOutcome {
+        guard let recordId = Self.recordId(in: entry.payload) else {
+            // A create payload with no id can't be reconciled — drop loudly.
+            return .drop(status: 400)
+        }
+        guard let patchBody = Self.completionStatePatchBody(from: entry.payload) else {
+            return .drop(status: 400)
+        }
+        do {
+            _ = try await client.performMutation(
+                method: "PATCH",
+                path: "/api/collections/\(entry.entity)/records/\(recordId)",
+                body: patchBody,
+                idempotencyKey: entry.idempotencyKey
+            )
+            return .success
+        } catch let APIClientError.httpError(status, body) {
+            // Classify as an update — a duplicate-id 400 has no meaning for a
+            // PATCH, so any 400 here drops.
+            return Self.classify(status: status, body: body, type: .update)
+        } catch APIClientError.notAuthenticated {
+            return .authExpired
+        } catch {
+            return .retry(reason: String(describing: error))
+        }
+    }
+
+    /// Build the `{state, changed_at}` PATCH body from a completion create
+    /// payload, preserving the wire-format `changed_at` string verbatim.
+    static func completionStatePatchBody(from payload: Data) -> Data? {
+        guard
+            let root = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+            let state = root["state"]
+        else {
+            return nil
+        }
+        var patch: [String: Any] = ["state": state]
+        if let changedAt = root["changed_at"] {
+            patch["changed_at"] = changedAt
+        }
+        return try? JSONSerialization.data(withJSONObject: patch)
     }
 
     /// Map an HTTP status to an outcome.
@@ -131,19 +201,22 @@ public struct MutationSender: Sendable {
     /// Detect PocketBase's "id already exists" 400 on a create.
     ///
     /// PocketBase shapes validation failures as
-    /// `{"data":{"id":{"code":"validation_...","message":"..."}}}`. We look for
-    /// a `data.id` error specifically so an unrelated 400 (e.g. a bad `name`)
-    /// still drops rather than being mistaken for a successful idempotent replay.
+    /// `{"data":{"id":{"code":"validation_...","message":"..."}}}`. `[FIX-m3]`:
+    /// we require the `data.id.code` to be exactly `"validation_not_unique"` —
+    /// the uniqueness collision — rather than merely the presence of a `data.id`
+    /// error. A *format* error on the id (e.g. `validation_invalid_value` from a
+    /// malformed client id) is a real client bug and must DROP loudly instead of
+    /// masquerading as an idempotent-replay success.
     static func isDuplicateIdError(_ body: Data) -> Bool {
         guard
             let root = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-            let data = root["data"] as? [String: Any]
+            let data = root["data"] as? [String: Any],
+            let idError = data["id"] as? [String: Any],
+            let code = idError["code"] as? String
         else {
             return false
         }
-        // The presence of an `id` field error on a create means the
-        // client-supplied id collided with an existing record.
-        return data["id"] != nil
+        return code == "validation_not_unique"
     }
 
     /// Pull the `id` out of a record payload (for update/delete routing).

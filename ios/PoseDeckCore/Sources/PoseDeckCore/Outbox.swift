@@ -25,6 +25,20 @@ public struct OutboxEntry: Codable, Identifiable, Hashable, Sendable {
     public var idempotencyKey: UUID
     /// Local clock timestamp when the mutation was enqueued.
     public var localTimestamp: Date
+    /// Monotonic enqueue sequence assigned by the queue (`[FIX-C2]`).
+    ///
+    /// `localTimestamp` alone is **not** a total order: an injected (or
+    /// coarse-resolution) clock can stamp a `.create` and a later `.update` of the
+    /// same record with the *identical* instant, and a sort on timestamp alone is
+    /// then free to emit the PATCH before its POST — a guaranteed server reject.
+    /// The queue assigns a strictly-increasing `sequence` at enqueue time, and
+    /// ``pending()`` sorts by `(localTimestamp, sequence)`, so enqueue order is
+    /// the tie-breaker and a create can never trail its own update.
+    ///
+    /// Defaulted so existing call sites (and persisted rows minted before this
+    /// field existed) still compile and decode; the queue overwrites it on
+    /// enqueue.
+    public var sequence: UInt64
     /// Number of failed send attempts so far (drives exponential backoff in §4.2).
     public var retryCount: Int
     /// Last error string, if the most recent send attempt failed.
@@ -37,6 +51,7 @@ public struct OutboxEntry: Codable, Identifiable, Hashable, Sendable {
         payload: Data,
         idempotencyKey: UUID = UUID(),
         localTimestamp: Date = Date(),
+        sequence: UInt64 = 0,
         retryCount: Int = 0,
         lastError: String? = nil
     ) {
@@ -46,8 +61,23 @@ public struct OutboxEntry: Codable, Identifiable, Hashable, Sendable {
         self.payload = payload
         self.idempotencyKey = idempotencyKey
         self.localTimestamp = localTimestamp
+        self.sequence = sequence
         self.retryCount = retryCount
         self.lastError = lastError
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.type = try c.decode(OutboxMutationType.self, forKey: .type)
+        self.entity = try c.decode(String.self, forKey: .entity)
+        self.payload = try c.decode(Data.self, forKey: .payload)
+        self.idempotencyKey = try c.decode(UUID.self, forKey: .idempotencyKey)
+        self.localTimestamp = try c.decode(Date.self, forKey: .localTimestamp)
+        // Default to 0 for rows persisted before `sequence` existed.
+        self.sequence = try c.decodeIfPresent(UInt64.self, forKey: .sequence) ?? 0
+        self.retryCount = try c.decode(Int.self, forKey: .retryCount)
+        self.lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -57,6 +87,7 @@ public struct OutboxEntry: Codable, Identifiable, Hashable, Sendable {
         case payload
         case idempotencyKey = "idempotency_key"
         case localTimestamp = "local_timestamp"
+        case sequence
         case retryCount = "retry_count"
         case lastError = "last_error"
     }
@@ -70,10 +101,15 @@ public struct OutboxEntry: Codable, Identifiable, Hashable, Sendable {
 public protocol OutboxQueue: Sendable {
     /// Append an entry. Idempotent by `idempotencyKey`: enqueuing an entry whose
     /// key already exists is a no-op and returns `false`.
+    ///
+    /// The queue assigns the entry's monotonic `sequence` at enqueue time
+    /// (`[FIX-C2]`), so callers need not (and should not) supply one.
     @discardableResult
     func enqueue(_ entry: OutboxEntry) async -> Bool
 
-    /// All pending entries in FIFO order (oldest `localTimestamp` first).
+    /// All pending entries in total order: `(localTimestamp, sequence)` (`[FIX-C2]`),
+    /// so a `.create` always precedes a later `.update` of the same record even
+    /// under an identical clock.
     func pending() async -> [OutboxEntry]
 
     /// Remove an entry once its mutation has been confirmed by the server (§4.2 step 5).
@@ -90,6 +126,9 @@ public protocol OutboxQueue: Sendable {
 public actor InMemoryOutbox: OutboxQueue {
     private var entries: [OutboxEntry] = []
     private var seenKeys: Set<UUID> = []
+    /// Monotonic counter stamped onto each enqueued entry (`[FIX-C2]`). Never
+    /// reset on `remove`, so a later enqueue always sorts after an earlier one.
+    private var nextSequence: UInt64 = 0
 
     public init() {}
 
@@ -99,12 +138,22 @@ public actor InMemoryOutbox: OutboxQueue {
             return false
         }
         seenKeys.insert(entry.idempotencyKey)
-        entries.append(entry)
+        var stamped = entry
+        stamped.sequence = nextSequence
+        nextSequence += 1
+        entries.append(stamped)
         return true
     }
 
     public func pending() async -> [OutboxEntry] {
-        entries.sorted { $0.localTimestamp < $1.localTimestamp }
+        // Total order: timestamp first, enqueue sequence as the tie-break so a
+        // create can never sort after its own update under an identical clock.
+        entries.sorted {
+            if $0.localTimestamp != $1.localTimestamp {
+                return $0.localTimestamp < $1.localTimestamp
+            }
+            return $0.sequence < $1.sequence
+        }
     }
 
     public func remove(id: UUID) async {

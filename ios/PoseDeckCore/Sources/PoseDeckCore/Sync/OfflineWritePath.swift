@@ -207,6 +207,67 @@ public struct OfflineWritePath: Sendable {
         return enqueued
     }
 
+    // MARK: - Card completions (per-user shoot progress; LWW on changedAt)
+
+    /// Mark a `(card, user)` completion to `state` locally + enqueue.
+    ///
+    /// The record id is **deterministic** (`CardCompletion.deterministicId`), so
+    /// the same `(card, user)` always maps to the same row across devices and
+    /// replays. This makes the first mark an idempotent `.create` and every
+    /// later state flip a `.update` PATCH on the same id.
+    ///
+    /// Create-vs-update branches on whether the row already exists in the local
+    /// mirror (`store.cardCompletion(id:) == nil`). With `[FIX-C1]` the create
+    /// path is safe even when the mirror is wrong about server existence: the
+    /// server's composite-unique constraint rejects the duplicate id and
+    /// ``MutationSender`` issues a follow-up state PATCH rather than dropping the
+    /// change.
+    ///
+    /// The optimistic local write goes through ``LocalStore/applyLocalCardCompletion(_:)``
+    /// (NOT the LWW `upsert`) so a user's own action is never a tie no-op
+    /// (`[FIX-M1]`). Each enqueue gets a fresh `idempotencyKey` — distinct state
+    /// changes must both send; the stable key is the record id, not the outbox key.
+    @discardableResult
+    public func markCardCompletion(
+        cardId: String,
+        userId: String,
+        state: CardCompletion.State
+    ) async throws -> CardCompletion {
+        let id = CardCompletion.deterministicId(card: cardId, user: userId)
+        let stamp = now()
+        let completion = CardCompletion(
+            id: id,
+            card: cardId,
+            user: userId,
+            state: state,
+            changedAt: stamp
+        )
+
+        let exists = await store.cardCompletion(id: id) != nil
+        // `[FIX-M1]`: force-apply the user's own action, bypassing the LWW tie guard.
+        await store.applyLocalCardCompletion(completion)
+
+        let stampString = PocketBaseDate.string(from: stamp)
+        if exists {
+            let body = CardCompletionUpdateWire(
+                id: id,
+                state: state.rawValue,
+                changed_at: stampString
+            )
+            try await enqueue(.update, entity: "card_completions", body: body)
+        } else {
+            let body = CardCompletionUpsertWire(
+                id: id,
+                card: cardId,
+                user: userId,
+                state: state.rawValue,
+                changed_at: stampString
+            )
+            try await enqueue(.create, entity: "card_completions", body: body)
+        }
+        return completion
+    }
+
     // MARK: - Card images (no LWW: insert / hard-delete)
 
     /// Enqueue a hard delete of a card image and remove it from the local mirror
@@ -287,5 +348,19 @@ public struct OfflineWritePath: Sendable {
     }
     struct IdOnlyWire: Encodable, Sendable {
         let id: String
+    }
+    /// Full completion create body (carries the deterministic client id).
+    struct CardCompletionUpsertWire: Encodable, Sendable {
+        let id: String
+        let card: String
+        let user: String
+        let state: String
+        let changed_at: String
+    }
+    /// Completion state-flip PATCH body.
+    struct CardCompletionUpdateWire: Encodable, Sendable {
+        let id: String
+        let state: String
+        let changed_at: String
     }
 }

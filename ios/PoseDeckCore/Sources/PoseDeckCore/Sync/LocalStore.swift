@@ -122,6 +122,22 @@ public protocol LocalStore: Sendable {
     // Card completions
     func upsertCardCompletion(_ completion: CardCompletion) async
     func cardCompletion(id: String) async -> CardCompletion?
+    /// Force-apply a user-originated completion, **bypassing the LWW tie guard**
+    /// (`[FIX-M1]`).
+    ///
+    /// The optimistic local write for a user's own shoot action must always take
+    /// effect — even when `changedAt` exactly equals the existing row's clock
+    /// (e.g. `markDone → clear → markDone` under a constant injected clock). The
+    /// shared ``LWW`` rule *skips* such ties, so routing the user's own action
+    /// through ``upsertCardCompletion(_:)`` would make it a silent no-op. This
+    /// seam unconditionally writes the user action; ``upsertCardCompletion(_:)``
+    /// (LWW) stays the path for *incoming* realtime echoes so an out-of-order
+    /// echo still cannot clobber a newer local row.
+    func applyLocalCardCompletion(_ completion: CardCompletion) async
+    /// All completions whose `card` is in `cardIds` (the deck-scoped read —
+    /// completions hold no deck relation, so the deck scope is expressed via its
+    /// card ids).
+    func cardCompletions(cardIds: [String]) async -> [CardCompletion]
 
     // Deck guests (no LWW; hard delete on revoke)
     func upsertDeckGuest(_ guest: DeckGuest) async
@@ -224,6 +240,17 @@ public actor InMemoryLocalStore: LocalStore {
     }
 
     public func cardCompletion(id: String) async -> CardCompletion? { cardCompletions[id] }
+
+    public func applyLocalCardCompletion(_ completion: CardCompletion) async {
+        // `[FIX-M1]`: a user's own action always wins locally — bypass the LWW
+        // tie guard so an equal-clock re-mark is never a silent no-op.
+        cardCompletions[completion.id] = completion
+    }
+
+    public func cardCompletions(cardIds: [String]) async -> [CardCompletion] {
+        let wanted = Set(cardIds)
+        return cardCompletions.values.filter { wanted.contains($0.card) }
+    }
 
     // MARK: Deck guests (insert / hard-delete on revoke, no LWW)
 

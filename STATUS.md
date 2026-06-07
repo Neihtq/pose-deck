@@ -1,6 +1,6 @@
 # Pose Deck — Build Status & Resume Point
 
-> Living scratchpad for picking up across sessions/reboots. Last updated: 2026-06-06.
+> Living scratchpad for picking up across sessions/reboots. Last updated: 2026-06-07.
 > Authoritative plan: `docs/PROJECT_PLAN.md`. Spec: `docs/DESIGN.md`, `docs/ARCHITECTURE.md`.
 
 ## Where we are
@@ -8,13 +8,40 @@
 | Milestone | Status |
 |---|---|
 | **M0** — backend foundation | ✅ done (PocketBase, 6 collections, migrations, seed, compose) |
-| **M1** — web prep MVP | ✅ done + gauntlet passed (auth, deck/card CRUD, images, dnd reorder, dark mode, inline card delete) |
-| **M2** — iOS prep MVP | ✅ **DONE + simulator-verified** — 14 XCUITests green on iPhone 16 Pro against live PocketBase |
-| **M3** — sync layer (outbox + realtime + offline) | 🟡 in progress — web sync DONE + gauntlet PASSED (242 tests, 4 layers, 9 adversarial fixes); iOS core DONE (225 tests); iOS app wiring (step 10) + iOS gauntlet next |
-| M4 shoot mode (iOS) · M5 sharing · M6 PDF · M7 SideStore · M8 polish | ⬜ pending |
+| **M1** — web prep MVP | ✅ done + gauntlet passed |
+| **M2** — iOS prep MVP | ✅ **DONE + simulator-verified** — 14 XCUITests green on iPhone 16 Pro |
+| **M3** — sync layer (outbox + realtime + offline) | ✅ **DONE + both gauntlets passed + sim-verified** — web 242 tests/4 layers/9 fixes; iOS core 290 tests; iOS app 12 fixes; SwiftData crash found+fixed by re-running the 14 XCUITests (all green) |
+| **M4** — iOS shoot mode | ⬜ next |
+| M5 sharing · M6 PDF · M7 SideStore · M8 polish | ⬜ pending |
 
 Working tree clean, all on `main`, nothing pushed (push only when asked).
-Latest commit: `4fca45c M2 gauntlet: 13 adversarial fixes + test layers`.
+Latest commit: `4b77882 M3 iOS: fix SwiftData @Model crash + verify on sim`.
+
+## M3 sync — what shipped (done 2026-06-07)
+Local-first outbox + realtime + offline, both clients (ARCHITECTURE.md §4).
+Vetted design + folded adversarial fixes in `docs/plans/M3-sync-implementation-plan.md`.
+- **Web** (`web/src/lib/{ids,outbox,serverEntities,syncEngine,localStore}.ts`,
+  `web/src/sync/`, `web/src/features/offline/`): client-supplied PB ids
+  (idempotent create), Dexie outbox FIFO + backoff, realtime LWW merge,
+  service-worker shell + Dexie offline pin. Reads via dexie-react-hooks
+  useLiveQuery. All 4 test layers green.
+- **iOS core** (`PoseDeckCore/Sources/PoseDeckCore/Sync/`): OutboxProcessor
+  (no in-actor sleep), MutationSender, SSE RealtimeClient, SyncEngine (LWW +
+  self-echo), OfflineWritePath, PrecachePlan. swift test 290.
+- **iOS app** (`PoseDeck/Sources/Sync/`): SwiftData @Model mirror,
+  SwiftDataOutbox, MirrorRepositories, SyncCoordinator, PrecacheService,
+  BackgroundRefresh, MirrorChangeTicker (reactive re-query). Compile + the 14
+  XCUITests verify it at runtime.
+- **Key lesson**: compile-only ≠ runtime. A SwiftData `@Model` named its field
+  `entity` (collides with NSManagedObject.entity) → decode SIGABRT only at
+  runtime. Caught by re-running the M2 XCUITest suite against the M3 app.
+  ALWAYS run the XCUITests after iOS app-layer changes now that the sim works.
+- **Deferred to M4/M5**: deck_guests + card_completions realtime *consumption*
+  (events flow into the store; no UI wiring yet). Offline image *upload*
+  queueing (uploads still need network; deletes are queued).
+- **On-device still dev-verified** (sim can't do): BGAppRefresh firing, real
+  airplane-mode persist-across-relaunch, SSE-over-wire propagation, photo
+  picker feel. See the iOS gauntlet report §4 for the full device checklist.
 
 ## ✅ Simulator fixed + M2 verified
 

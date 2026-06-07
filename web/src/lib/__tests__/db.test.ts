@@ -1,3 +1,4 @@
+import Dexie from "dexie";
 import { describe, expect, it } from "vitest";
 
 import { PoseDeckDB } from "../db";
@@ -12,9 +13,11 @@ describe("PoseDeckDB schema", () => {
       const tableNames = db.tables.map((t) => t.name).sort();
       expect(tableNames).toEqual(
         [
+          "_meta",
           "card_completions",
           "card_images",
           "cards",
+          "deck_guests",
           "decks",
           "outbox",
         ].sort(),
@@ -62,6 +65,62 @@ describe("PoseDeckDB schema", () => {
       const entries = await db.outbox.orderBy("id").toArray();
       expect(entries).toHaveLength(1);
       expect(entries[0].entity).toBe("decks");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("exposes deck_guests and _meta tables (v2) and round-trips them", async () => {
+    const db = new PoseDeckDB(`test-${crypto.randomUUID()}`);
+    await db.open();
+    try {
+      await db.deck_guests.put({
+        id: "g1",
+        deck: "d1",
+        user: "u2",
+        granted_at: "2026-06-07T00:00:00.000Z",
+      });
+      expect((await db.deck_guests.get("g1"))?.user).toBe("u2");
+
+      await db._meta.put({ key: "cursor:decks", value: "2026-06-07" });
+      expect((await db._meta.get("cursor:decks"))?.value).toBe("2026-06-07");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("preserves v1 outbox rows across the v2 upgrade", async () => {
+    const name = `test-${crypto.randomUUID()}`;
+    // Open at v1 by constructing a throwaway Dexie with only the v1 schema.
+    const v1 = new Dexie(name);
+    v1.version(1).stores({
+      decks: "id, owner, shoot_date, deleted_at, client_updated_at",
+      cards: "id, deck, position, deleted_at, client_updated_at",
+      card_images: "id, card, position",
+      card_completions: "id, card, user, state, [card+user]",
+      outbox: "++id, entity, recordId, idempotency_key",
+    });
+    await v1.open();
+    await v1.table("outbox").add({
+      type: "create",
+      entity: "decks",
+      recordId: "legacy-1",
+      payload: "{}",
+      idempotency_key: crypto.randomUUID(),
+      local_timestamp: new Date().toISOString(),
+      retry_count: 0,
+    });
+    v1.close();
+
+    // Reopen with the full (v2) schema and confirm the legacy row survived.
+    const db = new PoseDeckDB(name);
+    await db.open();
+    try {
+      const rows = await db.outbox.orderBy("id").toArray();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].recordId).toBe("legacy-1");
+      // v1 rows have no `status`; the queue treats absent status as pending.
+      expect(rows[0].status).toBeUndefined();
     } finally {
       db.close();
     }

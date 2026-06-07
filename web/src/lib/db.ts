@@ -10,10 +10,17 @@
  */
 import Dexie, { type EntityTable } from "dexie";
 
-import type { Card, CardCompletion, CardImage, Deck } from "./types";
+import type { Card, CardCompletion, CardImage, Deck, DeckGuest } from "./types";
 
 /** Kind of mutation queued in the outbox. */
 export type OutboxOperation = "create" | "update" | "delete";
+
+/**
+ * Processing state of an outbox entry, used by the FIFO drain loop.
+ *  - `pending`: eligible to send once `next_attempt_at` has passed.
+ *  - `inflight`: a send is in progress (single-flight guard).
+ */
+export type OutboxStatus = "pending" | "inflight";
 
 /** Entity (collection) a queued mutation targets. */
 export type OutboxEntity =
@@ -49,6 +56,25 @@ export interface OutboxEntry {
   retry_count: number;
   /** Last error message, if a send attempt failed. */
   last_error?: string;
+  /** Processing state (FIFO drain). Absent on v1 rows → treated as `pending`. */
+  status?: OutboxStatus;
+  /**
+   * Earliest time (ms epoch) this entry may be (re)attempted. Set when a
+   * transient failure schedules a backoff retry; `undefined`/0 = send now.
+   */
+  next_attempt_at?: number;
+}
+
+/**
+ * A small key/value table for sync bookkeeping (e.g. per-collection resync
+ * cursors). Kept generic so the realtime layer can stash cursors without
+ * another schema bump.
+ */
+export interface SyncMeta {
+  /** Meta key, e.g. `"cursor:decks"`. */
+  key: string;
+  /** Opaque JSON-serializable value. */
+  value: string;
 }
 
 /** The app's Dexie database with typed tables. */
@@ -57,7 +83,9 @@ export class PoseDeckDB extends Dexie {
   cards!: EntityTable<Card, "id">;
   card_images!: EntityTable<CardImage, "id">;
   card_completions!: EntityTable<CardCompletion, "id">;
+  deck_guests!: EntityTable<DeckGuest, "id">;
   outbox!: EntityTable<OutboxEntry, "id">;
+  _meta!: EntityTable<SyncMeta, "key">;
 
   constructor(name = "pose-deck") {
     super(name);
@@ -69,6 +97,16 @@ export class PoseDeckDB extends Dexie {
       card_completions: "id, card, user, state, [card+user]",
       // Auto-increment PK for FIFO processing; index entity + idempotency_key.
       outbox: "++id, entity, recordId, idempotency_key",
+    });
+    // v2 (M3 sync): the FIFO drain needs to query the queue by status and
+    // backoff time, so index those. Add `deck_guests` (mirrored for sharing /
+    // realtime) and a `_meta` cursor table. `card_images` is intentionally NOT
+    // re-indexed on `updated` — that field does not exist on the collection
+    // (ARCHITECTURE.md §3.4); images use insert/hard-delete, not LWW.
+    this.version(2).stores({
+      deck_guests: "id, deck, user, granted_at",
+      outbox: "++id, status, next_attempt_at, entity, recordId, idempotency_key",
+      _meta: "key",
     });
   }
 }

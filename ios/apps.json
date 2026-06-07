@@ -1,0 +1,23 @@
+{
+  "_comment_fill_in": "PLACEHOLDERS a human must replace before this source works: every <OWNER> and <REPO> token below = your GitHub owner/org and repository name (e.g. owner 'qthienng', repo 'pose-deck'). The iconURL must point at a real PNG (see ios/SIDESTORE.md). The CI job `update-apps-json` in .github/workflows/ios.yml rewrites version/versionDate/downloadURL/size from the latest GitHub Release on each tagged build, so those start as placeholders too. JSON has no comments — this underscore-prefixed key is ignored by AltStore/SideStore.",
+  "name": "Pose Deck",
+  "identifier": "dev.posedeck.source",
+  "sourceURL": "https://github.com/<OWNER>/<REPO>/releases/latest/download/apps.json",
+  "apps": [
+    {
+      "name": "Pose Deck",
+      "bundleIdentifier": "dev.posedeck.app",
+      "developerName": "Pose Deck",
+      "version": "0.1.0",
+      "versionDate": "2026-01-01",
+      "versionDescription": "Initial SideStore distribution build.",
+      "downloadURL": "https://github.com/<OWNER>/<REPO>/releases/download/v0.1.0/PoseDeck.ipa",
+      "localizedDescription": "Pose Deck is a private posing-reference deck app: build decks of pose cards with reference images, then run a swipe-driven shoot mode on device. Distributed via SideStore (no App Store / Apple Developer account required).",
+      "iconURL": "https://github.com/<OWNER>/<REPO>/raw/main/ios/PoseDeck/icon.png",
+      "tintColor": "1f1f24",
+      "size": 0,
+      "permissions": []
+    }
+  ],
+  "news": []
+}

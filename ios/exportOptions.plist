@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  exportOptions.plist — UNSIGNED IPA export for the SideStore / AltStore model.
+
+  Pose Deck is distributed via SideStore, which re-signs the app *on device*
+  using a free Apple ID + a self-hosted Anisette server (ARCHITECTURE.md §9/§10,
+  PROJECT_PLAN.md M7). The CI artifact is therefore intentionally UNSIGNED: there
+  is no Apple Developer team, no provisioning profile, and no signing identity on
+  the GitHub macOS runner.
+
+  How this is used (see .github/workflows/ios.yml, job `archive-ipa`):
+    1. `xcodebuild archive ... CODE_SIGNING_ALLOWED=NO` produces an unsigned
+       .xcarchive (the app binary is built but not codesigned).
+    2. The workflow PREFERS the manual Payload/ zip approach to turn that archive
+       into PoseDeck.ipa, because `xcodebuild -exportArchive` frequently refuses
+       to export when there is no signing identity / team. This plist exists as
+       the *documented fallback* path for `-exportArchive` and to make the intent
+       explicit; if a future Xcode tolerates an unsigned `development` export it
+       will be used with `CODE_SIGNING_ALLOWED=NO`.
+
+  Keys:
+    method            development — closest to the "sideload to my own devices"
+                      intent. (ad-hoc also works; both are fine because the
+                      artifact is re-signed on device anyway.)
+    signingStyle      manual — do NOT let Xcode try automatic signing (it would
+                      reach for an Apple ID / team that does not exist in CI).
+    teamID            empty — no Apple Developer team. Leave blank.
+    stripSwiftSymbols false — keep symbols; SideStore/AltStore handle the rest.
+    compileBitcode    false — bitcode is deprecated; never enabled here.
+    destination       export — write the .ipa to disk (not upload).
+-->
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>development</string>
+    <key>signingStyle</key>
+    <string>manual</string>
+    <key>teamID</key>
+    <string></string>
+    <key>stripSwiftSymbols</key>
+    <false/>
+    <key>compileBitcode</key>
+    <false/>
+    <key>destination</key>
+    <string>export</string>
+</dict>
+</plist>

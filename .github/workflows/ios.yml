@@ -1,14 +1,18 @@
-# iOS CI — STUB.
+# iOS CI — test the logic core, then archive an UNSIGNED IPA for SideStore.
 #
-# Implements ARCHITECTURE.md §10 (iOS) only partially for now. Today this builds
-# and tests the pure-logic Swift Package (PoseDeckCore) on a macOS runner — the
-# part the agent (and CI) can fully verify without a device or signing.
+# Implements ARCHITECTURE.md §10 (iOS) + PROJECT_PLAN.md M7:
+#   core-tests : build + test PoseDeckCore (the pure-logic Swift Package) — the
+#                part CI can fully verify without a device or signing.
+#   archive-ipa: xcodebuild archive (unsigned) -> PoseDeck.ipa -> workflow
+#                artifact (+ GitHub Release + apps.json AltStore source on tags).
 #
-# TODO: once the Xcode app target (ios/PoseDeck/PoseDeck.xcodeproj) exists, add a
-# job that runs `xcodebuild archive` + `xcodebuild -exportArchive` to produce an
-# unsigned .ipa, then uploads it to a GitHub Release / AltStore source manifest
-# (ARCHITECTURE.md §10 steps 2-4, PROJECT_PLAN.md M7). The app target is not built
-# here yet because the simulator/signing flow is device/dev-only.
+# WHY UNSIGNED: Pose Deck ships via SideStore, which re-signs on device with a
+# free Apple ID + self-hosted Anisette (ios/SIDESTORE.md). There is no Apple
+# Developer team, so the CI artifact is intentionally unsigned (the device signs
+# it). The archive runs with CODE_SIGNING_ALLOWED=NO.
+#
+# The .xcodeproj is gitignored; project.yml is the source of truth, so CI runs
+# `xcodegen generate` first.
 name: ios
 
 on:
@@ -17,7 +21,12 @@ on:
     paths:
       - 'ios/**'
       - '.github/workflows/ios.yml'
+    tags:
+      - 'v*'
   workflow_dispatch:
+
+permissions:
+  contents: write   # archive-ipa creates/updates a GitHub Release on tags
 
 jobs:
   core-tests:
@@ -39,3 +48,122 @@ jobs:
 
       - name: Test
         run: swift test
+
+  archive-ipa:
+    name: Archive unsigned IPA
+    runs-on: macos-15
+    needs: core-tests
+    # Run on pushes to main, on version tags, and on manual dispatch. (Skips on
+    # any other ref, e.g. a tag that isn't v*.)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/v')
+
+    env:
+      WORKDIR: ios/PoseDeck
+      SCHEME: PoseDeck
+      CONFIGURATION: Release
+      ARCHIVE_PATH: ${{ github.workspace }}/build/PoseDeck.xcarchive
+      EXPORT_DIR: ${{ github.workspace }}/build/export
+      IPA_PATH: ${{ github.workspace }}/build/export/PoseDeck.ipa
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios/PoseDeck
+        run: xcodegen generate
+
+      # Build an UNSIGNED archive. CODE_SIGNING_ALLOWED=NO skips the signing
+      # phase entirely so no team / provisioning profile is needed.
+      - name: Archive (unsigned)
+        working-directory: ios/PoseDeck
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project PoseDeck.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | xcbeautify || true
+          # xcbeautify may not be installed; the real gate is the archive existing.
+          test -d "$ARCHIVE_PATH" || { echo "::error::archive not produced"; exit 1; }
+
+      # Turn the archive into an .ipa. We PREFER the manual Payload/ zip approach
+      # because `xcodebuild -exportArchive` routinely refuses to export with no
+      # signing identity. The -exportArchive path is kept as a documented
+      # fallback (see ios/exportOptions.plist) and tried first; if it fails to
+      # yield an .ipa we fall back to zipping the .app into Payload/.
+      - name: Export unsigned IPA
+        run: |
+          set -euo pipefail
+          mkdir -p "$EXPORT_DIR"
+
+          echo "Attempt 1: xcodebuild -exportArchive (fallback path, often refuses unsigned)"
+          if xcodebuild -exportArchive \
+              -archivePath "$ARCHIVE_PATH" \
+              -exportOptionsPlist ios/exportOptions.plist \
+              -exportPath "$EXPORT_DIR" \
+              CODE_SIGNING_ALLOWED=NO 2>/dev/null; then
+            found="$(find "$EXPORT_DIR" -maxdepth 1 -name '*.ipa' | head -n1 || true)"
+            if [ -n "$found" ]; then
+              [ "$found" = "$IPA_PATH" ] || mv "$found" "$IPA_PATH"
+            fi
+          fi
+
+          if [ ! -f "$IPA_PATH" ]; then
+            echo "Attempt 2: manual Payload/ zip from the .xcarchive"
+            app="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -name '*.app' | head -n1)"
+            test -n "$app" || { echo "::error::no .app in archive"; exit 1; }
+            staging="$(mktemp -d)"
+            mkdir -p "$staging/Payload"
+            cp -R "$app" "$staging/Payload/"
+            ( cd "$staging" && zip -qry "$IPA_PATH" Payload )
+            rm -rf "$staging"
+          fi
+
+          test -f "$IPA_PATH" || { echo "::error::IPA not produced"; exit 1; }
+          ls -lh "$IPA_PATH"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PoseDeck-ipa
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+
+      # --- Release-only steps (version tags) -------------------------------
+      # On a v* tag, regenerate apps.json from the built IPA and attach both the
+      # IPA and the AltStore source manifest to the GitHub Release.
+      - name: Regenerate apps.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"   # v0.1.0 -> 0.1.0
+          IPA_PATH="$IPA_PATH" VERSION="$version" bash ios/update-apps-json.sh
+          cp ios/apps.json "$EXPORT_DIR/apps.json"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.IPA_PATH }}
+            ${{ env.EXPORT_DIR }}/apps.json
+          fail_on_unmatched_files: true

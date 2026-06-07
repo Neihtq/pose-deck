@@ -95,7 +95,7 @@ Verify backend up: `curl -s http://127.0.0.1:8090/api/health`
 
 ### Credentials
 - App users (web + iOS): `owner@posedeck.test` / `changeme123`, `guest@posedeck.test` / `changeme123`
-- PocketBase admin (http://127.0.0.1:8090/_/): `q.thien.nguyen@outlook.de` / `AsdfgHjkl95!`
+- PocketBase admin (http://127.0.0.1:8090/_/): `<dev-admin-email>` / `<dev-admin-pw>` (set when you bootstrap the local PocketBase instance; not committed)
 
 ## How we work (process — see also memory files)
 

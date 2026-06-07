@@ -41,11 +41,14 @@ struct DeckEditorSheet: View {
                 Section("Name") {
                     TextField("Deck name", text: $name)
                         .textInputAutocapitalization(.words)
+                        .accessibilityIdentifier("deckEditor.name")
                 }
                 Section("Shoot date") {
                     Toggle("Has a shoot date", isOn: $hasDate.animation())
+                        .accessibilityIdentifier("deckEditor.hasDate")
                     if hasDate {
                         DatePicker("Date", selection: $date, displayedComponents: .date)
+                            .accessibilityIdentifier("deckEditor.datePicker")
                     }
                 }
             }
@@ -54,12 +57,14 @@ struct DeckEditorSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel", action: onCancel)
+                        .accessibilityIdentifier("deckEditor.cancel")
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(saveLabel) {
                         onSave(trimmedName, hasDate ? date : nil)
                     }
                     .disabled(trimmedName.isEmpty)
+                    .accessibilityIdentifier("deckEditor.save")
                 }
             }
         }

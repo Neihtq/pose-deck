@@ -9,41 +9,42 @@
 |---|---|
 | **M0** — backend foundation | ✅ done (PocketBase, 6 collections, migrations, seed, compose) |
 | **M1** — web prep MVP | ✅ done + gauntlet passed (auth, deck/card CRUD, images, dnd reorder, dark mode, inline card delete) |
-| **M2** — iOS prep MVP | ✅ **build + gauntlet passed (compile-verified)** — ⚠️ NOT yet run on device/simulator |
+| **M2** — iOS prep MVP | ✅ **DONE + simulator-verified** — 14 XCUITests green on iPhone 16 Pro against live PocketBase |
 | **M3** — sync layer (outbox + realtime + offline) | ⬜ next |
 | M4 shoot mode (iOS) · M5 sharing · M6 PDF · M7 SideStore · M8 polish | ⬜ pending |
 
 Working tree clean, all on `main`, nothing pushed (push only when asked).
 Latest commit: `4fca45c M2 gauntlet: 13 adversarial fixes + test layers`.
 
-## ⏸️ Why we stopped: simulator reboot
+## ✅ Simulator fixed + M2 verified
 
-The iOS Simulator runtime is wedged (`liblaunch_sim.dylib could not be opened`). The
-runtime IS mounted and the dylib IS on disk; the `CoreSimulatorService` XPC layer is
-stuck. `-runFirstLaunch` + `killall` did not clear it. **A full reboot is the remaining
-fix.** User is rebooting.
+The simulator XPC wedge cleared after the reboot. M2 on-device verification is now an
+**automated XCUITest suite** (`ios/PoseDeck/UITests/`), not a manual checklist:
 
-### → FIRST THING after reboot
-1. Verify the simulator boots:
-   ```
-   xcrun simctl boot "iPhone 16 Pro" && xcrun simctl list devices | grep "iPhone 16 Pro"
-   ```
-   If still `unavailable`, run `sudo xcodebuild -runFirstLaunch` then retry boot.
-2. If it boots → **run the M2 app and do the on-device verification below** (this is the
-   main unfinished M2 task), then M2 is fully done.
-3. If it still won't boot → proceed to M3; iOS stays compile-only (acceptable, documented).
+- **14 UITests green** on iPhone 16 Pro against the live PocketBase dev backend.
+- Run with `ios/PoseDeck/run-uitests.sh` (whole suite) or `run-uitests.sh AuthUITests`
+  (one class). It handles the signing/keyboard/photo-seed setup automatically.
+- Coverage: sign-in + session persistence + sign-out (`AuthUITests`); deck
+  create/grouping/search/rename/duplicate/delete→trash→restore (`DeckListUITests`);
+  card add/title-60-cap/swipe-delete/drag-reorder-persists (`CardUITests`); image
+  pick→compress→upload→thumbnail (`ImageUploadUITests`).
 
-## M2 on-device checklist (👤 — the only thing left for M2)
+### Hard-won gotchas baked into the suite/script (read before touching UITests)
+1. **Ad-hoc signing is required.** `CODE_SIGNING_ALLOWED=NO` strips entitlements, so
+   Keychain writes fail with `errSecMissingEntitlement (-34018)` and sign-in silently
+   fails. We added `Config/PoseDeck.entitlements` (keychain-access-group) and build/run
+   with `CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES`.
+2. **Unlink the Simulator hardware keyboard** (`defaults write com.apple.iphonesimulator
+   ConnectHardwareKeyboard -bool false` + reboot) or `typeText` hangs forever.
+3. **Search-scope row lookups.** The grouped List is lazy — off-screen cells aren't in
+   the AX tree. Helpers create/find decks via the search field so the row is on-screen.
+4. **Toggle taps need the trailing edge**; full-row tap hits the label. Reorder needs
+   `press(forDuration:thenDragTo:withVelocity:.slow,thenHoldForDuration:)`.
+5. `-uitest-reset` launch arg clears the keychain session for a clean start.
 
-Build: `cd ios/PoseDeck && xcodegen generate && open PoseDeck.xcodeproj`
-(`.xcodeproj` is gitignored — regenerate with xcodegen.)
-Sign in with `owner@posedeck.test` / `changeme123` (backend must be running — see below).
-
-- [ ] Sign in; session persists across relaunch (Keychain)
-- [ ] Deck list: grouping (Upcoming/Undated/Past), search, create, rename, duplicate, delete→trash→restore
-- [ ] Deck detail: drag-to-reorder persists; swipe-to-delete a card inline (no need to open it)
-- [ ] Card editor: title ≤60 counter, all fields save
-- [ ] Images: PhotosPicker → compress (1080/q80) → upload → thumbnail renders; 5-image cap
+Dev DB note: a cleanup pass deleted 36 accumulated test-fixture decks; only the
+"Sample Shoot (dev seed)" deck remains. Tests self-clean (trash their decks) but the
+shared dev DB can still drift — re-clean if row-not-found flakiness returns.
 
 ## Restart the dev environment (these processes die on reboot)
 

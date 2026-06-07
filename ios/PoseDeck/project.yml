@@ -55,6 +55,10 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_EMIT_LOC_STRINGS: true
         ENABLE_USER_SCRIPT_SANDBOXING: true
+        # Keychain-access-group entitlement so the persisted auth session works
+        # on an ad-hoc-signed simulator build (UI tests). See the entitlements
+        # file for the errSecMissingEntitlement (-34018) rationale.
+        CODE_SIGN_ENTITLEMENTS: Config/PoseDeck.entitlements
     dependencies:
       - package: PoseDeckCore
         product: PoseDeckCore
@@ -72,15 +76,35 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.posedeck.app.tests
         GENERATE_INFOPLIST_FILE: true
 
+  # UI tests drive the running app through XCUITest. These are the M2
+  # on-device verification suite (sign-in, deck/card CRUD, reorder, images)
+  # — runnable now that the simulator works. Needs the PocketBase dev backend
+  # up (see STATUS.md) since the app talks to a live server.
+  PoseDeckUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: UITests
+    dependencies:
+      - target: PoseDeck
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.posedeck.app.uitests
+        GENERATE_INFOPLIST_FILE: true
+        TEST_TARGET_NAME: PoseDeck
+
 schemes:
   PoseDeck:
     build:
       targets:
         PoseDeck: all
         PoseDeckTests: [test]
+        PoseDeckUITests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
         - PoseDeckTests
+        - PoseDeckUITests

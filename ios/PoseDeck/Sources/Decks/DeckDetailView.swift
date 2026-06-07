@@ -95,6 +95,7 @@ struct DeckDetailView: View {
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) {
             EditButton()
+                .accessibilityIdentifier("deck.editButton")
         }
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
@@ -144,6 +145,7 @@ struct DeckDetailView: View {
             } actions: {
                 Button("Add Card") { cardRoute = .new }
                     .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("deck.addCard.empty")
             }
         } else {
             List {
@@ -157,6 +159,7 @@ struct DeckDetailView: View {
                             )
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("card.row.\(card.title)")
                     }
                     .onDelete { offsets in
                         Task { await model.deleteCard(at: offsets) }
@@ -173,6 +176,7 @@ struct DeckDetailView: View {
                     Button { cardRoute = .new } label: {
                         Label("Add Card", systemImage: "plus")
                     }
+                    .accessibilityIdentifier("deck.addCard")
                 }
             }
             .listStyle(.insetGrouped)

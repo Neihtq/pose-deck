@@ -119,6 +119,7 @@ struct DeckListView: View {
             } label: {
                 Label("Trash", systemImage: "trash")
             }
+            .accessibilityIdentifier("decks.trash")
         }
         if let onSignOut {
             ToolbarItem(placement: .topBarLeading) {
@@ -127,6 +128,7 @@ struct DeckListView: View {
                 } label: {
                     Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
                 }
+                .accessibilityIdentifier("decks.signOut")
             }
         }
         ToolbarItem(placement: .topBarTrailing) {
@@ -135,6 +137,7 @@ struct DeckListView: View {
             } label: {
                 Label("New Deck", systemImage: "plus")
             }
+            .accessibilityIdentifier("decks.new")
         }
     }
 
@@ -200,6 +203,7 @@ struct DeckListView: View {
                     NavigationLink(value: deck) {
                         DeckRow(deck: deck)
                     }
+                    .accessibilityIdentifier("deck.row.\(deck.name)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button(role: .destructive) {
                             deckPendingDelete = deck

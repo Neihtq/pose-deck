@@ -194,6 +194,7 @@ struct CardImagesSection: View {
         HStack {
             Text("Images (\(model.images.count)/\(model.maxImagesPerCard))")
                 .font(.headline)
+                .accessibilityIdentifier("cardImages.count")
             Spacer()
             if model.atImageLimit {
                 Text("Max reached")
@@ -264,6 +265,7 @@ struct CardImagesSection: View {
             }
             .disabled(model.atImageLimit || model.isUploading)
             .buttonStyle(.bordered)
+            .accessibilityIdentifier("cardImages.add")
 
             if model.isUploading {
                 ProgressView()

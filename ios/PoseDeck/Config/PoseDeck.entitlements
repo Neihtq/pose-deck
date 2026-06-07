@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Keychain access group for the persisted auth session (token + user).
+	  Without an explicit group, an app must rely on the application-identifier
+	  entitlement, which an unsigned simulator build (CODE_SIGNING_ALLOWED=NO)
+	  lacks — Keychain SecItem calls then fail with errSecMissingEntitlement
+	  (-34018). Declaring a group lets the app reach the Keychain when ad-hoc
+	  signed for the simulator (UI tests) and is harmless on a provisioned
+	  device. The group name is the bundle id; on device the team prefix is
+	  added automatically by codesign.
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>dev.posedeck.app</string>
+	</array>
+</dict>
+</plist>

@@ -187,6 +187,7 @@ struct CardEditorView: View {
                     Task { await handleSave() }
                 }
                 .disabled(!model.canSave)
+                .accessibilityIdentifier("cardEditor.save")
             }
         }
         .task { await model.load() }
@@ -224,6 +225,7 @@ struct CardEditorView: View {
             VStack(alignment: .leading, spacing: 4) {
                 TextField("Title", text: $model.title)
                     .textInputAutocapitalization(.sentences)
+                    .accessibilityIdentifier("cardEditor.title")
                 HStack {
                     if model.titleTooLong {
                         Text("Title must be \(CardEditorViewModel.titleMax) characters or fewer.")
@@ -234,11 +236,15 @@ struct CardEditorView: View {
                     Text("\(model.title.count)/\(CardEditorViewModel.titleMax)")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(model.titleTooLong ? .red : .secondary)
+                        .accessibilityIdentifier("cardEditor.titleCounter")
                 }
             }
             TextField("Time / slot", text: $model.timeSlot)
+                .accessibilityIdentifier("cardEditor.timeSlot")
             TextField("Subjects / names", text: $model.subjects)
+                .accessibilityIdentifier("cardEditor.subjects")
             TextField("Direction", text: $model.direction)
+                .accessibilityIdentifier("cardEditor.direction")
         } header: {
             Text("Card")
         } footer: {

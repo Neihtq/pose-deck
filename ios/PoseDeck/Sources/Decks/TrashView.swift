@@ -68,6 +68,7 @@ struct TrashView: View {
                             Spacer()
                             Button("Restore") { Task { await model.restore(deck) } }
                                 .buttonStyle(.bordered)
+                                .accessibilityIdentifier("trash.restore.\(deck.name)")
                         }
                     }
                 }

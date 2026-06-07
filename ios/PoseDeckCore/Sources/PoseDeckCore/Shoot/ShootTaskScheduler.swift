@@ -50,6 +50,16 @@ public final class ShootTaskScheduler {
         let token = nextToken
         nextToken += 1
         let task = Task { @MainActor [weak self] in
+            // `[GAUNTLET-3]` Honour cancellation BEFORE running the side effect.
+            // `Task.cancel()` is cooperative: it only flags a not-yet-started task,
+            // it does NOT prevent its body from running. So a `cancelAll()` that
+            // raced ahead of this task starting (e.g. `reshoot()` cancelling a
+            // queued `markDone`/`markSkipped` persist before its scoped completion
+            // reset) would otherwise still fire the write — re-stranding the card
+            // as done/skipped *after* the reset wrote pending. The explicit check
+            // makes the scheduler's "cancelAll tears down in-flight work" contract
+            // actually hold for a write whose body is otherwise suspension-free.
+            guard !Task.isCancelled else { self?.persistTasks[token] = nil; return }
             await work()
             self?.persistTasks[token] = nil
         }

@@ -1,4 +1,5 @@
 import XCTest
+import SwiftData
 import PoseDeckCore
 @testable import PoseDeck
 
@@ -111,5 +112,198 @@ final class ShootModeReshootTests: XCTestCase {
         await model.load()                   // must not re-seed the old done state
         XCTAssertFalse(model.isComplete, "load() after reshoot must not revert the reset")
         XCTAssertEqual(model.progressText, "Card 1 of 2")
+    }
+
+    /// `[GAUNTLET-3]` regression: a done()/skip() persist is still queued (we do
+    /// NOT drain it with the 100ms sleep the other tests use) when reshoot() runs.
+    /// reshoot() must cancel that in-flight persist BEFORE resetting, so the
+    /// touched card converges to `.pending` and stays there — a queued markDone
+    /// running after resetCompletions would otherwise re-strand it as `.done`.
+    /// Without fix #3 the markDone interleaves during reshoot's awaits and wins.
+    func testReshootCancelsInFlightPersistBeforeReset() async {
+        let cards = makeCards(3)
+        let repo = FakeCardCompletionRepository()
+        let model = makeModel(cards: cards, completionRepo: repo)
+
+        model.done()                         // c0 done — persist SCHEDULED, not yet run
+        model.skip()                         // c1 skipped — persist SCHEDULED, not yet run
+        // NO drain sleep here: the persists are still queued on the scheduler.
+        await model.reshoot()
+
+        // Give any (incorrectly) surviving persist task ample time to run and
+        // re-strand a card — with fix #3 it was cancelled and nothing fires.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        let c0 = repo.byId[CardCompletion.deterministicId(card: "c0", user: "u1")]
+        let c1 = repo.byId[CardCompletion.deterministicId(card: "c1", user: "u1")]
+        XCTAssertEqual(c0?.state, .pending, "c0 must converge to pending, not be re-stranded as done")
+        XCTAssertEqual(c1?.state, .pending, "c1 must converge to pending, not be re-stranded as skipped")
+
+        // A subsequent fresh load() must not re-seed the touched cards as done/skipped.
+        let fresh = makeModel(cards: cards, completionRepo: repo)
+        await fresh.load()
+        XCTAssertEqual(fresh.progressText, "Card 1 of 3")
+        XCTAssertFalse(fresh.isComplete)
+        XCTAssertEqual(fresh.skippedCount, 0)
+    }
+}
+
+// MARK: - Fix #4: duplicate-deck image copy (web parity)
+
+/// Records every `uploadCardImage` call so a test can assert images were copied
+/// onto the copy card at the right position. The list/url stubs return canned
+/// data per source card so `copyImages` can run end-to-end without the network.
+@MainActor
+final class RecordingImageRepository: ImageRepositing {
+    nonisolated var maxImagesPerCard: Int { 5 }
+
+    /// Source-card images, keyed by card id, returned by `listCardImages`.
+    var imagesByCard: [String: [CardImage]]
+    /// Every upload as `(cardId, position)`, in call order.
+    private(set) var uploads: [(cardId: String, position: Int)] = []
+
+    init(imagesByCard: [String: [CardImage]] = [:]) { self.imagesByCard = imagesByCard }
+
+    func listCardImages(cardId: String) async throws -> [CardImage] { imagesByCard[cardId] ?? [] }
+
+    func fileURL(for image: CardImage) async throws -> URL {
+        // A real file:// URL so `downloadProtected` (which routes through a real
+        // URLSession) returns bytes without any network. URLSession serves
+        // file:// reliably; data: URLs interact poorly with the reload policy.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("posedeck-test-\(image.id).jpg")
+        try? Data([0xFF, 0xD8, 0xFF, 0xD9]).write(to: url)
+        return url
+    }
+
+    @discardableResult
+    func uploadCardImage(cardId: String, data: Data, position: Int) async throws -> CardImage {
+        uploads.append((cardId: cardId, position: position))
+        return CardImage(id: "uploaded-\(uploads.count)", card: cardId, position: position)
+    }
+
+    func deleteCardImage(id: String) async throws {}
+}
+
+@MainActor
+final class DuplicateDeckImageCopyTests: XCTestCase {
+
+    /// Build a MirrorDeckRepository over an in-memory mirror with the supplied
+    /// image deps. `cardExists` controls the server-side existence probe.
+    private func makeRepo(
+        imageRepo: ImageRepositing?,
+        cardExists: @escaping @Sendable (String) -> Bool
+    ) throws -> MirrorDeckRepository {
+        let container = try LocalMirrorStore.makeContainer(inMemory: true)
+        let store = SwiftDataLocalStore(container: container)
+        let outbox = SwiftDataOutbox(container: container)
+        return MirrorDeckRepository(
+            store: store,
+            outbox: outbox,
+            currentUserId: "u1",
+            imageRepo: imageRepo,
+            awaitOutboxDrain: imageRepo == nil ? nil : { /* no-op drain for the unit test */ },
+            cardExistsRemotely: imageRepo == nil ? nil : { id in cardExists(id) }
+        )
+    }
+
+    /// When the copy card exists server-side, each source image is uploaded onto
+    /// the copy card preserving its position. Drives `copyDeckImages(pairs:)`
+    /// directly (no detached-task timing).
+    func testCopyDeckImagesUploadsEachSourceImageAtPosition() async throws {
+        let source = Card(id: "src1", deck: "d1", position: 1000, title: "Source")
+        let copy = Card(id: "copy1", deck: "d2", position: 1000, title: "Source (copy)")
+        let recorder = RecordingImageRepository(imagesByCard: [
+            "src1": [
+                CardImage(id: "i1", card: "src1", position: 1000),
+                CardImage(id: "i2", card: "src1", position: 2000),
+                CardImage(id: "i3", card: "src1", position: 3000),
+            ]
+        ])
+        let repo = try makeRepo(imageRepo: recorder, cardExists: { _ in true })
+
+        await repo.copyDeckImages(pairs: [(source: source, copy: copy)])
+
+        XCTAssertEqual(recorder.uploads.count, 3, "every source image must be copied")
+        XCTAssertEqual(recorder.uploads.map(\.cardId), ["copy1", "copy1", "copy1"])
+        XCTAssertEqual(recorder.uploads.map(\.position), [1000, 2000, 3000],
+                       "each image must keep its source position on the copy card")
+    }
+
+    /// When the copy card does NOT exist server-side yet (its create hasn't
+    /// flushed), no image is uploaded for that card — the duplicate still
+    /// succeeded; the images are simply skipped this pass.
+    func testCopyDeckImagesSkipsWhenCopyCardNotYetRemote() async throws {
+        let source = Card(id: "src1", deck: "d1", position: 1000, title: "Source")
+        let copy = Card(id: "copy1", deck: "d2", position: 1000, title: "Source (copy)")
+        let recorder = RecordingImageRepository(imagesByCard: [
+            "src1": [CardImage(id: "i1", card: "src1", position: 1000)]
+        ])
+        let repo = try makeRepo(imageRepo: recorder, cardExists: { _ in false })
+
+        await repo.copyDeckImages(pairs: [(source: source, copy: copy)])
+
+        XCTAssertTrue(recorder.uploads.isEmpty,
+                      "a copy card not yet existing server-side must get zero uploads")
+    }
+
+    /// Legacy / no-deps path: without the image deps, `copyDeckImages` is a no-op
+    /// (cards-only behaviour preserved); the duplicate flow still works.
+    func testCopyDeckImagesNoOpWithoutImageDeps() async throws {
+        let source = Card(id: "src1", deck: "d1", position: 1000, title: "Source")
+        let copy = Card(id: "copy1", deck: "d2", position: 1000, title: "Source (copy)")
+        let repo = try makeRepo(imageRepo: nil, cardExists: { _ in true })
+
+        // Must not crash and must do nothing observable.
+        await repo.copyDeckImages(pairs: [(source: source, copy: copy)])
+    }
+
+    /// End-to-end through `duplicateDeck`: a seeded source deck with one card that
+    /// has images is duplicated; the detached copy task drains, finds the copy
+    /// card exists (stub true), and uploads each image onto the copy card. Asserts
+    /// the cards copied AND the images followed.
+    func testDuplicateDeckCopiesImagesOntoCopyCards() async throws {
+        let container = try LocalMirrorStore.makeContainer(inMemory: true)
+        let store = SwiftDataLocalStore(container: container)
+        let outbox = SwiftDataOutbox(container: container)
+
+        // Seed a source deck + one card in the mirror.
+        let sourceDeck = Deck(id: "d1", owner: "u1", name: "Wedding")
+        await store.upsertDeck(sourceDeck)
+        let sourceCard = Card(id: "src1", deck: "d1", position: 1000, title: "First look")
+        await store.upsertCard(sourceCard)
+
+        let recorder = RecordingImageRepository(imagesByCard: [
+            "src1": [
+                CardImage(id: "i1", card: "src1", position: 1000),
+                CardImage(id: "i2", card: "src1", position: 2000),
+            ]
+        ])
+
+        let repo = MirrorDeckRepository(
+            store: store,
+            outbox: outbox,
+            currentUserId: "u1",
+            imageRepo: recorder,
+            awaitOutboxDrain: { /* no-op: the in-memory mirror already holds the copy card */ },
+            cardExistsRemotely: { _ in true }
+        )
+
+        let copy = try await repo.duplicateDeck(id: "d1", ownerId: "u1")
+        XCTAssertTrue(copy.name.hasSuffix("(copy)"))
+
+        // The copy card is created in the mirror synchronously by duplicateDeck.
+        let copyCards = await store.cards(deckId: copy.id).filter { $0.deletedAt == nil }
+        XCTAssertEqual(copyCards.count, 1, "the source card must be copied")
+        let copyCardId = copyCards[0].id
+
+        // The image copy is DETACHED — poll briefly for it to complete.
+        for _ in 0..<50 where recorder.uploads.count < 2 {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(recorder.uploads.count, 2, "both source images must be copied (detached)")
+        XCTAssertEqual(Set(recorder.uploads.map(\.cardId)), [copyCardId],
+                       "images must attach to the copy card, not the source")
+        XCTAssertEqual(recorder.uploads.map(\.position).sorted(), [1000, 2000])
     }
 }

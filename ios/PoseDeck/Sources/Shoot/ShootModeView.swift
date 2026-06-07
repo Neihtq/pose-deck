@@ -98,9 +98,14 @@ struct ShootModeView: View {
         .rotationEffect(.degrees(Double(dragOffset.width / 18).clamped(to: -12...12)))
         .scaleEffect(1 - min(abs(dragOffset.width), 160) / 1600)
         .gesture(swipeGesture)
-        // Fresh per-card `@State dragOffset` so a newly-swapped card never inherits
-        // the prior card's fly-off offset and re-animates off-screen (`[M-flyoff]`).
         .id(session.currentCardId)
+        // Re-centre the incoming card the instant the session advances. `dragOffset`
+        // is parent `@State`, NOT owned by the `.id`-keyed subtree, so the `.id`
+        // swap does *not* reset it — after a fly-off it is still at ±700 and would
+        // render the next card off-screen (`[GAUNTLET-1]`). This fires on *any*
+        // advance (gesture fly-off or button) and resets without animation so the
+        // new card snaps to centre. The button path is already at `.zero` here.
+        .onChange(of: session.currentCardId) { dragOffset = .zero }
     }
 
     /// The id the card view is keyed on — the pure session's current card id.
@@ -155,17 +160,23 @@ struct ShootModeView: View {
     }
 
     /// Fly the current card off-screen in the swipe direction, then advance the
-    /// session. `[M-flyoff]`: the card is keyed on `session.currentCardId`, so
-    /// when `advance()` swaps the model's current card SwiftUI builds a *fresh*
-    /// card view with `dragOffset == .zero` (no inherited fly-off, no jump). We
-    /// run the mutation on the animation's completion so the departing frame
-    /// finishes before the swap. The button path calls `advance()` directly with
+    /// session. We run the mutation on the animation's completion so the departing
+    /// frame finishes before the swap; the `.onChange(of: currentCardId)` re-centres
+    /// the incoming card. The button path calls `advance()` directly with
     /// `dragOffset == .zero`, so it advances with zero dependence on animation.
+    ///
+    /// `[GAUNTLET-2]`: the completion captures the card id this fly-off began for
+    /// and no-ops if the session has *already* advanced past it — otherwise a
+    /// Skip/Done button tap during the 0.22s animation would advance once
+    /// immediately and this stale completion would advance *again*, silently
+    /// consuming (and persisting a spurious completion for) a never-shown card.
     private func flyOff(toLeading: Bool, _ advance: @escaping () -> Void) {
+        let startCardId = session.currentCardId
         let offX: CGFloat = toLeading ? -700 : 700
         withAnimation(.easeIn(duration: 0.22)) {
             dragOffset = CGSize(width: offX, height: 0)
         } completion: {
+            guard session.currentCardId == startCardId else { return }
             advance()
         }
     }

@@ -34,13 +34,23 @@ struct MirrorDeckRepository: DeckRepositoring {
     /// duplicated card (item 4), best-effort. Defaulted to `nil` so call sites
     /// that don't need image-copy (and tests) keep compiling and skip it.
     let imageRepo: ImageRepositing?
+    /// Awaits an outbox drain pass so the copy cards' `create`s flush to the
+    /// server before any image is attached (iOS mirror of the web `drainSync()`).
+    /// Defaulted `nil`; when absent the image copy is skipped entirely.
+    let awaitOutboxDrain: (@Sendable () async -> Void)?
+    /// True iff `cardId` exists server-side (iOS mirror of the web
+    /// `cards.getOne(copyCardId)` existence check). Defaulted `nil`; when absent
+    /// the image copy is skipped entirely.
+    let cardExistsRemotely: (@Sendable (String) async -> Bool)?
 
     init(
         store: SwiftDataLocalStore,
         outbox: SwiftDataOutbox,
         currentUserId: String,
         now: @escaping @Sendable () -> Date = { Date() },
-        imageRepo: ImageRepositing? = nil
+        imageRepo: ImageRepositing? = nil,
+        awaitOutboxDrain: (@Sendable () async -> Void)? = nil,
+        cardExistsRemotely: (@Sendable (String) async -> Bool)? = nil
     ) {
         self.store = store
         self.outbox = outbox
@@ -48,6 +58,8 @@ struct MirrorDeckRepository: DeckRepositoring {
         self.writePath = OfflineWritePath(store: store, outbox: outbox, now: now)
         self.now = now
         self.imageRepo = imageRepo
+        self.awaitOutboxDrain = awaitOutboxDrain
+        self.cardExistsRemotely = cardExistsRemotely
     }
 
     // Reads (mirror)
@@ -141,15 +153,23 @@ struct MirrorDeckRepository: DeckRepositoring {
     /// create, then copy each non-deleted card with a fresh client id at striped
     /// positions (mirrors ``DeckRepository/duplicateDeck`` but through the outbox).
     ///
-    /// When an ``ImageRepositing`` is injected, each copied card's images are also
-    /// copied **best-effort** (item 4): per source image, the bytes are fetched
-    /// through the protected, non-persisting session (SEC-IOS-B) and re-uploaded
-    /// onto the copy card. The upload is network-bound and the copy card's
-    /// server-side record only exists once its outbox `create` has flushed, so —
-    /// like the web online-after-drain step — an image copy that races ahead of
-    /// the card's sync simply fails and is skipped. Every image copy runs in its
-    /// own `do`/`catch`; one failure is logged and skipped and never fails the
-    /// duplicate (the cards always copy regardless).
+    /// Image copy (item 4) is **deferred + detached** to reach true web parity
+    /// (web `deckApi.ts` `copyDeckImages`). The copy cards are enqueued to the
+    /// outbox here, but the outbox only *inserts+saves* — the actual server
+    /// `create` flushes on the ``SyncCoordinator`` drain loop, so the
+    /// client-minted copy-card ids do **not** exist server-side yet when this
+    /// returns. Uploading onto them inline would 404 (PB requires the `card`
+    /// relation + an owner-join createRule), and the per-image `catch` would
+    /// silently skip *every* image. So instead, when all three image deps
+    /// (`imageRepo` + `awaitOutboxDrain` + `cardExistsRemotely`) are injected, we
+    /// fire a **detached** task — `duplicateDeck` returns immediately like the web
+    /// `void copyDeckImages(...)` — that first `await`s an outbox drain pass
+    /// (mirror of web `drainSync()`) so the copy-card creates flush, then for each
+    /// (source, copy) pair verifies the copy card exists server-side (mirror of
+    /// web `cards.getOne(copyCardId)`) before attaching its images. Cards always
+    /// copy regardless; a pair whose card hasn't synced yet is skipped this pass.
+    /// When any image dep is absent (legacy / tests) the image copy is skipped
+    /// entirely and the cards still copy.
     @discardableResult
     func duplicateDeck(id: String, ownerId: String) async throws -> Deck {
         guard let source = await store.deck(id: id), source.deletedAt == nil else {
@@ -164,17 +184,45 @@ struct MirrorDeckRepository: DeckRepositoring {
         let base = String(source.name.prefix(DeckRepository.nameMaxLength - suffix.count))
         let copy = try await writePath.createDeck(name: base + suffix, shootDate: nil, ownerId: ownerId)
         let sourceCards = await store.cards(deckId: id).filter { $0.deletedAt == nil }
+        var pairs: [(source: Card, copy: Card)] = []
         for card in sourceCards {
             let fields = CardRepository.CardFields(
                 title: card.title, timeSlot: card.timeSlot, subjects: card.subjects,
                 direction: card.direction, notes: card.notes
             )
             let copyCard = try await writePath.createCard(deckId: copy.id, fields: fields)
-            if let imageRepo {
-                await copyImages(from: card, to: copyCard, using: imageRepo)
-            }
+            pairs.append((source: card, copy: copyCard))
+        }
+        // Detached image copy (web parity): fire-and-forget so the duplicate
+        // returns now and is never blocked or failed by image work. Only when all
+        // three deps are present — otherwise legacy/test behaviour (no copy).
+        if imageRepo != nil, awaitOutboxDrain != nil, cardExistsRemotely != nil, !pairs.isEmpty {
+            let copy = self
+            Task { await copy.copyDeckImages(pairs: pairs) }
         }
         return copy
+    }
+
+    /// Deferred, best-effort image copy for the (source, copy) card pairs produced
+    /// by ``duplicateDeck(id:ownerId:)`` (item 4; iOS mirror of the web
+    /// `copyDeckImages`). `internal` so a test can drive it directly without the
+    /// detached-task timing.
+    ///
+    /// 1. `await awaitOutboxDrain()` — wait for the copy-card `create`s (just
+    ///    enqueued) to flush to the server (mirror of web `drainSync()`).
+    /// 2. Per pair, only attach images if the copy card now exists server-side
+    ///    (mirror of web `cards.getOne(copyCardId)`); a not-yet-synced card is
+    ///    skipped this pass (its images simply aren't copied; the duplicate still
+    ///    succeeded). Then ``copyImages(from:to:using:)`` does the per-image work.
+    ///
+    /// A no-op unless all three image deps are injected.
+    func copyDeckImages(pairs: [(source: Card, copy: Card)]) async {
+        guard let imageRepo, let awaitOutboxDrain, let cardExistsRemotely else { return }
+        await awaitOutboxDrain()
+        for pair in pairs {
+            guard await cardExistsRemotely(pair.copy.id) else { continue }
+            await copyImages(from: pair.source, to: pair.copy, using: imageRepo)
+        }
     }
 
     /// Best-effort copy of every image on `source` onto `destination`, preserving

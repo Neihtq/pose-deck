@@ -339,6 +339,15 @@ final class SyncCoordinator {
         }
     }
 
+    /// Drive the outbox to a non-progressing (idle/deferred) state so freshly
+    /// enqueued writes flush. The iOS mirror of the web `drainSync()` used by the
+    /// detached duplicate-deck image copy (item 4 / fix #4): the copy-card
+    /// `create`s are enqueued just before this runs, and a bounded quiesce flushes
+    /// them so the subsequent server-side existence check can succeed.
+    func drainToIdle() async {
+        await quiesceProcessor(maxPasses: 20)
+    }
+
     /// Drive `drain()` to a non-progressing state a bounded number of times so a
     /// signout flushes what it can before purging.
     private func quiesceProcessor(maxPasses: Int) async {
@@ -413,11 +422,25 @@ final class SyncCoordinator {
     // MARK: - Repository factories (mirror-backed)
 
     func makeDeckRepository(ownerId: String) -> MirrorDeckRepository {
-        MirrorDeckRepository(
+        let apiClient = self.apiClient
+        return MirrorDeckRepository(
             store: store,
             outbox: outbox,
             currentUserId: ownerId,
-            imageRepo: makeImageRepository()
+            imageRepo: makeImageRepository(),
+            // fix #4 (web parity): flush the copy-card creates before attaching
+            // images. Bounce to the main actor — the coordinator is @MainActor.
+            awaitOutboxDrain: { [weak self] in await self?.drainToIdle() },
+            // fix #4: only attach images to a copy card that exists server-side.
+            // No getOne on APIClient, so a 1-row `list` by id is the existence
+            // probe; any throw (offline/transient) → false (skip this pass).
+            cardExistsRemotely: { id in
+                let filter = "id = \(PocketBaseFilter.quoted(id))"
+                let found = try? await apiClient.list(
+                    Card.self, collection: "cards", perPage: 1, filter: filter
+                )
+                return (found?.items.isEmpty == false)
+            }
         )
     }
 

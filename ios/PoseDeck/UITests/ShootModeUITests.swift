@@ -108,6 +108,89 @@ final class ShootModeUITests: PoseDeckUITestCase {
         trashDeck(deck)
     }
 
+    /// `[GAUNTLET-1 + #2]` swipe-gesture regression — the gap the button-driven
+    /// flow above never exercises. The fly-off animation + the parent `@State`
+    /// `dragOffset` reset (`[GAUNTLET-1]`) and the stale-completion guard
+    /// (`[GAUNTLET-2]`) are only reachable through real swipe physics, so this
+    /// drives `swipeRight()` (= done, DESIGN §4.2) / `swipeLeft()` (= skip) on the
+    /// `shoot.card-image` element and asserts:
+    ///   (a) the next card's progress is VISIBLE after the swipe — catches the
+    ///       off-screen render where `dragOffset` stayed at ±700 (#1), and
+    ///   (b) progress advances by EXACTLY ONE per swipe — catches the
+    ///       double-advance where a fly-off completion fired after an advance (#2),
+    ///   (c) the card image stays hittable + centred within the screen after the
+    ///       swipe-advance (belt-and-suspenders for #1 if a label read flakes).
+    func testShootSwipeAdvancesExactlyOnePerSwipe() {
+        launchAndSignIn()
+        let deck = deckName("swipe")
+        openDeck(deck)
+
+        // Position-ordered shoot order: One, Two, Three.
+        addCard(titled: "Swipe One")
+        addCard(titled: "Swipe Two")
+        addCard(titled: "Swipe Three")
+
+        waitFor("deck.startShoot", "Start-shoot button missing").tap()
+
+        let card = waitFor("shoot.card-image", "Shoot card image missing")
+        XCTAssertEqual(
+            waitFor("shoot.progress", "Progress indicator missing").label,
+            "Card 1 of 3", "Should start at card 1 of 3"
+        )
+        // The card title is the unambiguous "which card is shown" signal — used to
+        // prove advance-by-EXACTLY-one (#2): a double-advance would skip a title.
+        XCTAssertTrue(waitForLabel("shoot.card-title", "Swipe One"),
+                      "Should start on 'Swipe One' (got '\(element("shoot.card-title").label)')")
+
+        // Swipe RIGHT = done (DESIGN §4.2) → advance EXACTLY one: One → Two.
+        card.swipeRight()
+        XCTAssertTrue(
+            waitForLabel("shoot.card-title", "Swipe Two"),
+            "Swipe-right (done) should advance by exactly one to 'Swipe Two' (got '\(element("shoot.card-title").label)')"
+        )
+        // Progress also advances by one (catches #1's off-screen render too).
+        XCTAssertTrue(waitForLabel("shoot.progress", "Card 2 of 3"),
+                      "Progress should read Card 2 of 3 after the done swipe")
+        assertCardCentredAndHittable("after swipe-right advance")
+
+        // Swipe LEFT = skip → the skipped card (Two) moves to the END, so the next
+        // PRESENTED card is Three (advance by exactly one card shown). The cursor
+        // position stays at 2 of 3 by design (skip moves the card, not the cursor).
+        card.swipeLeft()
+        XCTAssertTrue(
+            waitForLabel("shoot.card-title", "Swipe Three"),
+            "Swipe-left (skip) should advance by exactly one to 'Swipe Three' (got '\(element("shoot.card-title").label)')"
+        )
+        assertCardCentredAndHittable("after swipe-left advance")
+
+        // EXACTLY one card was skipped — a double-advance would have consumed an
+        // extra card and shown "+2 skipped" or skipped past a title (#2).
+        let skipped = waitFor("shoot.skipped-count", "Skipped badge did not appear after swipe-left skip")
+        XCTAssertEqual(skipped.label, "+1 skipped", "Exactly one card should be skipped (no double-advance)")
+
+        // Exit + clean up.
+        if element("shoot.exit").exists { element("shoot.exit").tap() }
+        leaveDeckToList()
+        trashDeck(deck)
+    }
+
+    /// Assert the shoot card image is present, hittable, and its frame is centred
+    /// within the screen bounds — i.e. it did NOT render off-screen at a stale
+    /// fly-off offset (`[GAUNTLET-1]`).
+    private func assertCardCentredAndHittable(_ context: String) {
+        let card = element("shoot.card-image")
+        XCTAssertTrue(card.waitForExistence(timeout: Self.timeout), "Card image missing \(context)")
+        XCTAssertTrue(card.isHittable, "Card image not hittable (likely off-screen) \(context)")
+        let screen = app.windows.firstMatch.frame
+        let frame = card.frame
+        XCTAssertTrue(
+            screen.intersection(frame).width > frame.width * 0.6,
+            "Card image is mostly off-screen \(context): frame=\(frame) screen=\(screen)"
+        )
+        XCTAssertGreaterThan(frame.midX, screen.minX, "Card image pushed off the left edge \(context)")
+        XCTAssertLessThan(frame.midX, screen.maxX, "Card image pushed off the right edge \(context)")
+    }
+
     /// Poll an element's label until it matches (XCUITest labels update lazily).
     private func waitForLabel(_ id: String, _ expected: String, timeout: TimeInterval = timeout) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)

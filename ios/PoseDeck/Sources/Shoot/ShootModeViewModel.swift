@@ -133,6 +133,15 @@ final class ShootModeViewModel {
     /// instance whose `load()` re-fetches would now read `pending`. Never calls
     /// `load()` (which would re-seed from completions).
     func reshoot() async {
+        // `[GAUNTLET-3]` Tear down any in-flight done/skip persists BEFORE the reset
+        // so a queued `markDone`/`markSkipped` (which force-applies the local mirror,
+        // bypassing the LWW tie guard) can't run *after* `resetCompletions` and
+        // re-strand a card as `done`. `resetCompletions` writes directly (not through
+        // the scheduler), so without this its ordering vs. pending persists is
+        // unspecified. Mirrors `load()`'s re-arm: cancel, then resume so the prefetch
+        // below can still schedule.
+        scheduler.cancelAll()
+        scheduler.resume()
         // Capture the scoped id set before resetting the session (reset clears it).
         var scoped = session.doneIds.union(session.skippedActiveIds)
         let cardIds = cards.map(\.id)

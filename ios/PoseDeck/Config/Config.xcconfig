@@ -9,7 +9,15 @@
 // yielding `http:`. Work around this by splitting the scheme's slashes into a
 // separate variable and recombining — a standard xcconfig idiom.
 SLASH = /
-API_BASE_URL = http:$(SLASH)$(SLASH)localhost:8090
+// On-device LAN testing: the backend runs on the dev Mac (192.168.68.55:8090),
+// the app is built on a second Mac and installed on the iPhone, and all three
+// share one Wi-Fi. The IP is baked in at build time, so it must point at the
+// machine actually running PocketBase. If that Mac's IP changes, update it here
+// and rebuild.
+//
+// Simulator / same-machine default (swap back when not LAN testing):
+//   API_BASE_URL = http:$(SLASH)$(SLASH)localhost:8090
+API_BASE_URL = http:$(SLASH)$(SLASH)192.168.68.55:8090
 
 // To point at a LAN backend (e.g. TrueNAS), override locally, e.g.:
 //   API_BASE_URL = http:$(SLASH)$(SLASH)192.168.1.50:8090

@@ -30,18 +30,24 @@ struct MirrorDeckRepository: DeckRepositoring {
     /// The authenticated user's id — used to owner-scope the Trash so a guest
     /// never sees/restores an owner's trashed shared deck (`[FIX #3-iOS]`).
     let currentUserId: String
+    /// Optional image repository used to copy a source card's images onto the
+    /// duplicated card (item 4), best-effort. Defaulted to `nil` so call sites
+    /// that don't need image-copy (and tests) keep compiling and skip it.
+    let imageRepo: ImageRepositing?
 
     init(
         store: SwiftDataLocalStore,
         outbox: SwiftDataOutbox,
         currentUserId: String,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        imageRepo: ImageRepositing? = nil
     ) {
         self.store = store
         self.outbox = outbox
         self.currentUserId = currentUserId
         self.writePath = OfflineWritePath(store: store, outbox: outbox, now: now)
         self.now = now
+        self.imageRepo = imageRepo
     }
 
     // Reads (mirror)
@@ -134,6 +140,16 @@ struct MirrorDeckRepository: DeckRepositoring {
     /// Duplicate a deck **offline-first**: mint the copy locally + enqueue a deck
     /// create, then copy each non-deleted card with a fresh client id at striped
     /// positions (mirrors ``DeckRepository/duplicateDeck`` but through the outbox).
+    ///
+    /// When an ``ImageRepositing`` is injected, each copied card's images are also
+    /// copied **best-effort** (item 4): per source image, the bytes are fetched
+    /// through the protected, non-persisting session (SEC-IOS-B) and re-uploaded
+    /// onto the copy card. The upload is network-bound and the copy card's
+    /// server-side record only exists once its outbox `create` has flushed, so —
+    /// like the web online-after-drain step — an image copy that races ahead of
+    /// the card's sync simply fails and is skipped. Every image copy runs in its
+    /// own `do`/`catch`; one failure is logged and skipped and never fails the
+    /// duplicate (the cards always copy regardless).
     @discardableResult
     func duplicateDeck(id: String, ownerId: String) async throws -> Deck {
         guard let source = await store.deck(id: id), source.deletedAt == nil else {
@@ -153,9 +169,50 @@ struct MirrorDeckRepository: DeckRepositoring {
                 title: card.title, timeSlot: card.timeSlot, subjects: card.subjects,
                 direction: card.direction, notes: card.notes
             )
-            try await writePath.createCard(deckId: copy.id, fields: fields)
+            let copyCard = try await writePath.createCard(deckId: copy.id, fields: fields)
+            if let imageRepo {
+                await copyImages(from: card, to: copyCard, using: imageRepo)
+            }
         }
         return copy
+    }
+
+    /// Best-effort copy of every image on `source` onto `destination`, preserving
+    /// each image's position. Each image is handled in its own `do`/`catch`: a
+    /// failed list/token-mint/download/upload (including the per-card cap throwing
+    /// or the copy card not yet existing server-side) is skipped so a single bad
+    /// image never aborts the duplicate or the remaining images. Bytes are fetched
+    /// through the protected non-persisting session (SEC-IOS-B), NOT
+    /// `URLSession.shared`, so the already-compressed JPEG is re-uploaded without
+    /// ever touching the shared on-disk HTTP cache.
+    private func copyImages(from source: Card, to destination: Card, using imageRepo: ImageRepositing) async {
+        let sourceImages: [CardImage]
+        do {
+            sourceImages = try await imageRepo.listCardImages(cardId: source.id)
+        } catch {
+            return
+        }
+        for image in sourceImages {
+            do {
+                let url = try await imageRepo.fileURL(for: image)
+                let data = try await MirrorDeckRepository.downloadProtected(url)
+                _ = try await imageRepo.uploadCardImage(
+                    cardId: destination.id,
+                    data: data,
+                    position: image.position
+                )
+            } catch {
+                continue
+            }
+        }
+    }
+
+    /// Download protected image bytes through the dedicated non-persisting session
+    /// (SEC-IOS-B) so decrypted private `card_images` bytes never reach
+    /// `URLCache.shared`. A static holder keeps one session for all copies.
+    private static let protectedSession = ProtectedImageSession.make()
+    private static func downloadProtected(_ url: URL) async throws -> Data {
+        try await protectedSession.data(from: url).0
     }
 }
 

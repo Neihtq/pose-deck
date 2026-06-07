@@ -1,5 +1,7 @@
 import SwiftUI
 import PhotosUI
+import UIKit
+import UniformTypeIdentifiers
 import PoseDeckCore
 
 /// View model backing ``CardImagesSection``.
@@ -115,6 +117,16 @@ final class CardImagesViewModel {
             errorMessage = error.localizedDescription
         }
         isUploading = false
+    }
+
+    /// Handle an image pasted from the system clipboard (item 1). Reuses
+    /// ``addImage(data:)`` so the in-flight/cap gate, compressor, and per-card cap
+    /// are all enforced exactly as for a picked photo — mirrors the web paste path
+    /// which shares the same `useImageUpload` flow. A `PasteButton` only delivers
+    /// `supportedContentTypes` matches, so a non-image clipboard never reaches
+    /// here (no-op, no toast).
+    func handlePasted(data: Data) async {
+        await addImage(data: data)
     }
 
     /// Handle a `PhotosPickerItem` selection: load its bytes then upload.
@@ -256,6 +268,23 @@ struct CardImagesSection: View {
         }
     }
 
+    /// Load the first pasted image provider's bytes and forward them to the model
+    /// (item 1). `PasteButton(supportedContentTypes: [.image])` only yields image
+    /// providers, so a non-image clipboard delivers nothing here (no-op). The
+    /// bytes are normalized to JPEG via `UIImage` so the shared compress/upload
+    /// path always receives an encodable image.
+    @MainActor
+    private static func handlePaste(_ providers: [NSItemProvider], model: CardImagesViewModel) async {
+        guard let provider = providers.first(where: { $0.canLoadObject(ofClass: UIImage.self) }) else { return }
+        let image: UIImage? = await withCheckedContinuation { continuation in
+            provider.loadObject(ofClass: UIImage.self) { object, _ in
+                continuation.resume(returning: object as? UIImage)
+            }
+        }
+        guard let data = image?.jpegData(compressionQuality: 1.0) else { return }
+        await model.handlePasted(data: data)
+    }
+
     private var addButton: some View {
         HStack(spacing: 12) {
             PhotosPicker(
@@ -268,6 +297,19 @@ struct CardImagesSection: View {
             .disabled(model.atImageLimit || model.isUploading)
             .buttonStyle(.bordered)
             .accessibilityIdentifier("cardImages.add")
+
+            // Clipboard paste (item 1): mirrors the web paste affordance. The
+            // system auto-disables this when the clipboard holds no image; we
+            // additionally gate on the same cap/in-flight state as the picker so a
+            // paste can't bypass the cap or stack on an in-flight upload. Loads
+            // the first image provider's bytes and re-encodes JPEG via UIImage so
+            // the shared `addImage` compress/upload/cap path handles it.
+            PasteButton(supportedContentTypes: [.image]) { providers in
+                Task { await CardImagesSection.handlePaste(providers, model: model) }
+            }
+            .disabled(model.atImageLimit || model.isUploading)
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("cardImages.paste")
 
             if model.isUploading {
                 ProgressView()

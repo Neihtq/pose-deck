@@ -413,7 +413,12 @@ final class SyncCoordinator {
     // MARK: - Repository factories (mirror-backed)
 
     func makeDeckRepository(ownerId: String) -> MirrorDeckRepository {
-        MirrorDeckRepository(store: store, outbox: outbox, currentUserId: ownerId)
+        MirrorDeckRepository(
+            store: store,
+            outbox: outbox,
+            currentUserId: ownerId,
+            imageRepo: makeImageRepository()
+        )
     }
 
     func makeDeckGuestRepository(ownerId: String) -> MirrorDeckGuestRepository {

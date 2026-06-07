@@ -261,6 +261,183 @@ final class DeckRepositoryTests: XCTestCase {
         XCTAssertEqual(body["name"] as? String, "Smith Wedding")
     }
 
+    // MARK: - duplicate copies images (item 4)
+
+    /// Thread-safe recorder for the `@Sendable` download closure.
+    private final class URLRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [URL] = []
+        func record(_ url: URL) { lock.lock(); stored.append(url); lock.unlock() }
+        var urls: [URL] { lock.lock(); defer { lock.unlock() }; return stored }
+    }
+
+    /// A spy ``ImageRepositing`` that serves a fixed set of source images and
+    /// records every upload so a test can assert what got copied. No network.
+    private final class SpyImageRepository: ImageRepositing, @unchecked Sendable {
+        let maxImagesPerCard: Int
+        /// Images keyed by source card id.
+        var imagesByCard: [String: [CardImage]]
+        /// Optional per-card-id failure injected on `uploadCardImage` (best-effort path).
+        var uploadFailureCardIds: Set<String> = []
+        /// Recorded uploads: (cardId, position).
+        private(set) var uploads: [(cardId: String, position: Int)] = []
+
+        init(maxImagesPerCard: Int = 5, imagesByCard: [String: [CardImage]] = [:]) {
+            self.maxImagesPerCard = maxImagesPerCard
+            self.imagesByCard = imagesByCard
+        }
+
+        func listCardImages(cardId: String) async throws -> [CardImage] {
+            (imagesByCard[cardId] ?? []).sorted { $0.position < $1.position }
+        }
+
+        func uploadCardImage(cardId: String, data: Data, position: Int) async throws -> CardImage {
+            if uploadFailureCardIds.contains(cardId) {
+                throw ImageRepositoryError.tooManyImages(cardId: cardId)
+            }
+            uploads.append((cardId, position))
+            return CardImage(id: UUID().uuidString, card: cardId, position: position, file: "image.jpg")
+        }
+
+        func deleteCardImage(id: String) async throws {}
+
+        func fileURL(for image: CardImage) async throws -> URL {
+            URL(string: "https://stub.local/api/files/card_images/\(image.id)/\(image.file ?? "x.jpg")?token=t")!
+        }
+    }
+
+    /// A two-card source deck whose first card has two images and second card one
+    /// must have all three images re-uploaded onto the copy cards, each at the
+    /// source position. Bytes flow through the injected `downloadImage` closure
+    /// (no network), proving the image-copy collaborator is wired through
+    /// `duplicateDeck`.
+    func testDuplicateDeckCopiesImagesPerCard() async throws {
+        StubURLProtocol.shared.setHandler { request in
+            if request.httpMethod == "GET" {
+                let url = request.url!.absoluteString
+                if url.contains("collections/decks") {
+                    return (200, Data(#"{"page":1,"perPage":1,"totalItems":1,"totalPages":1,"items":[{"id":"src","owner":"u","name":"Shoot","shoot_date":"","deleted_at":""}]}"#.utf8))
+                }
+                let body = """
+                {"page":1,"perPage":200,"totalItems":2,"totalPages":1,"items":[
+                  {"id":"c1","deck":"src","position":1000,"title":"First","deleted_at":""},
+                  {"id":"c2","deck":"src","position":2000,"title":"Second","deleted_at":""}
+                ]}
+                """
+                return (200, Data(body.utf8))
+            }
+            let url = request.url!.absoluteString
+            if url.contains("collections/decks") {
+                return (200, Data(#"{"id":"copy","owner":"u","name":"Shoot (copy)","deleted_at":""}"#.utf8))
+            }
+            // Cards create — echo deterministic copy-card ids so we can assert the
+            // upload targets. PocketBase ignores the id we send and returns its own.
+            return (200, Data(#"{"id":"copycard","deck":"copy","position":1000,"title":"x","deleted_at":""}"#.utf8))
+        }
+
+        let images = SpyImageRepository(imagesByCard: [
+            "c1": [
+                CardImage(id: "i1", card: "c1", position: 1, file: "a.jpg"),
+                CardImage(id: "i2", card: "c1", position: 2, file: "b.jpg"),
+            ],
+            "c2": [
+                CardImage(id: "i3", card: "c2", position: 1, file: "c.jpg"),
+            ],
+        ])
+        let recorder = URLRecorder()
+        let repo = DeckRepository(
+            client: await makeClient(),
+            now: { Self.fixedNow },
+            imageRepository: images,
+            downloadImage: { url in
+                recorder.record(url)
+                return Data("jpegbytes".utf8)
+            }
+        )
+
+        _ = try await repo.duplicateDeck(id: "src", ownerId: "u")
+
+        XCTAssertEqual(images.uploads.count, 3, "all 3 source images across both cards must be re-uploaded")
+        // Positions are preserved from the source images (1, 2 on card one; 1 on card two).
+        XCTAssertEqual(images.uploads.map(\.position).sorted(), [1, 1, 2])
+        // Bytes were fetched through the injected (protected-session stand-in)
+        // download closure, never URLSession.shared.
+        let downloadedURLs = recorder.urls
+        XCTAssertEqual(downloadedURLs.count, 3, "each copied image downloads its source bytes once")
+        XCTAssertTrue(downloadedURLs.allSatisfy { $0.absoluteString.contains("token=") })
+    }
+
+    /// Best-effort: one image's upload failure must be swallowed and the remaining
+    /// images still copied; the duplicate itself never throws.
+    func testDuplicateDeckImageCopyIsBestEffort() async throws {
+        StubURLProtocol.shared.setHandler { request in
+            if request.httpMethod == "GET" {
+                let url = request.url!.absoluteString
+                if url.contains("collections/decks") {
+                    return (200, Data(#"{"page":1,"perPage":1,"totalItems":1,"totalPages":1,"items":[{"id":"src","owner":"u","name":"S","shoot_date":"","deleted_at":""}]}"#.utf8))
+                }
+                return (200, Data(#"{"page":1,"perPage":200,"totalItems":1,"totalPages":1,"items":[{"id":"c1","deck":"src","position":1000,"title":"First","deleted_at":""}]}"#.utf8))
+            }
+            let url = request.url!.absoluteString
+            if url.contains("collections/decks") {
+                return (200, Data(#"{"id":"copy","owner":"u","name":"S (copy)","deleted_at":""}"#.utf8))
+            }
+            return (200, Data(#"{"id":"copycard","deck":"copy","position":1000,"title":"x","deleted_at":""}"#.utf8))
+        }
+
+        let images = SpyImageRepository(imagesByCard: [
+            "c1": [
+                CardImage(id: "i1", card: "c1", position: 1, file: "a.jpg"),
+                CardImage(id: "i2", card: "c1", position: 2, file: "b.jpg"),
+            ],
+        ])
+        // Fail every upload to the copy card; the duplicate must still succeed.
+        images.uploadFailureCardIds = ["copycard"]
+        let repo = DeckRepository(
+            client: await makeClient(),
+            now: { Self.fixedNow },
+            imageRepository: images,
+            downloadImage: { _ in Data("bytes".utf8) }
+        )
+
+        let copy = try await repo.duplicateDeck(id: "src", ownerId: "u")
+        XCTAssertEqual(copy.id, "copy", "duplicate succeeds even when every image copy fails")
+        XCTAssertTrue(images.uploads.isEmpty, "no upload was recorded (all failed)")
+
+        // The cards themselves still copied (image-copy is downstream of card create).
+        let cardBodies = try allPostBodies().filter { $0["deck"] as? String == "copy" }
+        XCTAssertEqual(cardBodies.count, 1, "cards copy regardless of image-copy failure")
+    }
+
+    /// `[C-deckrepo-init]`: the pre-image-copy initializer (client+now only) must
+    /// still compile and behave identically — image-copy is skipped when no image
+    /// repository is injected.
+    func testDuplicateDeckWithoutImageRepositorySkipsImageCopy() async throws {
+        StubURLProtocol.shared.setHandler { request in
+            if request.httpMethod == "GET" {
+                let url = request.url!.absoluteString
+                if url.contains("collections/decks") {
+                    return (200, Data(#"{"page":1,"perPage":1,"totalItems":1,"totalPages":1,"items":[{"id":"src","owner":"u","name":"S","shoot_date":"","deleted_at":""}]}"#.utf8))
+                }
+                return (200, Data(#"{"page":1,"perPage":200,"totalItems":1,"totalPages":1,"items":[{"id":"c1","deck":"src","position":1000,"title":"First","deleted_at":""}]}"#.utf8))
+            }
+            let url = request.url!.absoluteString
+            if url.contains("collections/decks") {
+                return (200, Data(#"{"id":"copy","owner":"u","name":"S (copy)","deleted_at":""}"#.utf8))
+            }
+            return (200, Data(#"{"id":"copycard","deck":"copy","position":1000,"title":"x","deleted_at":""}"#.utf8))
+        }
+        // Old initializer — no imageRepository, no downloadImage.
+        let repo = DeckRepository(client: await makeClient(), now: { Self.fixedNow })
+        let copy = try await repo.duplicateDeck(id: "src", ownerId: "u")
+        XCTAssertEqual(copy.id, "copy")
+        // No card_images requests were issued (image-copy skipped).
+        let imageRequests = StubURLProtocol.shared.requests.filter {
+            ($0.url?.absoluteString ?? "").contains("card_images")
+        }
+        XCTAssertTrue(imageRequests.isEmpty, "no image repository → no image traffic")
+    }
+
     // MARK: - list pagination (CORR-2 regression)
 
     /// Regression for CORR-2: a user with more decks than fit on one page must

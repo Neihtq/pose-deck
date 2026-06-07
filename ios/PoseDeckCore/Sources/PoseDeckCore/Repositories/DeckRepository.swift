@@ -27,9 +27,30 @@ public struct DeckRepository: Sendable {
     /// Clock injected for testability; defaults to wall-clock `Date.init`.
     private let now: @Sendable () -> Date
 
-    public init(client: APIClient, now: @escaping @Sendable () -> Date = Date.init) {
+    /// Optional image repository used to copy a source card's images onto the
+    /// duplicated card (item 4). Defaulted to `nil` so existing call sites/tests
+    /// that only need deck+card CRUD keep compiling and skip image-copy entirely.
+    private let imageRepository: ImageRepositing?
+
+    /// Downloads the bytes for a resolved (token-bearing) image file URL.
+    /// Injectable for tests; the default fetches through the dedicated
+    /// non-persisting ``ProtectedImageSession`` (SEC-IOS-B) so decrypted private
+    /// `card_images` bytes are never written to the process-global
+    /// `URLCache.shared` — NOT `URLSession.shared`.
+    private let downloadImage: @Sendable (URL) async throws -> Data
+
+    public init(
+        client: APIClient,
+        now: @escaping @Sendable () -> Date = Date.init,
+        imageRepository: ImageRepositing? = nil,
+        downloadImage: @escaping @Sendable (URL) async throws -> Data = { url in
+            try await ProtectedImageSession.make().data(from: url).0
+        }
+    ) {
         self.client = client
         self.now = now
+        self.imageRepository = imageRepository
+        self.downloadImage = downloadImage
     }
 
     // MARK: - Read
@@ -155,9 +176,16 @@ public struct DeckRepository: Sendable {
     ///
     /// Copies the deck metadata into a fresh deck (name suffixed " (copy)", no
     /// `shoot_date` carried over) and copies every non-soft-deleted card with
-    /// freshly striped integer-gap positions, preserving order. Completions and
-    /// images are NOT copied (completions are per-user/permanent; images are the
-    /// image-pipeline unit's concern).
+    /// freshly striped integer-gap positions, preserving order. Completions are
+    /// NOT copied (they are per-user/permanent).
+    ///
+    /// When an ``ImageRepositing`` is injected, each copied card's images are
+    /// copied too on a **best-effort** basis (item 4): the source bytes are
+    /// downloaded through the protected, non-persisting session (SEC-IOS-B) and
+    /// re-uploaded onto the copy card at the same position. Each image copy runs
+    /// in its own `do`/`catch`; one failure is logged and skipped and never fails
+    /// the duplicate (the cards always copy regardless). When no image repository
+    /// is injected, images are skipped entirely (legacy behaviour).
     ///
     /// Only valid for *live* source decks: `getDeck` already excludes
     /// soft-deleted decks, so a trashed deck reads as not-found here.
@@ -201,11 +229,56 @@ public struct DeckRepository: Sendable {
                 deleted_at: "",
                 client_updated_at: PocketBaseDate.string(from: now())
             )
-            let _: Card = try await client.create(collection: cardsCollection, body: body)
+            let copyCard: Card = try await client.create(collection: cardsCollection, body: body)
+            // Best-effort: copy the source card's images onto the new card. Only
+            // runs when an image repository is injected; otherwise images are
+            // skipped (legacy behaviour). Never fails the duplicate.
+            if let imageRepository {
+                await copyImages(from: card, to: copyCard, using: imageRepository)
+            }
             position += Self.positionGap
         }
 
         return copy
+    }
+
+    /// Best-effort copy of every image on `source` onto `destination`, preserving
+    /// each image's position.
+    ///
+    /// Each image is handled in its own `do`/`catch`: a failed token mint,
+    /// download, or upload (including the per-card cap throwing) is logged and
+    /// skipped so a single bad image never aborts the duplicate or the remaining
+    /// images. Bytes are fetched through the injected protected-session download
+    /// closure (SEC-IOS-B), NOT `URLSession.shared`, so the already-compressed
+    /// JPEG is re-uploaded without ever touching the shared on-disk HTTP cache.
+    private func copyImages(
+        from source: Card,
+        to destination: Card,
+        using imageRepository: ImageRepositing
+    ) async {
+        let sourceImages: [CardImage]
+        do {
+            sourceImages = try await imageRepository.listCardImages(cardId: source.id)
+        } catch {
+            // Can't list the source images — skip image copy for this card.
+            return
+        }
+        for image in sourceImages {
+            do {
+                let url = try await imageRepository.fileURL(for: image)
+                let data = try await downloadImage(url)
+                _ = try await imageRepository.uploadCardImage(
+                    cardId: destination.id,
+                    data: data,
+                    position: image.position
+                )
+            } catch {
+                // Best-effort: log and continue. One image's failure (token mint,
+                // download, upload, or hitting the per-card cap) must not abort
+                // the duplicate or block the remaining images.
+                continue
+            }
+        }
     }
 
     // MARK: - Encodable bodies

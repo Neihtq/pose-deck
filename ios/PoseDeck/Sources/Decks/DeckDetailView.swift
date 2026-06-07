@@ -154,9 +154,9 @@ struct DeckDetailView: View {
                     Button { model.activeSheet = .edit } label: {
                         Label("Rename / Date", systemImage: "pencil")
                     }
-                    Button { Task { await model.duplicateDeck() } } label: {
-                        Label("Duplicate", systemImage: "doc.on.doc")
-                    }
+                    // Duplicate intentionally lives in the deck LIST (swipe +
+                    // context menu), not here — mirrors the web design where the
+                    // detail screen has no Duplicate action (item 4).
                     Divider()
                     Button(role: .destructive) { showDeleteConfirm = true } label: {
                         Label("Delete", systemImage: "trash")

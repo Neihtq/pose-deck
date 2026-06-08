@@ -5,12 +5,17 @@
  * tab but is dropped when the tab/browser closes — narrowing the XSS
  * exfiltration window and removing the durable on-disk copy of the token.
  */
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   AUTH_STORAGE_KEY,
+  BACKEND_URL_STORAGE_KEY,
+  clearFileToken,
   createPocketBase,
   createSessionAuthStore,
+  getFileToken,
+  pb,
+  setStoredBackendUrl,
 } from "../pocketbase";
 
 /** A throwaway, syntactically-valid (unsigned) JWT for store round-trips. */
@@ -87,5 +92,67 @@ describe("pocketbase auth store (SEC-OBS-2)", () => {
 
     expect(sessionStorage.getItem(AUTH_STORAGE_KEY)).toBeNull();
     expect(store.token).toBe("");
+  });
+});
+
+/**
+ * Regression test for SEC-1: a short-lived file token is minted against (and
+ * only valid for) a specific backend. {@link setStoredBackendUrl} repoints the
+ * live `pb.baseURL` at a different server; before the fix it left the
+ * module-global cached file token intact, so a token minted for server A could
+ * be appended (via getFileToken/fileUrlWithToken) to an `/api/files` URL that
+ * now resolves against server B. The cache must be invalidated whenever the
+ * resolved baseURL actually changes, and left alone when it does not.
+ */
+describe("file-token cache vs backend-URL switch (SEC-1)", () => {
+  const originalBaseUrl = pb.baseURL;
+
+  beforeEach(() => {
+    localStorage.removeItem(BACKEND_URL_STORAGE_KEY);
+    clearFileToken();
+    pb.baseURL = "http://server-a.test";
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    clearFileToken();
+    localStorage.removeItem(BACKEND_URL_STORAGE_KEY);
+    pb.baseURL = originalBaseUrl;
+  });
+
+  it("re-mints the file token after switching to a different backend", async () => {
+    const getToken = vi
+      .spyOn(pb.files, "getToken")
+      .mockResolvedValueOnce("token-for-server-a")
+      .mockResolvedValueOnce("token-for-server-b");
+
+    // Token minted against server A and cached.
+    expect(await getFileToken()).toBe("token-for-server-a");
+    expect(getToken).toHaveBeenCalledTimes(1);
+
+    // Repoint the client at a different backend.
+    setStoredBackendUrl("http://server-b.test");
+    expect(pb.baseURL).toBe("http://server-b.test");
+
+    // The next file token must be freshly minted against server B, not the
+    // stale server-A token served from cache.
+    expect(await getFileToken()).toBe("token-for-server-b");
+    expect(getToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the cached token when the backend URL is unchanged", async () => {
+    const getToken = vi
+      .spyOn(pb.files, "getToken")
+      .mockResolvedValue("token-for-server-a");
+
+    expect(await getFileToken()).toBe("token-for-server-a");
+    expect(getToken).toHaveBeenCalledTimes(1);
+
+    // Setting the same URL must not needlessly invalidate the cache.
+    setStoredBackendUrl("http://server-a.test");
+    expect(pb.baseURL).toBe("http://server-a.test");
+
+    expect(await getFileToken()).toBe("token-for-server-a");
+    expect(getToken).toHaveBeenCalledTimes(1);
   });
 });

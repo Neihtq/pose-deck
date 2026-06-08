@@ -327,4 +327,31 @@ final class ShootSessionTests: XCTestCase {
         XCTAssertFalse(s.doneIds.contains("a"))
         XCTAssertEqual(s.currentCardId, "a", "undo restores the cursor to the un-done card")
     }
+
+    /// Gauntlet (iOS shoot reorder): undoing a SKIP frame after the upcoming
+    /// suffix was reordered must still reverse the skip cleanly — no card lost or
+    /// duplicated, the skipped flag cleared, and a valid cursor. `reorderUpcoming`
+    /// documents that undo "locates its card by id + reinserts before the cursor"
+    /// so a suffix reorder leaves the undo history valid; the existing
+    /// `testReorderUpcomingPreservesUndoability` only exercised a *done* frame, so
+    /// this pins the skip-frame path against a future change to either operation.
+    func testUndoSkipAfterReorderKeepsWorkingOrderIntact() {
+        var s = session(["a", "b", "c"])
+        s.skip()                                   // [b, c, a]; a skipped; frame .skip(a, from:0)
+        XCTAssertEqual(s.workingOrder, ["b", "c", "a"])
+        s.reorderUpcoming(["c", "b", "a"])         // user reorders the upcoming suffix
+        XCTAssertEqual(s.workingOrder, ["c", "b", "a"])
+        XCTAssertEqual(s.currentCardId, "c")
+        s.undo()                                   // reverse the skip-a
+        // Invariant: the card set is exactly the originals (no loss, no dupe).
+        XCTAssertEqual(Set(s.workingOrder), ["a", "b", "c"], "no card lost or duplicated")
+        XCTAssertEqual(s.workingOrder.count, 3)
+        // The skip is reversed: a is no longer flagged skipped and the session is
+        // back to a not-yet-acted state with a presentable current card.
+        XCTAssertFalse(s.skippedActiveIds.contains("a"), "undo clears the skipped flag")
+        XCTAssertEqual(s.skippedCount, 0)
+        XCTAssertFalse(s.canUndo, "the only frame was popped")
+        XCTAssertNotNil(s.currentCardId, "cursor stays on a presentable card")
+        XCTAssertFalse(s.isComplete)
+    }
 }

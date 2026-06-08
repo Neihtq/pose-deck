@@ -61,7 +61,17 @@ export function setStoredBackendUrl(url: string): void {
       window.localStorage.setItem(BACKEND_URL_STORAGE_KEY, trimmed);
     }
   }
-  pb.baseURL = trimmed !== "" ? trimmed : resolveApiBaseUrl();
+  const nextBaseUrl = trimmed !== "" ? trimmed : resolveApiBaseUrl();
+  // A file token is minted against (and only valid for) a specific server. When
+  // we repoint the client at a different backend, any cached token belongs to
+  // the old server and must never be appended to a /api/files URL that now
+  // resolves against the new one — so invalidate it when the URL changes
+  // (SEC-1). Keeps the cache-vs-baseURL invariant explicit rather than relying
+  // on the fact that setStoredBackendUrl happens to run pre-auth today.
+  if (nextBaseUrl !== pb.baseURL) {
+    clearFileToken();
+  }
+  pb.baseURL = nextBaseUrl;
 }
 
 /**

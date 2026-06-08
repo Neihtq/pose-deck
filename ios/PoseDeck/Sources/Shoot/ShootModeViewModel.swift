@@ -36,8 +36,15 @@ final class ShootModeViewModel {
     /// The pure state machine the view drives.
     private(set) var session: ShootSession
 
-    /// Cached first-image file URL per card id (minted lazily on demand).
+    /// Cached first-image file URL per card id (minted lazily on demand). Drives
+    /// the main card face and the overview thumbnails.
     private(set) var imageURLByCard: [String: URL] = [:]
+
+    /// Cached **all** image file URLs per card id, in `position` order — minted
+    /// for the current card so the swipe-up detail can show a horizontal carousel
+    /// of every reference photo (item 6), not just the first. Populated on demand
+    /// when the detail sheet opens.
+    private(set) var allImageURLsByCard: [String: [URL]] = [:]
 
     init(
         deck: Deck,
@@ -82,6 +89,27 @@ final class ShootModeViewModel {
         guard let id = session.currentCardId else { return nil }
         return imageURLByCard[id]
     }
+
+    /// All image URLs for the current card, in `position` order (item 6 carousel).
+    /// Empty until ``loadAllImagesForCurrentCard()`` resolves them; falls back to
+    /// the single prefetched first image so the detail view is never blank while
+    /// the rest load.
+    var currentCardImageURLs: [URL] {
+        guard let id = session.currentCardId else { return [] }
+        if let all = allImageURLsByCard[id], !all.isEmpty { return all }
+        if let first = imageURLByCard[id] { return [first] }
+        return []
+    }
+
+    /// The upcoming (not-yet-done) cards in shoot order, current card first —
+    /// what the in-shoot overview lists and lets the user reorder (item 5).
+    var upcomingCards: [Card] {
+        session.upcomingIds.compactMap { cardsById[$0] }
+    }
+
+    /// First-image thumbnail URL for any card id, if already prefetched. The
+    /// overview uses this for its row thumbnails.
+    func thumbnailURL(for cardId: String) -> URL? { imageURLByCard[cardId] }
 
     // MARK: - Lifecycle
 
@@ -153,6 +181,53 @@ final class ShootModeViewModel {
         session.reset()
         try? await completionRepo.resetCompletions(forCardIds: Array(scoped), userId: userId)
         await prefetchImages()
+    }
+
+    // MARK: - Overview + reorder (item 5)
+
+    /// Apply a user reorder of the upcoming cards from the overview. `orderedIds`
+    /// is the new order of the not-yet-done cards (current card first). The pure
+    /// session no-ops on a non-permutation, so a stale overview can't corrupt the
+    /// session. Reorder is session-scoped and ephemeral by design (the deck-prep
+    /// screen owns durable, synced reordering); nothing is persisted here.
+    func reorderUpcoming(_ orderedIds: [String]) {
+        session.reorderUpcoming(orderedIds)
+        // The reorder may surface a new current card / new lookahead — prefetch.
+        scheduler.coalesce { [weak self] in await self?.prefetchImages() }
+    }
+
+    /// Prefetch first-image thumbnails for *every* upcoming card (not just the
+    /// 2-card lookahead) so the overview list renders without per-row flashes.
+    /// Best-effort; only mints URLs not already cached.
+    func prefetchOverviewThumbnails() async {
+        for cardId in session.upcomingIds where imageURLByCard[cardId] == nil {
+            guard let images = try? await imageRepo.listCardImages(cardId: cardId),
+                  let first = images.first,
+                  let url = try? await imageRepo.fileURL(for: first) else { continue }
+            imageURLByCard[cardId] = url
+        }
+    }
+
+    // MARK: - Detail carousel (item 6)
+
+    /// Resolve **all** image URLs for the current card (in position order) so the
+    /// swipe-up detail can show a horizontal carousel. Best-effort and idempotent:
+    /// returns early if already resolved for this card. Routed through the
+    /// scheduler-free path because it's awaited directly by the detail sheet's
+    /// `.task`, which SwiftUI cancels on dismiss.
+    func loadAllImagesForCurrentCard() async {
+        guard let cardId = session.currentCardId else { return }
+        if let existing = allImageURLsByCard[cardId], !existing.isEmpty { return }
+        guard let images = try? await imageRepo.listCardImages(cardId: cardId) else { return }
+        var urls: [URL] = []
+        for image in images {
+            if let url = try? await imageRepo.fileURL(for: image) {
+                urls.append(url)
+            }
+        }
+        if !urls.isEmpty {
+            allImageURLsByCard[cardId] = urls
+        }
     }
 
     // MARK: - Transitions (session + persist)

@@ -18,6 +18,8 @@ struct DeckListView: View {
     private let detailFactory: (Deck) -> DeckDetailView
     /// Optional sign-out action shown in the toolbar (wired by the app root).
     private let onSignOut: (() -> Void)?
+    /// Optional Settings sheet content (theme + backend), wired by the app root.
+    private let settingsContent: (() -> AnyView)?
 
     /// Sheet/alert presentation state.
     private enum ActiveSheet: Identifiable {
@@ -33,17 +35,20 @@ struct DeckListView: View {
     @State private var activeSheet: ActiveSheet?
     @State private var deckPendingDelete: Deck?
     @State private var showTrash = false
+    @State private var showSettings = false
 
     init(
         model: DeckListViewModel,
         ticker: MirrorChangeTicker? = nil,
         detailFactory: @escaping (Deck) -> DeckDetailView,
-        onSignOut: (() -> Void)? = nil
+        onSignOut: (() -> Void)? = nil,
+        settingsContent: (() -> AnyView)? = nil
     ) {
         self._model = State(initialValue: model)
         self.ticker = ticker
         self.detailFactory = detailFactory
         self.onSignOut = onSignOut
+        self.settingsContent = settingsContent
     }
 
     var body: some View {
@@ -83,6 +88,11 @@ struct DeckListView: View {
                 .sheet(isPresented: $showTrash) {
                     TrashView(repo: model.repository, ownerId: model.owner)
                         .onDisappear { Task { await model.load() } }
+                }
+                .sheet(isPresented: $showSettings) {
+                    if let settingsContent {
+                        settingsContent()
+                    }
                 }
                 .confirmationDialog(
                     "Move this deck to Trash?",
@@ -155,6 +165,16 @@ struct DeckListView: View {
                 Label("New Deck", systemImage: "plus")
             }
             .accessibilityIdentifier("decks.new")
+        }
+        if settingsContent != nil {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .accessibilityIdentifier("decks.settings")
+            }
         }
     }
 

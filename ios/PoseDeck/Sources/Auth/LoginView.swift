@@ -15,15 +15,24 @@ final class AuthViewModel {
     var email: String = ""
     /// Bound to the password field.
     var password: String = ""
+    /// Bound to the optional backend-URL field (item 4).
+    var backendURL: String = ""
+    /// Whether the server section is expanded (defaults open only when a custom
+    /// backend is already set, so first-time/local users see a clean form).
+    var serverExpanded: Bool = false
     /// Inline error message to surface under the form, or `nil` when clear.
     private(set) var errorMessage: String?
     /// `true` while a sign-in request is in flight (disables submit / shows spinner).
     private(set) var isLoading: Bool = false
 
     private let session: any AuthSession
+    /// Applies a user-entered backend URL (rebuilds the API stack) before sign-in.
+    /// `nil` in previews/tests that don't exercise the backend switch.
+    private let applyBackendURL: ((String) -> Void)?
 
-    init(session: any AuthSession) {
+    init(session: any AuthSession, applyBackendURL: ((String) -> Void)? = nil) {
         self.session = session
+        self.applyBackendURL = applyBackendURL
     }
 
     /// Whether the submit button should be enabled: non-empty trimmed
@@ -34,11 +43,24 @@ final class AuthViewModel {
             && !password.isEmpty
     }
 
-    /// Attempt sign-in. Trims the email, surfaces any failure inline, and clears
-    /// the loading flag in all paths. On success the session publishes the
-    /// authenticated state the root view reacts to.
+    /// Attempt sign-in. Points the app at the entered backend (if any) first so a
+    /// wrong server surfaces as a sign-in failure here, then trims the email,
+    /// surfaces any failure inline, and clears the loading flag in all paths. On
+    /// success the session publishes the authenticated state the root reacts to.
     func signIn() async {
         guard canSubmit else { return }
+
+        // Apply the backend URL only when the user engaged the server field, so
+        // the prefilled default never silently shadows a later config change.
+        if serverExpanded {
+            let trimmedURL = backendURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedURL.isEmpty, URL(string: trimmedURL) == nil {
+                errorMessage = "Enter a valid server URL, e.g. https://api.example.com"
+                return
+            }
+            applyBackendURL?(trimmedURL)
+        }
+
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
@@ -78,17 +100,34 @@ final class AuthViewModel {
 /// the observable ``AuthSession`` state the root observes.
 struct LoginView: View {
     @State private var model: AuthViewModel
+    /// The app environment, for the appearance toggle (item 3) and backend
+    /// switch (item 4). Optional so the `#Preview` can run without one.
+    @Bindable private var env: AppEnvironment
     @FocusState private var focusedField: Field?
 
-    private enum Field { case email, password }
+    private enum Field { case email, password, server }
 
-    /// - Parameter session: the shared auth session to sign in through.
-    init(session: any AuthSession) {
-        _model = State(initialValue: AuthViewModel(session: session))
+    /// - Parameter env: the composition root to sign in through + reconfigure.
+    init(env: AppEnvironment) {
+        self._env = Bindable(env)
+        let vm = AuthViewModel(
+            session: env,
+            applyBackendURL: { env.applyBackendURL($0) }
+        )
+        // Prefill the server field with the live backend so it shows where we'd
+        // connect, and expand the section if the user already set a custom one.
+        vm.backendURL = env.baseURLString
+        vm.serverExpanded = AppConfig.storedBaseURLString != nil
+        _model = State(initialValue: vm)
     }
 
     var body: some View {
         VStack(spacing: 24) {
+            HStack {
+                Spacer()
+                themeMenu
+            }
+
             Spacer(minLength: 0)
 
             VStack(spacing: 8) {
@@ -116,11 +155,15 @@ struct LoginView: View {
 
                 SecureField("Password", text: $model.password)
                     .textContentType(.password)
-                    .submitLabel(.go)
+                    .submitLabel(model.serverExpanded ? .next : .go)
                     .focused($focusedField, equals: .password)
-                    .onSubmit { submit() }
+                    .onSubmit {
+                        if model.serverExpanded { focusedField = .server } else { submit() }
+                    }
                     .padding()
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+
+                serverSection
 
                 if let errorMessage = model.errorMessage {
                     Text(errorMessage)
@@ -156,6 +199,59 @@ struct LoginView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// Appearance menu (item 3) — reachable pre-auth so the login screen honors a
+    /// dark-mode preference instead of flashing light.
+    private var themeMenu: some View {
+        Menu {
+            Picker("Appearance", selection: $env.theme) {
+                ForEach(AppTheme.allCases) { theme in
+                    Label(theme.label, systemImage: theme.symbol).tag(theme)
+                }
+            }
+        } label: {
+            Image(systemName: env.theme.symbol)
+                .font(.title3)
+                .padding(8)
+        }
+        .accessibilityLabel("Appearance")
+        .accessibilityIdentifier("login.theme")
+    }
+
+    /// Optional backend-URL field (item 4): collapsed behind a disclosure so the
+    /// common login stays clean. Expanded by default only when a custom backend
+    /// is already stored.
+    @ViewBuilder
+    private var serverSection: some View {
+        if model.serverExpanded {
+            VStack(alignment: .leading, spacing: 4) {
+                // type: a plain field; we validate with URL(string:) on submit so
+                // the user gets a friendly message rather than silent native
+                // constraint blocking (mirrors the web login).
+                TextField("Server URL", text: $model.backendURL)
+                    .textContentType(.URL)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.go)
+                    .focused($focusedField, equals: .server)
+                    .onSubmit { submit() }
+                    .padding()
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                Text("The Pose Deck backend to connect to. Leave the default unless you self-host.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityIdentifier("login.server-field")
+        } else {
+            Button("Use a different server") {
+                model.serverExpanded = true
+            }
+            .font(.footnote)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityIdentifier("login.server-disclosure")
+        }
+    }
+
     /// Kick off sign-in, dismissing the keyboard first.
     private func submit() {
         guard model.canSubmit else { return }
@@ -165,39 +261,14 @@ struct LoginView: View {
 }
 
 #if DEBUG
-/// In-memory fake session for previews: flips `currentUser` after a short delay,
-/// or throws to exercise the error path.
+/// Build an in-memory ``AppEnvironment`` for previews (no on-disk store / network).
 @MainActor
-@Observable
-private final class PreviewAuthSession: AuthSession {
-    private(set) var currentUser: User?
-    let shouldFail: Bool
-
-    init(shouldFail: Bool = false) { self.shouldFail = shouldFail }
-
-    func signIn(email: String, password: String) async throws {
-        try? await Task.sleep(nanoseconds: 600_000_000)
-        if shouldFail {
-            throw APIClientError.httpError(status: 400, body: Data())
-        }
-        currentUser = User(
-            id: "preview-user",
-            email: email,
-            name: "Preview",
-            created: nil,
-            updated: nil
-        )
-    }
-
-    func signOut() async { currentUser = nil }
-    func restore() async {}
+private func previewEnvironment() -> AppEnvironment {
+    let container = try! LocalMirrorStore.makeContainer(inMemory: true)
+    return AppEnvironment(modelContainer: container, keychain: InMemoryKeychainStore())
 }
 
 #Preview("Login") {
-    LoginView(session: PreviewAuthSession())
-}
-
-#Preview("Login – error") {
-    LoginView(session: PreviewAuthSession(shouldFail: true))
+    LoginView(env: previewEnvironment())
 }
 #endif

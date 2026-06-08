@@ -20,6 +20,7 @@ struct ShootModeView: View {
 
     @State private var dragOffset: CGSize = .zero
     @State private var showDetailSheet = false
+    @State private var showOverviewSheet = false
 
     init(_ model: ShootModeViewModel) {
         self._model = State(initialValue: model)
@@ -27,7 +28,9 @@ struct ShootModeView: View {
 
     var body: some View {
         ZStack {
-            Color(.systemBackground).ignoresSafeArea()
+            // Grouped background so the elevated card face (item 2) reads as a
+            // card sitting on a surface. Semantic color → adapts to theme (item 3).
+            Color(.systemGroupedBackground).ignoresSafeArea()
             content
             topBar
         }
@@ -40,7 +43,15 @@ struct ShootModeView: View {
         .onDisappear { model.cancelPendingWork() }
         .sheet(isPresented: $showDetailSheet) {
             if let card = model.currentCard {
-                CardDetailSheet(card: card, imageURL: model.currentImageURL)
+                // The detail sheet shows ALL of the card's reference photos in a
+                // horizontal carousel (item 6), not just the first. It resolves
+                // the full set on appear; until then it falls back to the single
+                // prefetched first image so it's never blank.
+                CardDetailSheet(
+                    card: card,
+                    imageURLs: model.currentCardImageURLs,
+                    loadAllImages: { await model.loadAllImagesForCurrentCard() }
+                )
             }
         }
         // Single bottom control bar (replaces the old in-card hintBar + the
@@ -48,6 +59,10 @@ struct ShootModeView: View {
         // card lays out *above* it and the buttons never sit on top of the card
         // content. Buttons drive the SAME view-model methods as the gestures.
         .safeAreaInset(edge: .bottom) { controlBar }
+        // Upcoming-cards overview (item 5): see the shoot order and reorder it.
+        .sheet(isPresented: $showOverviewSheet) {
+            ShootOverviewSheet(model: model)
+        }
     }
 
     @ViewBuilder
@@ -65,33 +80,43 @@ struct ShootModeView: View {
     // MARK: - Current card
 
     private func cardView(_ card: Card) -> some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 0) {
             Spacer(minLength: 0)
-            cardImage
-                .accessibilityIdentifier("shoot.card-image")
-            VStack(spacing: 6) {
-                Text(card.title.isEmpty ? "Untitled card" : card.title)
-                    .font(.title2.weight(.semibold))
-                    .multilineTextAlignment(.center)
-                    .accessibilityIdentifier("shoot.card-title")
-                let meta = [card.timeSlot, card.subjects]
-                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                    .joined(separator: " • ")
-                if !meta.isEmpty {
-                    Text(meta).font(.subheadline).foregroundStyle(.secondary)
-                }
-                if let direction = card.direction?.trimmingCharacters(in: .whitespacesAndNewlines), !direction.isEmpty {
-                    Text(direction)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+            // The card "face": a real card surface (elevated fill, continuous
+            // rounded corners, hairline stroke, soft shadow) so shoot mode reads
+            // as a physical deck of cards instead of a bare list of fields
+            // (item 2). The drag transform is applied to this whole surface below.
+            VStack(spacing: 16) {
+                cardImage
+                    .accessibilityIdentifier("shoot.card-image")
+                VStack(spacing: 6) {
+                    Text(card.title.isEmpty ? "Untitled card" : card.title)
+                        .font(.title2.weight(.semibold))
                         .multilineTextAlignment(.center)
+                        .accessibilityIdentifier("shoot.card-title")
+                    let meta = [card.timeSlot, card.subjects]
+                        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " • ")
+                    if !meta.isEmpty {
+                        Text(meta).font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    if let direction = card.direction?.trimmingCharacters(in: .whitespacesAndNewlines), !direction.isEmpty {
+                        Text(direction)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
                 }
+                .padding(.horizontal)
             }
-            .padding(.horizontal)
+            .padding(24)
+            .frame(maxWidth: .infinity)
+            .background(cardSurface)
             Spacer(minLength: 0)
         }
-        .padding()
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
         .offset(dragOffset)
         // Rotate toward the drag direction (~12° at full throw) and ease the scale
         // down slightly so the card feels physical instead of stiff (item 2).
@@ -110,6 +135,20 @@ struct ShootModeView: View {
 
     /// The id the card view is keyed on — the pure session's current card id.
     private var session: ShootSession { model.session }
+
+    /// The card-face background: an elevated surface with continuous rounded
+    /// corners, a hairline border, and a soft shadow so the shoot card looks
+    /// like a real card (item 2). Uses semantic system colors so it adapts to
+    /// the active light/dark theme (item 3).
+    private var cardSurface: some View {
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .fill(Color(.secondarySystemGroupedBackground))
+            .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.18), radius: 18, x: 0, y: 10)
+    }
 
     @ViewBuilder
     private var cardImage: some View {
@@ -223,10 +262,23 @@ struct ShootModeView: View {
 
                 Spacer()
 
+                // Tapping the progress opens the upcoming-cards overview (item 5);
+                // it doubles as the visible "shoot order" affordance. Kept as a
+                // plain VStack of Texts (NOT a Button/Label) so `shoot.progress`
+                // keeps its exact "Card N of M" accessibility label the XCUITest
+                // asserts on — a Button/Label subtree would merge or shadow it.
+                // Tappability is added via `.onTapGesture` + an explicit button
+                // trait for VoiceOver, leaving the accessibility tree unchanged.
                 VStack(spacing: 4) {
-                    Text(model.progressText)
-                        .font(.headline)
-                        .accessibilityIdentifier("shoot.progress")
+                    HStack(spacing: 6) {
+                        Image(systemName: "list.bullet")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        Text(model.progressText)
+                            .font(.headline)
+                            .accessibilityIdentifier("shoot.progress")
+                    }
                     if model.skippedCount > 0 {
                         Text("+\(model.skippedCount) skipped")
                             .font(.caption)
@@ -234,6 +286,10 @@ struct ShootModeView: View {
                             .accessibilityIdentifier("shoot.skipped-count")
                     }
                 }
+                .contentShape(Rectangle())
+                .onTapGesture { if !model.isComplete { showOverviewSheet = true } }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint("Shows and reorders upcoming cards")
 
                 Spacer()
 
@@ -305,28 +361,23 @@ private extension Comparable {
     }
 }
 
-/// Swipe-up detail sheet: the full image and the card's notes. Dismiss by
-/// swiping down (system) or tapping the close button.
+/// Swipe-up detail sheet: a horizontal carousel of ALL the card's reference
+/// photos (item 6) plus the card's notes. Dismiss by swiping down (system) or
+/// tapping the close button.
 private struct CardDetailSheet: View {
     let card: Card
-    let imageURL: URL?
+    /// All resolved image URLs in position order. May start with just the
+    /// prefetched first image and grow once `loadAllImages` resolves the rest.
+    let imageURLs: [URL]
+    /// Resolves the full image set for the current card (best-effort, idempotent).
+    let loadAllImages: () async -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    if let imageURL {
-                        // Protected token-bearing URL — non-persisting session (SEC-IOS-B).
-                        ProtectedAsyncImage(url: imageURL) { phase in
-                            if case .success(let image) = phase {
-                                image.resizable().scaledToFit()
-                            } else {
-                                Color.clear.frame(height: 1)
-                            }
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    }
+                    imageCarousel
                     Text(card.title.isEmpty ? "Untitled card" : card.title)
                         .font(.title3.weight(.semibold))
                     if let direction = card.direction, !direction.isEmpty {
@@ -347,6 +398,51 @@ private struct CardDetailSheet: View {
             }
         }
         .accessibilityIdentifier("shoot.detail-sheet")
+        // Resolve the rest of the card's images once the sheet is on screen.
+        .task { await loadAllImages() }
+    }
+
+    /// Horizontally scrollable, paged carousel of the card's images. With a
+    /// single image it shows just that image (no paging affordance); with
+    /// several it pages between them and shows an "n of m" counter. Each image is
+    /// loaded through the non-persisting session (SEC-IOS-B).
+    @ViewBuilder
+    private var imageCarousel: some View {
+        if imageURLs.isEmpty {
+            EmptyView()
+        } else if imageURLs.count == 1 {
+            carouselImage(imageURLs[0])
+                .accessibilityIdentifier("shoot.detail-carousel")
+        } else {
+            VStack(spacing: 8) {
+                TabView {
+                    ForEach(Array(imageURLs.enumerated()), id: \.offset) { _, url in
+                        carouselImage(url)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .always))
+                .indexViewStyle(.page(backgroundDisplayMode: .always))
+                .frame(height: 360)
+                .accessibilityIdentifier("shoot.detail-carousel")
+                Text("\(imageURLs.count) photos — swipe to browse")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func carouselImage(_ url: URL) -> some View {
+        ProtectedAsyncImage(url: url) { phase in
+            switch phase {
+            case .success(let image):
+                image.resizable().scaledToFit()
+            case .failure:
+                Color.clear.frame(height: 1)
+            default:
+                ProgressView().frame(maxWidth: .infinity, minHeight: 200)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private func labeled(_ label: String, _ value: String) -> some View {

@@ -202,6 +202,45 @@ public struct ShootSession: Sendable, Equatable {
         }
     }
 
+    /// The presentable upcoming cards — every not-yet-done id from the cursor
+    /// onward, in working order. This is exactly what an in-shoot overview lists
+    /// and what ``reorderUpcoming(_:)`` accepts a permutation of. The current
+    /// card is the first element (or empty when complete).
+    public var upcomingIds: [String] {
+        guard index < workingOrder.count else { return [] }
+        return workingOrder[index...].filter { !doneIds.contains($0) }
+    }
+
+    /// Reorder the upcoming (not-yet-done) cards in place — the live "shoot this
+    /// next" decision an in-shoot overview offers (item 5). Reorder is **session
+    /// scoped and ephemeral**, exactly like the rest of the working order: it is
+    /// never persisted or synced (the deck-prep screen owns durable reordering).
+    ///
+    /// `newOrder` must be a permutation of ``upcomingIds`` — any id added,
+    /// dropped, or duplicated makes the call a **no-op**, so a stale overview can
+    /// never corrupt the session (total count and cursor are preserved). Done
+    /// cards sitting ahead of the cursor (the hydrated shape) keep their slots;
+    /// only the not-done ids are repositioned. This does **not** push an undo
+    /// frame: Undo reverses the last *swipe*, not a reorder, and undo locates its
+    /// card by id + reinserts before the cursor, so a suffix reorder leaves the
+    /// existing undo history valid.
+    public mutating func reorderUpcoming(_ newOrder: [String]) {
+        guard index <= workingOrder.count else { return }
+        let suffix = Array(workingOrder[index...])
+        let notDone = suffix.filter { !doneIds.contains($0) }
+        // Permutation guard: same membership AND same count (rejects dupes).
+        guard newOrder.count == notDone.count, Set(newOrder) == Set(notDone) else {
+            return
+        }
+        // Walk the original suffix; refill each not-done slot from `newOrder` in
+        // order, leaving any done-ahead ids pinned to their positions.
+        var feed = newOrder.makeIterator()
+        let rebuiltSuffix = suffix.map { id in
+            doneIds.contains(id) ? id : (feed.next() ?? id)
+        }
+        workingOrder = Array(workingOrder[..<index]) + rebuiltSuffix
+    }
+
     /// Restore the session to its starting state so the deck can be re-shot
     /// (item 3): the working order returns to ``originalOrder`` (undoing any
     /// `skip()` reorders), the cursor returns to the start, and all progress

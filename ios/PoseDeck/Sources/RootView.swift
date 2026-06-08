@@ -17,9 +17,7 @@ import PoseDeckCore
 /// is driven through the auth/scene lifecycle so the mirror backfills, realtime
 /// connects, and the outbox drains for the signed-in session.
 struct RootView: View {
-    private let apiClient: APIClient
-    @State private var auth: AuthService
-    @State private var sync: SyncCoordinator
+    @State private var env: AppEnvironment
     @Environment(\.scenePhase) private var scenePhase
     /// Tracks whether the launch-time session restore has completed so we don't
     /// flash the login screen before the keychain is consulted.
@@ -28,11 +26,13 @@ struct RootView: View {
     /// we start it exactly once per sign-in.
     @State private var didStartSync = false
 
-    init(apiClient: APIClient, authService: AuthService, sync: SyncCoordinator) {
-        self.apiClient = apiClient
-        self._auth = State(initialValue: authService)
-        self._sync = State(initialValue: sync)
+    init(env: AppEnvironment) {
+        self._env = State(initialValue: env)
     }
+
+    /// Convenience accessors so the body reads the same as before the env refactor.
+    private var auth: AppEnvironment { env }
+    private var sync: SyncCoordinator { env.sync }
 
     var body: some View {
         Group {
@@ -42,7 +42,7 @@ struct RootView: View {
             } else if auth.isAuthenticated, let ownerId = auth.currentUserId {
                 deckList(ownerId: ownerId)
             } else {
-                LoginView(session: auth)
+                LoginView(env: env)
             }
         }
         .task {
@@ -94,7 +94,9 @@ struct RootView: View {
             },
             onSignOut: {
                 Task { await auth.signOut() }
-            }
+            },
+            // Settings sheet hosts the theme picker (item 3) + backend info (item 4).
+            settingsContent: { AnyView(SettingsView(env: env)) }
         )
     }
 

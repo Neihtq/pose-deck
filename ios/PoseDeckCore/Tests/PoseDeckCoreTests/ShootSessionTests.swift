@@ -261,4 +261,70 @@ final class ShootSessionTests: XCTestCase {
         XCTAssertTrue(s.skippedActiveIds.isEmpty)
         XCTAssertFalse(s.isComplete)
     }
+
+    // MARK: - upcomingIds + reorderUpcoming (in-shoot overview, item 5)
+
+    func testUpcomingIdsListsNotDoneFromCursor() {
+        var s = session(["a", "b", "c", "d"])
+        XCTAssertEqual(s.upcomingIds, ["a", "b", "c", "d"])
+        s.markDone()                                   // a done, cursor at b
+        XCTAssertEqual(s.upcomingIds, ["b", "c", "d"], "done card drops out of upcoming")
+        XCTAssertEqual(s.upcomingIds.first, s.currentCardId)
+    }
+
+    func testUpcomingIdsEmptyWhenComplete() {
+        var s = session(["a"])
+        s.markDone()
+        XCTAssertNil(s.currentCardId)
+        XCTAssertEqual(s.upcomingIds, [])
+    }
+
+    func testReorderUpcomingPermutesWorkingOrder() {
+        var s = session(["a", "b", "c", "d"])
+        s.reorderUpcoming(["c", "a", "d", "b"])
+        XCTAssertEqual(s.workingOrder, ["c", "a", "d", "b"])
+        XCTAssertEqual(s.currentCardId, "c", "the new first upcoming card is current")
+        XCTAssertEqual(s.progress.total, 4, "count is preserved")
+    }
+
+    func testReorderUpcomingOnlyTouchesSuffixAfterCursor() {
+        var s = session(["a", "b", "c", "d"])
+        s.markDone()                                   // a done, cursor at index 1 (b)
+        s.reorderUpcoming(["d", "b", "c"])             // reorder the upcoming suffix
+        XCTAssertEqual(s.workingOrder, ["a", "d", "b", "c"], "done prefix 'a' is pinned")
+        XCTAssertEqual(s.currentCardId, "d")
+        XCTAssertTrue(s.doneIds.contains("a"))
+    }
+
+    func testReorderUpcomingPinsDoneCardsAheadOfCursor() {
+        // Hydrated session leaves a done card ahead of the cursor in position order.
+        var s = ShootSession(cardIds: ["a", "b", "c", "d"], doneIds: ["c"], skippedActiveIds: [])
+        XCTAssertEqual(s.currentCardId, "a")
+        XCTAssertEqual(s.upcomingIds, ["a", "b", "d"], "done 'c' is excluded from upcoming")
+        s.reorderUpcoming(["b", "d", "a"])
+        // 'c' stays pinned at its original slot (index 2); not-done ids refill around it.
+        XCTAssertEqual(s.workingOrder, ["b", "d", "c", "a"])
+        XCTAssertTrue(s.doneIds.contains("c"))
+    }
+
+    func testReorderUpcomingRejectsNonPermutation() {
+        var s = session(["a", "b", "c"])
+        let before = s.workingOrder
+        s.reorderUpcoming(["a", "b"])              // missing an id
+        XCTAssertEqual(s.workingOrder, before, "dropped id → no-op")
+        s.reorderUpcoming(["a", "b", "c", "x"])    // extra id
+        XCTAssertEqual(s.workingOrder, before, "added id → no-op")
+        s.reorderUpcoming(["a", "a", "b"])         // duplicate
+        XCTAssertEqual(s.workingOrder, before, "duplicate id → no-op")
+    }
+
+    func testReorderUpcomingPreservesUndoability() {
+        var s = session(["a", "b", "c"])
+        s.markDone()                               // done a; undo frame pushed
+        s.reorderUpcoming(["c", "b"])              // reorder the remaining upcoming
+        XCTAssertEqual(s.currentCardId, "c")
+        s.undo()                                   // reverse the done-a
+        XCTAssertFalse(s.doneIds.contains("a"))
+        XCTAssertEqual(s.currentCardId, "a", "undo restores the cursor to the un-done card")
+    }
 }

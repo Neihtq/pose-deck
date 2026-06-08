@@ -1,7 +1,33 @@
 # Pose Deck — Build Status & Resume Point
 
-> Living scratchpad for picking up across sessions/reboots. Last updated: 2026-06-07.
+> Living scratchpad for picking up across sessions/reboots. Last updated: 2026-06-08.
 > Authoritative plan: `docs/PROJECT_PLAN.md`. Spec: `docs/DESIGN.md`, `docs/ARCHITECTURE.md`.
+
+## UX round 2 (2026-06-08) — 6 user-requested improvements, all shipped
+
+All built, gauntlet-passed, and verified (full XCUITest suite + web tests green):
+1. **Multi-image layout overlap (iOS editor)** — `CardImagesSection` thumbnails used
+   `.aspectRatio(1,.fill)` which overflowed grid cells into the buttons; fixed with a
+   `Color.clear` square + overlay + clip (canonical idiom). Verified on 5-image + extreme
+   mixed-aspect cards.
+2. **Shoot cards look like real cards (iOS)** — elevated surface, rounded corners, shadow.
+3. **Light/Dark/System theme switch (iOS)** — `AppEnvironment` owns the pref;
+   `preferredColorScheme` at root; picker in new Settings sheet (gear) + login menu. (Web
+   already had a theme toggle; added it to the web login too.)
+4. **Backend URL at login (web + iOS)** — "Use a different server" field, persisted
+   (localStorage / UserDefaults), precedence override→env→default. iOS rebuilds the API
+   stack (`AppEnvironment`) against the entered URL pre-auth.
+5. **In-shoot overview + reorder (iOS)** — tap the progress header → sheet lists upcoming
+   cards, drag to reorder what you shoot next. `ShootSession.reorderUpcoming` (permutation-
+   guarded, session-ephemeral; deck prep owns durable order).
+6. **Multi-image carousel in shoot detail (iOS)** — swipe-up shows ALL photos paged, not
+   just the first.
+
+Also this round: reverted `Config.xcconfig` default to **localhost** (the LAN IP from
+`fb109d6` had silently broken simulator XCUITests). Both milestone gauntlets ran and found
+**0 defects in the new features** but surfaced + fixed 9 findings in pre-existing M0–M8 code
+(committed separately, `6743519`). ⚠️ Gauntlet flag for the user: on the dev PocketBase,
+`card_images` files serve WITHOUT token enforcement despite a viewRule — confirm prod gating.
 
 ## Where we are
 
@@ -21,7 +47,9 @@
 is device-only / deploy / sign-off — see `docs/HANDOFF.md`.
 
 Working tree clean, all on `main`, nothing pushed (push only when asked).
-Latest commit: `4b77882 M3 iOS: fix SwiftData @Model crash + verify on sim`.
+Latest commits (UX round 2, 2026-06-08): `6125b42` web backend-URL+theme, `be61baa`
+iOS items 2/3/4/5/6, `284d0db` iOS multi-image layout fix, `9026d48` SEC-1, `6743519`
+gauntlet hardening of pre-existing code.
 
 ## M3 sync — what shipped (done 2026-06-07)
 Local-first outbox + realtime + offline, both clients (ARCHITECTURE.md §4).

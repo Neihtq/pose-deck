@@ -26,6 +26,13 @@ final class CardImagesViewModel {
     private(set) var images: [CardImage] = []
     /// Resolved (token-carrying) display URLs keyed by image id; populated async.
     private(set) var imageURLs: [String: URL] = [:]
+    /// Per-image count of consecutive token re-mints in the current `.failure`
+    /// streak (SWIFT-A1). PocketBase mints a fresh `?token=` per `fileURL(for:)`,
+    /// so a naive "URL changed" guard never fires on a genuine 404 and the
+    /// `.failure -> re-mint -> re-render -> .failure` chain spins forever. We cap
+    /// re-mints per image identity via `ThumbnailRefresh.shouldApply`. A fresh
+    /// `resolveURLs()` pass clears the streaks.
+    private var remintAttempts: [String: Int] = [:]
 
     /// True while the initial image list loads.
     private(set) var isLoading = false
@@ -67,6 +74,10 @@ final class CardImagesViewModel {
             }
         }
         imageURLs = resolved
+        // A fresh resolve pass ends any prior per-image re-mint streak, so an
+        // image that previously hit the genuine-404 cap gets another chance to
+        // recover (e.g. restored bytes, or a legitimate later token expiry).
+        remintAttempts.removeAll()
     }
 
     /// Re-mint a single image's display URL after its `AsyncImage` failed to
@@ -75,8 +86,16 @@ final class CardImagesViewModel {
     /// infinite reload loop on a genuine 404 (mirrors the web `handleImageError`).
     func refreshURL(for image: CardImage) async {
         guard let fresh = try? await repository.fileURL(for: image) else { return }
-        if imageURLs[image.id] != fresh {
+        let current = imageURLs[image.id]
+        let attempts = remintAttempts[image.id, default: 0]
+        // Reset the streak if the underlying image identity changed.
+        let identityChanged = current.map {
+            ThumbnailRefresh.identity(of: fresh) != ThumbnailRefresh.identity(of: $0)
+        } ?? true
+        let effectiveAttempts = identityChanged ? 0 : attempts
+        if ThumbnailRefresh.shouldApply(fresh: fresh, current: current, attempts: effectiveAttempts) {
             imageURLs[image.id] = fresh
+            remintAttempts[image.id] = effectiveAttempts + 1
         }
     }
 

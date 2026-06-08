@@ -15,6 +15,9 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { db } from "@/lib/db";
+import type { Deck } from "@/lib/types";
+
 // --- Mock data-access + side-effect modules -------------------------------
 const createCard = vi.fn();
 const updateCard = vi.fn();
@@ -52,7 +55,24 @@ vi.mock("@/components/ui/use-toast", () => ({
   toast: vi.fn(),
 }));
 
+vi.mock("@/features/auth/AuthContext", () => ({
+  clearAuthOnUnauthorized: vi.fn(() => false),
+  // The editor is owner-only; render as the deck owner so the form mounts.
+  useAuth: () => ({ user: { id: "owner1", email: "owner@posedeck.test" } }),
+}));
+
 import CardEditor from "@/features/cards/CardEditor";
+
+const DECK: Deck = {
+  id: "deck1",
+  owner: "owner1",
+  name: "Owned Deck",
+  shoot_date: "",
+  client_updated_at: "",
+  created: "",
+  updated: "",
+  deleted_at: "",
+};
 
 function renderCreatePage() {
   return render(
@@ -68,19 +88,24 @@ function renderCreatePage() {
   );
 }
 
-function titleInput(): HTMLInputElement {
-  return screen.getByLabelText(/Title/i) as HTMLInputElement;
+async function titleInput(): Promise<HTMLInputElement> {
+  // The owner-gated editor mounts only after the deck live query resolves.
+  return (await screen.findByLabelText(/Title/i)) as HTMLInputElement;
 }
 
 function saveButton(): HTMLButtonElement {
   return screen.getByRole("button", { name: /Create card/i }) as HTMLButtonElement;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   createCard.mockReset();
   createCard.mockResolvedValue({ id: "card1" });
   updateCard.mockReset();
   softDeleteCard.mockReset();
+  // Owner-gated editor: seed the deck (owned by the test user) so the form
+  // mounts in create mode.
+  await db.decks.clear();
+  await db.decks.put(DECK);
 });
 
 describe("CardEditor title length cap (DESIGN.md §3.1 ≤60)", () => {
@@ -88,7 +113,7 @@ describe("CardEditor title length cap (DESIGN.md §3.1 ≤60)", () => {
     renderCreatePage();
 
     const maxTitle = "a".repeat(60);
-    fireEvent.change(titleInput(), { target: { value: maxTitle } });
+    fireEvent.change(await titleInput(), { target: { value: maxTitle } });
 
     // No "too long" error at exactly 60 chars.
     expect(
@@ -110,14 +135,15 @@ describe("CardEditor title length cap (DESIGN.md §3.1 ≤60)", () => {
   it("rejects a 61-char title (exceeds the ≤60 product cap)", async () => {
     renderCreatePage();
 
-    fireEvent.change(titleInput(), { target: { value: "a".repeat(61) } });
+    fireEvent.change(await titleInput(), { target: { value: "a".repeat(61) } });
 
     expect(screen.getByText(/characters or fewer/i)).toBeInTheDocument();
     expect(saveButton()).toBeDisabled();
   });
 
-  it("shows the 60-char counter denominator", () => {
+  it("shows the 60-char counter denominator", async () => {
     renderCreatePage();
+    await titleInput();
     expect(screen.getByText("0/60")).toBeInTheDocument();
   });
 });

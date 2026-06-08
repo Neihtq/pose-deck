@@ -45,6 +45,16 @@ final class DeckDetailViewModel {
     /// write-back (their live URL is at least as fresh as the pass's own).
     private var refreshedDuringLoad: Set<String> = []
 
+    /// Per-card count of consecutive thumbnail token re-mints in the current
+    /// `.failure` streak (SWIFT-A1). PocketBase mints a fresh `?token=` on every
+    /// `fileURL(for:)` call, so a naive "URL changed" guard never fires on a
+    /// genuine 404 and the `.failure -> re-mint -> re-render -> .failure` chain
+    /// spins forever. We cap re-mints per card identity via
+    /// `ThumbnailRefresh.shouldApply`. Reset when the card's underlying image
+    /// identity changes (a successful load also implicitly ends the streak by
+    /// not re-firing `.failure`). `@MainActor` serializes all mutation.
+    private var thumbnailRemintAttempts: [String: Int] = [:]
+
     /// Current guests of this deck (M5 sharing), oldest grant first. Re-read on
     /// the ticker bump so a realtime grant/revoke reflects live in the share UI.
     private(set) var guests: [DeckGuest] = []
@@ -66,6 +76,15 @@ final class DeckDetailViewModel {
     /// flag. `isReordering` is bound by the view to disable drag while busy.
     private var reorderGate = ReorderGate()
     var isReordering: Bool { reorderGate.isBusy }
+
+    /// Serializes in-flight guest grants so the share screen's two invocation
+    /// paths — the Share button and the email field's `.onSubmit` (keyboard
+    /// Return) — cannot both spawn a `grantGuest` network round-trip for the same
+    /// email (SWIFT-A2). The view's `isSubmitting` `@State` only disables the
+    /// Button, not `.onSubmit`, so the guard must live inside `grantGuest` to
+    /// cover every caller. Mirrors `reorderGate` / the web submitting flag.
+    private var grantGate = GuestGrantGate()
+    var isGranting: Bool { grantGate.isBusy }
 
     init(
         deck: Deck,
@@ -135,6 +154,11 @@ final class DeckDetailViewModel {
         thumbnailLoadGeneration &+= 1
         let generation = thumbnailLoadGeneration
         refreshedDuringLoad.removeAll()
+        // A fresh wholesale resolve pass ends any prior per-card re-mint streak:
+        // the cards are being re-read from scratch, so a card that previously hit
+        // the genuine-404 re-mint cap gets another chance to recover (e.g. the
+        // file's bytes were since restored, or a legitimate later token expiry).
+        thumbnailRemintAttempts.removeAll()
 
         // swift-mirror-image-network-per-read: fan the per-card resolve out
         // CONCURRENTLY (one batch of round-trips, not N serialized ones) and let
@@ -184,8 +208,21 @@ final class DeckDetailViewModel {
             let images = try await imageRepo.listCardImages(cardId: card.id)
             guard let first = images.first else { return }
             let fresh = try await imageRepo.fileURL(for: first)
-            if ThumbnailRefresh.shouldApply(fresh: fresh, current: thumbnailURLs[card.id]) {
+            let current = thumbnailURLs[card.id]
+            let attempts = thumbnailRemintAttempts[card.id, default: 0]
+            // If the underlying image identity changed, this is a fresh subject —
+            // reset the re-mint streak before deciding.
+            let identityChanged = current.map {
+                ThumbnailRefresh.identity(of: fresh) != ThumbnailRefresh.identity(of: $0)
+            } ?? true
+            let effectiveAttempts = identityChanged ? 0 : attempts
+            if ThumbnailRefresh.shouldApply(fresh: fresh, current: current, attempts: effectiveAttempts) {
                 thumbnailURLs[card.id] = fresh
+                // Count this re-mint against the per-identity cap. A reset is
+                // implicit: on identity change we start the streak at the value
+                // we just applied; a genuine 404 will keep incrementing until
+                // `shouldApply` refuses, breaking the loop.
+                thumbnailRemintAttempts[card.id] = effectiveAttempts + 1
                 // Mark this card so an in-flight `loadThumbnails()` pass (SWIFT-3)
                 // preserves this newer re-mint instead of clobbering it on
                 // write-back. Harmless when no load pass is in flight.
@@ -320,6 +357,13 @@ final class DeckDetailViewModel {
         guard let guestRepo else { return }
         let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // SWIFT-A2: re-entry guard at the source so BOTH the Share button and the
+        // email field's `.onSubmit` (keyboard Return) paths are gated by one
+        // in-flight flag. Without this, a Return racing a Share tap (or two rapid
+        // Returns) spawns two overlapping grant round-trips for the same email.
+        // The view's `isSubmitting` only disables the Button, not `.onSubmit`.
+        guard grantGate.begin() else { return }
+        defer { grantGate.finish() }
         do {
             let resolved = try await guestRepo.grantGuest(deckId: deck.id, email: trimmed)
             // Reload the mirror FIRST, then decide duplicate against the fresh

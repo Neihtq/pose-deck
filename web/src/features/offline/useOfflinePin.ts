@@ -50,11 +50,17 @@ export function useOfflinePin(deckId: string | undefined): OfflinePinState {
 
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // Synchronous in-flight guard: the closed-over `busy` state is only updated
+  // after a re-render commits, so two same-frame double-taps would both read
+  // busy=false and both pass a state-based guard. A ref mutates synchronously,
+  // closing that re-entrancy window (matches useImageUpload's pattern).
+  const inFlight = React.useRef(false);
 
   const togglePin = React.useCallback(async () => {
-    if (!deckId || busy) {
+    if (!deckId || inFlight.current) {
       return;
     }
+    inFlight.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -70,9 +76,10 @@ export function useOfflinePin(deckId: string | undefined): OfflinePinState {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not update offline copy.");
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
-  }, [deckId, busy]);
+  }, [deckId]);
 
   return {
     pinned,

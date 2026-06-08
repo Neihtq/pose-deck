@@ -17,9 +17,16 @@
  *
  * On save → createCard/updateCard, then navigate back to the deck. Delete →
  * softDeleteCard (never hard-delete).
+ *
+ * Owner gating (DESIGN.md §6 "Guests cannot edit cards", §9 web = owner
+ * prep/edit): the card editor is owner-only. A guest reaches a deck read-only
+ * (shared decks sync down into their deck list), so if a guest navigates to a
+ * card-editor URL we redirect them back to the deck rather than render an
+ * editable form. Server-side PB rules already reject guest writes; this keeps
+ * the UX consistent with the read-only intent instead of showing error toasts.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Navigate, useNavigate, useParams } from "react-router-dom";
 import { ImagePlus, Loader2, Trash2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -41,10 +48,11 @@ import { toast } from "@/components/ui/use-toast";
 import { cn } from "@/lib/utils";
 
 import { db } from "@/lib/db";
-import { liveCardImages } from "@/lib/localStore";
-import type { Card, CardImage } from "@/lib/types";
+import { liveCardImages, liveDeck } from "@/lib/localStore";
+import { useLiveQuery } from "@/lib/useLiveQuery";
+import type { Card, CardImage, Deck } from "@/lib/types";
 
-import { clearAuthOnUnauthorized } from "@/features/auth/AuthContext";
+import { clearAuthOnUnauthorized, useAuth } from "@/features/auth/AuthContext";
 
 import {
   type CardFields,
@@ -88,8 +96,21 @@ function formFromCard(card: Card): Required<CardFields> {
 
 export default function CardEditor(): JSX.Element {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const { deckId, cardId } = useParams<{ deckId: string; cardId?: string }>();
   const isEdit = Boolean(cardId);
+
+  // Owner gating (DESIGN.md §6 / §9): the editor is owner-only. Resolve the
+  // deck from Dexie (local-first, same source the deck detail page uses) and
+  // compute ownership. `undefined` = still loading; `null` = missing deck.
+  const deckRow = useLiveQuery<Deck | null>(
+    () => (deckId ? liveDeck(db, deckId).then((d) => d ?? null) : Promise.resolve(null)),
+    [deckId],
+  );
+  const deckLoading = deckRow === undefined;
+  // Once the deck has loaded, a non-owner is a guest who must not reach the
+  // editable form. We treat an unauthenticated session (no user) the same way.
+  const isOwner = !!deckRow && !!user && deckRow.owner === user.id;
 
   const [form, setForm] = useState<Required<CardFields>>(EMPTY_FORM);
   const [images, setImages] = useState<CardImage[]>([]);
@@ -288,6 +309,25 @@ export default function CardEditor(): JSX.Element {
         <p className="text-sm text-destructive">Missing deck.</p>
       </div>
     );
+  }
+
+  // Wait for the deck to load before deciding ownership so we don't flash a
+  // redirect for the owner while the live query is still resolving.
+  if (deckLoading) {
+    return (
+      <div className="mx-auto max-w-2xl px-4 py-10">
+        <div className="flex items-center gap-2 text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading…
+        </div>
+      </div>
+    );
+  }
+
+  // Guests (or anyone who isn't the deck owner) get the read-only deck instead
+  // of an editable form. DESIGN.md §6: "Guests cannot edit cards."
+  if (!isOwner) {
+    return <Navigate to={`/decks/${deckId}`} replace />;
   }
 
   return (

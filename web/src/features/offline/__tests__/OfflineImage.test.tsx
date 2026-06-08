@@ -198,6 +198,67 @@ describe("<OfflineImage> (M3)", () => {
     await waitFor(() => expect(lateRelease).toHaveBeenCalledTimes(1));
   });
 
+  it("does not adopt a STALE error-path resolve into a newer cycle after image/opts change (react-3)", async () => {
+    // Regression for react-3: a NETWORK <img> errors and the error-path token
+    // refresh starts an in-flight resolve for the CURRENT image/opts. While that
+    // network round-trip is pending, the props change (e.g. `thumb`), tearing
+    // down the old resolve cycle and starting a new one with its own resolve.
+    // When the STALE error-path resolve finally lands, it must NOT adopt: the
+    // shared `mountedRef` is already true again for the new cycle, so without a
+    // per-cycle generation tag it would revoke the live handle and briefly show
+    // the wrong (stale) image variant.
+    const newCycleRelease = vi.fn();
+    const staleRetryRelease = vi.fn();
+
+    // Hold the error-path retry resolve open so we control exactly when it lands.
+    let landStaleRetry!: (h: ImageHandle) => void;
+
+    resolveImage
+      // 1) Initial effect resolve: a NETWORK url whose token will "expire".
+      .mockResolvedValueOnce(handle("https://pb/file?token=stale", false))
+      // 2) Error-path retry resolve: PENDING until we land it manually.
+      .mockReturnValueOnce(
+        new Promise<ImageHandle>((res) => {
+          landStaleRetry = res;
+        }),
+      )
+      // 3) New cycle's effect resolve (after the `thumb` change): the correct,
+      //    current variant the component should be displaying.
+      .mockResolvedValueOnce(
+        handle("https://pb/file?token=new-variant", false, newCycleRelease),
+      );
+
+    const { rerender } = render(<OfflineImage image={IMAGE} />);
+    const img = await findImg();
+    expect(img).toHaveAttribute("src", "https://pb/file?token=stale");
+
+    // The network <img> fails: kick off the error-path retry (now pending).
+    img.dispatchEvent(new Event("error"));
+    await waitFor(() => expect(resolveImage).toHaveBeenCalledTimes(2));
+
+    // Props change mid-flight → old cycle torn down, new cycle resolves.
+    rerender(<OfflineImage image={IMAGE} thumb="200x200" />);
+    await waitFor(() =>
+      expect(document.querySelector("img")).toHaveAttribute(
+        "src",
+        "https://pb/file?token=new-variant",
+      ),
+    );
+    expect(resolveImage).toHaveBeenCalledTimes(3);
+
+    // NOW the stale error-path retry lands. It belongs to the OLD cycle and must
+    // self-release (no adoption): the displayed src must stay on the new variant
+    // and the new cycle's live handle must NOT be revoked.
+    landStaleRetry(handle("https://pb/file?token=stale-variant", false, staleRetryRelease));
+    await waitFor(() => expect(staleRetryRelease).toHaveBeenCalledTimes(1));
+
+    expect(document.querySelector("img")).toHaveAttribute(
+      "src",
+      "https://pb/file?token=new-variant",
+    );
+    expect(newCycleRelease).not.toHaveBeenCalled();
+  });
+
   it("revokes the cached object URL on unmount (no blob leak)", async () => {
     const release = vi.fn();
     resolveImage.mockResolvedValue(handle("blob:cached-1", true, release));

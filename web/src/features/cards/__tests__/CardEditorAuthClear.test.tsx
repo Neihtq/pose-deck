@@ -23,7 +23,7 @@ import { ClientResponseError } from "pocketbase";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { db } from "@/lib/db";
-import type { Card, CardImage } from "@/lib/types";
+import type { Card, CardImage, Deck } from "@/lib/types";
 
 // --- Mock data-access + side-effect modules -------------------------------
 // The card + images are read from Dexie (seeded below); mutations are mocked.
@@ -66,9 +66,22 @@ vi.mock("@/components/ui/use-toast", () => ({
 vi.mock("@/features/auth/AuthContext", () => ({
   clearAuthOnUnauthorized: (...args: unknown[]) =>
     clearAuthOnUnauthorized(...args),
+  // The editor is owner-only; render as the deck owner so the form mounts.
+  useAuth: () => ({ user: { id: "owner1", email: "owner@posedeck.test" } }),
 }));
 
 import CardEditor from "@/features/cards/CardEditor";
+
+const DECK: Deck = {
+  id: "deck1",
+  owner: "owner1",
+  name: "Owned Deck",
+  shoot_date: "",
+  client_updated_at: "",
+  created: "",
+  updated: "",
+  deleted_at: "",
+};
 
 const CARD: Card = {
   id: "card1",
@@ -126,8 +139,14 @@ beforeEach(async () => {
   // By default a 401 was indeed a 401 -> auth cleared, redirect handled.
   clearAuthOnUnauthorized.mockReturnValue(true);
   imageDisplayUrl.mockResolvedValue("blob:img1");
-  // Healthy edit-mode load: seed the card + its image into Dexie.
-  await Promise.all([db.cards.clear(), db.card_images.clear()]);
+  // Healthy edit-mode load: seed the deck (owned by the test user), card, and
+  // its image into Dexie so the owner-gated editor mounts.
+  await Promise.all([
+    db.decks.clear(),
+    db.cards.clear(),
+    db.card_images.clear(),
+  ]);
+  await db.decks.put(DECK);
   await db.cards.put(CARD);
   await db.card_images.put(IMAGE);
 });

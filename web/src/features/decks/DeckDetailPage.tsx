@@ -132,6 +132,23 @@ export default function DeckDetailPage(): React.JSX.Element {
   );
   const loading = liveDeckRow === undefined || liveCardRows === undefined;
 
+  // Stable identity of the card SET (sorted ids) for the thumbnail effect.
+  // Dexie's `useLiveQuery` hands back a NEW `cards` array reference on every
+  // write to the cards table — including reorders (which only rewrite
+  // `position`) and per-card field edits that don't change which cards exist.
+  // Keying the thumbnail-build effect off this order-independent string
+  // (instead of the `cards` array identity) means a reorder or card edit no
+  // longer re-queries every card's images; the effect only re-runs when a card
+  // is actually added or removed.
+  const cardIdsKey = React.useMemo(
+    () =>
+      cards
+        .map((c) => c.id)
+        .sort()
+        .join(","),
+    [cards],
+  );
+
   const [thumbnails, setThumbnails] = React.useState<ThumbnailMap>({});
 
   // True while a `reorderCards` write is in flight. We block starting a new
@@ -162,20 +179,25 @@ export default function DeckDetailPage(): React.JSX.Element {
     }),
   );
 
-  // Best-effort: pick each card's first-image record from Dexie. Re-runs
-  // whenever the live card list changes (e.g. a card or its image syncs in).
+  // Best-effort: pick each card's first-image record from Dexie. Re-runs only
+  // when the set of card ids changes (a card added/removed), NOT on every
+  // reorder or per-card edit — Dexie's live query hands back a fresh `cards`
+  // array reference on any cards-table write, so depending on `cardIdsKey`
+  // (a stable string of ids) instead of the `cards` array identity avoids
+  // re-querying every card's images for position-only or field-only changes.
   // `<OfflineImage>` owns the actual source resolution (pinned blob vs. token
   // URL) and the expired-token retry, so we only need the image record here.
   React.useEffect(() => {
     let cancelled = false;
+    const cardIds = cardIdsKey ? cardIdsKey.split(",") : [];
     (async () => {
       const thumbEntries = await Promise.all(
-        cards.map(async (card): Promise<[string, CardImage | null]> => {
+        cardIds.map(async (cardId): Promise<[string, CardImage | null]> => {
           try {
-            const imgs: CardImage[] = await liveCardImages(db, card.id);
-            return [card.id, imgs[0] ?? null];
+            const imgs: CardImage[] = await liveCardImages(db, cardId);
+            return [cardId, imgs[0] ?? null];
           } catch {
-            return [card.id, null];
+            return [cardId, null];
           }
         }),
       );
@@ -186,10 +208,21 @@ export default function DeckDetailPage(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [cards]);
+  }, [cardIdsKey]);
+
+  // Guests view the deck read-only (DESIGN.md §6: "Guests cannot edit cards,
+  // reorder, or share."). Computed here (not after the early returns) so the
+  // mutation callbacks below can guard on it. `deck` may be null while loading;
+  // the early returns below bail before any owner-only UI renders.
+  const isOwner = deck?.owner === user?.id;
 
   const handleDragEnd = React.useCallback(
     (event: DragEndEvent) => {
+      // Guests cannot reorder (DESIGN.md §6). Refuse to persist a drop even if a
+      // drag somehow fires; the drag handles are also disabled for guests.
+      if (!isOwner) {
+        return;
+      }
       // Serialize persistence: ignore drops while a reorder write is still in
       // flight so two restripes can't interleave.
       if (reordering || !id) {
@@ -228,7 +261,7 @@ export default function DeckDetailPage(): React.JSX.Element {
           setReordering(false);
         });
     },
-    [cards, id, reordering],
+    [cards, id, isOwner, reordering],
   );
 
   const openRename = React.useCallback(() => {
@@ -318,7 +351,9 @@ export default function DeckDetailPage(): React.JSX.Element {
   }, [deck, navigate]);
 
   const handleAddCard = React.useCallback(async () => {
-    if (!id) {
+    // Guests cannot add cards (DESIGN.md §6). The button is hidden for guests;
+    // this guard backstops the affordance being hidden in the UI.
+    if (!id || !isOwner) {
       return;
     }
     setCreating(true);
@@ -336,7 +371,7 @@ export default function DeckDetailPage(): React.JSX.Element {
     } finally {
       setCreating(false);
     }
-  }, [id, navigate]);
+  }, [id, isOwner, navigate]);
 
   const openCard = React.useCallback(
     (cardId: string) => {
@@ -352,7 +387,9 @@ export default function DeckDetailPage(): React.JSX.Element {
   // card query drops the row once `deleted_at` is set. Never hard-deletes
   // (DESIGN.md soft-delete model).
   const handleDeleteCard = React.useCallback(async () => {
-    if (!cardToDelete) {
+    // Guests cannot delete cards (DESIGN.md §6). The per-row delete button is
+    // hidden for guests; this guard backstops that.
+    if (!cardToDelete || !isOwner) {
       return;
     }
     setDeletingCard(true);
@@ -370,7 +407,7 @@ export default function DeckDetailPage(): React.JSX.Element {
     } finally {
       setDeletingCard(false);
     }
-  }, [cardToDelete]);
+  }, [cardToDelete, isOwner]);
 
   if (loading) {
     return (
@@ -392,10 +429,10 @@ export default function DeckDetailPage(): React.JSX.Element {
   }
 
   // Sharing/editing affordances are owner-only; a guest views the deck
-  // read-only (M5). The deck list still shows guests their shared decks, but
-  // Rename/Delete/Share are hidden for non-owners.
-  const isOwner = deck.owner === user?.id;
-
+  // read-only (M5/DESIGN.md §6). The deck list still shows guests their shared
+  // decks, but Add-card, reorder, per-card delete, Rename/Delete/Share are all
+  // hidden for non-owners. `isOwner` is computed above the early returns so the
+  // mutation callbacks can guard on it; here `deck` is guaranteed non-null.
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-8">
       <div className="mb-6">
@@ -418,9 +455,11 @@ export default function DeckDetailPage(): React.JSX.Element {
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <OfflineToggle deckId={deck.id} />
-          <Button onClick={handleAddCard} disabled={creating}>
-            {creating ? "Adding…" : "Add card"}
-          </Button>
+          {isOwner ? (
+            <Button onClick={handleAddCard} disabled={creating}>
+              {creating ? "Adding…" : "Add card"}
+            </Button>
+          ) : null}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="icon" aria-label="Deck options">
@@ -470,9 +509,11 @@ export default function DeckDetailPage(): React.JSX.Element {
       {cards.length === 0 ? (
         <div className="rounded-lg border border-dashed py-16 text-center">
           <p className="text-sm text-muted-foreground">No cards yet.</p>
-          <Button className="mt-4" onClick={handleAddCard} disabled={creating}>
-            Add your first card
-          </Button>
+          {isOwner ? (
+            <Button className="mt-4" onClick={handleAddCard} disabled={creating}>
+              Add your first card
+            </Button>
+          ) : null}
         </div>
       ) : (
         <DndContext
@@ -493,6 +534,9 @@ export default function DeckDetailPage(): React.JSX.Element {
                   thumbnail={thumbnails[card.id] ?? null}
                   onOpen={openCard}
                   onDelete={setCardToDelete}
+                  // Guests view read-only: no drag handle, no delete button
+                  // (DESIGN.md §6). Owners get full mutation affordances.
+                  canEdit={isOwner}
                   dragDisabled={reordering}
                 />
               ))}
@@ -620,6 +664,12 @@ interface SortableCardRowProps {
   onOpen: (cardId: string) => void;
   /** Request inline deletion of this card (opens a confirmation). */
   onDelete: (card: CardRecord) => void;
+  /**
+   * Whether the current viewer may mutate this card. Guests (read-only, per
+   * DESIGN.md §6) get `false`: no drag handle and no delete button. The row
+   * stays clickable so guests can still view the card.
+   */
+  canEdit: boolean;
   /** Disables the drag handle while a reorder is being persisted. */
   dragDisabled?: boolean;
 }
@@ -633,8 +683,11 @@ function SortableCardRow({
   thumbnail,
   onOpen,
   onDelete,
+  canEdit,
   dragDisabled = false,
 }: SortableCardRowProps): React.JSX.Element {
+  // Guests cannot reorder (DESIGN.md §6): disable the sortable for non-owners as
+  // well as while a reorder write is in flight.
   const {
     attributes,
     listeners,
@@ -642,7 +695,7 @@ function SortableCardRow({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: card.id, disabled: dragDisabled });
+  } = useSortable({ id: card.id, disabled: dragDisabled || !canEdit });
 
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -664,22 +717,24 @@ function SortableCardRow({
         isDragging && "z-10 opacity-80 shadow-md",
       )}
     >
-      <button
-        type="button"
-        disabled={dragDisabled}
-        className="shrink-0 cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-accent active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-50"
-        // Name the handle by its target card. The keyboard alternative to the
-        // pointer drag is fully handled by dnd-kit's KeyboardSensor: spreading
-        // `attributes` adds `aria-roledescription="sortable"` and an
-        // `aria-describedby` pointing at dnd-kit's built-in screen-reader
-        // instructions ("press space bar to pick up…, arrow keys to move…"), so
-        // we don't supply our own — `attributes` is spread last so it wins.
-        aria-label={`Reorder ${cardLabel}`}
-        {...attributes}
-        {...listeners}
-      >
-        <span aria-hidden>⠿</span>
-      </button>
+      {canEdit ? (
+        <button
+          type="button"
+          disabled={dragDisabled}
+          className="shrink-0 cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-accent active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-50"
+          // Name the handle by its target card. The keyboard alternative to the
+          // pointer drag is fully handled by dnd-kit's KeyboardSensor: spreading
+          // `attributes` adds `aria-roledescription="sortable"` and an
+          // `aria-describedby` pointing at dnd-kit's built-in screen-reader
+          // instructions ("press space bar to pick up…, arrow keys to move…"),
+          // so we don't supply our own — `attributes` is spread last so it wins.
+          aria-label={`Reorder ${cardLabel}`}
+          {...attributes}
+          {...listeners}
+        >
+          <span aria-hidden>⠿</span>
+        </button>
+      ) : null}
 
       <button
         type="button"
@@ -721,14 +776,16 @@ function SortableCardRow({
         </div>
       </button>
 
-      <button
-        type="button"
-        onClick={() => onDelete(card)}
-        className="shrink-0 rounded p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-        aria-label={`Delete ${cardLabel}`}
-      >
-        <Trash2 className="h-4 w-4" />
-      </button>
+      {canEdit ? (
+        <button
+          type="button"
+          onClick={() => onDelete(card)}
+          className="shrink-0 rounded p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+          aria-label={`Delete ${cardLabel}`}
+        >
+          <Trash2 className="h-4 w-4" />
+        </button>
+      ) : null}
     </li>
   );
 }

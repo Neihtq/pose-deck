@@ -56,6 +56,14 @@ export function OfflineImage({
   // Cleared on unmount so async resolves (effect or error path) don't adopt a
   // handle or setState on a dead component.
   const mountedRef = React.useRef(true);
+  // Monotonic tag for the current resolve cycle. The effect bumps it on every
+  // run (image/opts change); async resolves capture the value live at the call
+  // site and only adopt while it still matches. A single shared `mountedRef`
+  // boolean can't distinguish cycles: a cleanup flips it false, then the next
+  // effect flips it true again, so an in-flight resolve from the OLD cycle (e.g.
+  // the error-path token refresh) could otherwise adopt a STALE variant into the
+  // remounted cycle, briefly showing the wrong image.
+  const generationRef = React.useRef(0);
 
   const opts = React.useMemo(
     () => ({ ...(thumb ? { thumb } : {}), networkUrl }),
@@ -63,25 +71,32 @@ export function OfflineImage({
   );
 
   // Adopt a freshly-resolved handle as the live source: revoke the previously
-  // adopted handle, then take ownership of the new one. If the component has
-  // unmounted, self-release the new handle instead (no leak, no late setState).
-  const adopt = React.useCallback((handle: ImageHandle): void => {
-    if (!mountedRef.current) {
-      // Resolved after unmount: revoke immediately so the blob URL can't leak.
-      handle.release();
-      return;
-    }
-    releaseRef.current();
-    releaseRef.current = handle.release;
-    fromCacheRef.current = handle.fromCache;
-    setUrl(handle.url);
-  }, []);
+  // adopted handle, then take ownership of the new one. The caller passes the
+  // `generation` it captured before awaiting; if the component has unmounted OR
+  // a newer resolve cycle has started, self-release the new handle instead (no
+  // leak, no late setState, no stale-variant adoption).
+  const adopt = React.useCallback(
+    (handle: ImageHandle, generation: number): void => {
+      if (!mountedRef.current || generation !== generationRef.current) {
+        // Resolved after unmount or superseded by a newer cycle: revoke
+        // immediately so the blob URL can't leak.
+        handle.release();
+        return;
+      }
+      releaseRef.current();
+      releaseRef.current = handle.release;
+      fromCacheRef.current = handle.fromCache;
+      setUrl(handle.url);
+    },
+    [],
+  );
 
   // Resolve (and re-resolve on image/thumb change) the handle, owning revoke.
   React.useEffect(() => {
     mountedRef.current = true;
+    const generation = ++generationRef.current;
     (async () => {
-      adopt(await resolveImage(image, opts));
+      adopt(await resolveImage(image, opts), generation);
     })();
     return () => {
       // Tear down this resolve cycle: stop adopting and revoke the live handle.
@@ -98,14 +113,23 @@ export function OfflineImage({
     if (fromCacheRef.current) {
       return;
     }
+    // Capture the cycle this error belongs to BEFORE awaiting: if image/opts
+    // change while the token mints, the resolve must not adopt into the new
+    // cycle (it would show the stale variant until the new cycle's own resolve).
+    const generation = generationRef.current;
     const handle = await resolveImage(image, opts);
-    if (!mountedRef.current || handle.url === url) {
-      // Unmounted, or unchanged URL (a genuine error, e.g. 404). Either way the
-      // handle is not adopted, so release it now to avoid leaking/looping.
+    if (
+      !mountedRef.current ||
+      generation !== generationRef.current ||
+      handle.url === url
+    ) {
+      // Unmounted, superseded by a newer cycle, or unchanged URL (a genuine
+      // error, e.g. 404). Either way the handle is not adopted, so release it
+      // now to avoid leaking/looping.
       handle.release();
       return;
     }
-    adopt(handle);
+    adopt(handle, generation);
   }, [image, opts, url, adopt]);
 
   if (url === null) {

@@ -383,6 +383,31 @@ describe("live read queries", () => {
     ]);
   });
 
+  // CORR-2: the Trash sort comparator must be a consistent total order. For
+  // two decks with an identical `deleted_at`, the comparator must return 0
+  // (not -1 for both arg orders), otherwise equal-timestamp decks order
+  // arbitrarily/unstably. We assert the result preserves the stable insertion
+  // order of the equal-timestamp group while still putting newest-deleted
+  // first overall.
+  it("liveTrashedDecks orders equal deleted_at decks stably (consistent comparator)", async () => {
+    const TIE = "2026-06-07T01:00:00.000Z";
+    await db.decks.bulkPut([
+      deck({ id: "older", deleted_at: "2026-06-06T00:00:00.000Z" }),
+      deck({ id: "tieA", deleted_at: TIE }),
+      deck({ id: "tieB", deleted_at: TIE }),
+      deck({ id: "tieC", deleted_at: TIE }),
+      deck({ id: "newest", deleted_at: "2026-06-08T00:00:00.000Z" }),
+    ]);
+    // newest-deleted first; the three tied decks keep their stable order.
+    expect((await liveTrashedDecks(db, "u1")).map((d) => d.id)).toEqual([
+      "newest",
+      "tieA",
+      "tieB",
+      "tieC",
+      "older",
+    ]);
+  });
+
   it("liveDeckGuests returns a deck's guests ordered by granted_at", async () => {
     await db.deck_guests.bulkPut([
       { id: "g2", deck: "d1", user: "uB", granted_at: "2026-06-07T02:00:00.000Z" },

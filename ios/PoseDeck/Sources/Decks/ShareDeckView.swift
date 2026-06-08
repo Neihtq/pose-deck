@@ -90,6 +90,12 @@ struct ShareDeckView: View {
     }
 
     private func submit() {
+        // SWIFT-A2: re-entry guard so the Button and the field's `.onSubmit`
+        // (keyboard Return) paths are both gated by the same in-flight flag — a
+        // Return racing a Share tap, or two rapid Returns, must not spawn two
+        // overlapping grant Tasks. `model.grantGuest` also guards at the source
+        // (GuestGrantGate); this elides the redundant Task before it even spawns.
+        guard !isSubmitting else { return }
         let target = email
         guard !target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         isSubmitting = true

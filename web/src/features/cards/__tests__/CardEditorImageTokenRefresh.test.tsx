@@ -20,7 +20,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { db } from "@/lib/db";
-import type { Card, CardImage } from "@/lib/types";
+import type { Card, CardImage, Deck } from "@/lib/types";
 
 // --- Mock data-access + side-effect modules -------------------------------
 // The card + its images are read from Dexie; only the URL resolver is mocked.
@@ -51,7 +51,24 @@ vi.mock("@/components/ui/use-toast", () => ({
   toast: vi.fn(),
 }));
 
+vi.mock("@/features/auth/AuthContext", () => ({
+  clearAuthOnUnauthorized: vi.fn(() => false),
+  // The editor is owner-only; render as the deck owner so the form mounts.
+  useAuth: () => ({ user: { id: "owner1", email: "owner@posedeck.test" } }),
+}));
+
 import CardEditor from "@/features/cards/CardEditor";
+
+const DECK: Deck = {
+  id: "deck1",
+  owner: "owner1",
+  name: "Owned Deck",
+  shoot_date: "",
+  client_updated_at: "",
+  created: "",
+  updated: "",
+  deleted_at: "",
+};
 
 const CARD: Card = {
   id: "card1",
@@ -87,7 +104,12 @@ function renderEditPage() {
 
 beforeEach(async () => {
   imageDisplayUrl.mockReset();
-  await Promise.all([db.cards.clear(), db.card_images.clear()]);
+  await Promise.all([
+    db.decks.clear(),
+    db.cards.clear(),
+    db.card_images.clear(),
+  ]);
+  await db.decks.put(DECK);
   await db.cards.put(CARD);
   await db.card_images.put(IMAGE);
 });

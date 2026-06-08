@@ -73,12 +73,16 @@ export const pocketBaseFetchAll: EntityFetcher = async (entity) => {
   return records as unknown as Parameters<typeof mergeRecord>[2][];
 };
 
+/** Server-canonical metadata fields that are always authoritative on a 2xx. */
+const SERVER_CANONICAL_KEYS = ["id", "created", "updated"] as const;
+
 /** Reconcile server-canonical fields into the local row after a 2xx send. */
 async function reconcileEntry(
   database: PoseDeckDB,
-  entity: OutboxEntity,
+  entry: OutboxEntry,
   serverRecord: unknown,
 ): Promise<void> {
+  const entity = entry.entity;
   // A delete has no canonical record to merge; for images/guests the engine's
   // delete already removed the row locally. For create/update we merge the
   // server record (carrying canonical created/updated).
@@ -89,12 +93,82 @@ async function reconcileEntry(
   if (typeof rec.id !== "string" || rec.id === "") {
     return;
   }
+
+  // CORR-1: the server echo we are about to reconcile is the FULL record as of
+  // the mutation we just confirmed (its `client_updated_at` equals the clock we
+  // sent). If the user edited this same record AGAIN while this send was
+  // in-flight, that newer edit was written to the Dexie row (and queued as a
+  // separate pending outbox entry, since this one was `inflight` and excluded
+  // from coalescing). Force-writing the whole stale server record here would
+  // revert every field to the just-confirmed snapshot until the newer entry
+  // drains — a visible thrash, and genuine data loss if that entry later fails
+  // or the tab closes first. So before force-writing the full record, check for
+  // a pending outbox entry for this same (entity,recordId) whose clock is
+  // strictly newer than the confirmed clock; if one exists, write ONLY the
+  // server-canonical metadata (id/created/updated) and leave the newer local
+  // field values intact.
+  const confirmed = confirmedClock(entry);
+  if (confirmed !== undefined && (await hasNewerPending(database, entry, confirmed))) {
+    await reconcileMetadataOnly(database, entity, rec);
+    return;
+  }
+
   // `force`: this is the server echo of OUR OWN just-confirmed mutation, which
   // carries the SAME `client_updated_at` we sent — a tie under LWW that would be
   // skipped, leaving the server-canonical created/updated/id unwritten. For our
   // own confirmed record the server values are authoritative, so bypass LWW and
-  // write them directly (ARCHITECTURE.md §4.2 step 5).
+  // write them directly (ARCHITECTURE.md §4.2 step 5). Safe here because no
+  // newer local mutation for this record is pending.
   await mergeRecord(database, entity, rec as never, { force: true });
+}
+
+/**
+ * Is there a pending outbox entry for the same `(entity,recordId)` as `entry`
+ * carrying an LWW clock strictly newer than `confirmedClockValue`? Such an entry
+ * means the user re-edited this record while `entry` was in-flight, so the local
+ * row holds newer field values the stale server echo must not clobber (CORR-1).
+ */
+async function hasNewerPending(
+  database: PoseDeckDB,
+  entry: OutboxEntry,
+  confirmedClockValue: string,
+): Promise<boolean> {
+  const siblings = await database.outbox
+    .where("recordId")
+    .equals(entry.recordId)
+    .toArray();
+  for (const sibling of siblings) {
+    if (sibling.id === entry.id) continue;
+    if (sibling.entity !== entry.entity) continue;
+    const clock = confirmedClock(sibling);
+    if (clock !== undefined && clock > confirmedClockValue) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Write only the server-canonical metadata (id/created/updated) onto the
+ * existing local row, preserving the user's newer field edits. Falls back to a
+ * full force-write if the row has since disappeared locally.
+ */
+async function reconcileMetadataOnly(
+  database: PoseDeckDB,
+  entity: OutboxEntity,
+  rec: AnyServerRecord,
+): Promise<void> {
+  const table = database[entity];
+  const local = (await table.get(rec.id)) as Record<string, unknown> | undefined;
+  if (!local) {
+    await mergeRecord(database, entity, rec as never, { force: true });
+    return;
+  }
+  const merged: Record<string, unknown> = { ...local };
+  for (const key of SERVER_CANONICAL_KEYS) {
+    if (key in rec) merged[key] = rec[key];
+  }
+  await table.put(merged as never);
 }
 
 /**
@@ -139,7 +213,7 @@ export function createSyncRuntime(
     transport: opts.transport,
     hooks: {
       reconcile: (entry, serverRecord) =>
-        reconcileEntry(database, entry.entity, serverRecord),
+        reconcileEntry(database, entry, serverRecord),
       onConfirmed: (entry) => {
         recentlyConfirmed.mark(
           entry.entity,

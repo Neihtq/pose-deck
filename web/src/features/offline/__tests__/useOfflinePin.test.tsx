@@ -138,6 +138,28 @@ describe("useOfflinePin (M3)", () => {
     expect(unpinDeck).not.toHaveBeenCalled();
   });
 
+  it("guards re-entrancy synchronously: two same-frame taps run a single pin (react-2)", async () => {
+    // Two togglePin() calls fired within the SAME render frame — before React
+    // re-renders with busy=true. A state-based guard (`if (busy) return`) reads
+    // the closed-over busy=false in both closures, so BOTH would proceed. A
+    // synchronous ref guard mutates immediately, so the second call short-circuits.
+    const { result } = renderHook(() => useOfflinePin(DECK));
+    await waitFor(() => expect(result.current.pinned).toBe(false));
+
+    await act(async () => {
+      // Same captured callback instance, dispatched back-to-back with no render
+      // in between — exactly the same-frame double-tap window.
+      const first = result.current.togglePin();
+      const second = result.current.togglePin();
+      await Promise.all([first, second]);
+    });
+
+    // The second call must have been suppressed by the in-flight ref guard.
+    expect(pinDeck).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(result.current.pinned).toBe(true));
+    expect(result.current.busy).toBe(false);
+  });
+
   it("reads live pin state directly so a double-tap can't pin then unpin a stale snapshot", async () => {
     // Pre-pin out of band; the live query may not have propagated yet when the
     // user taps. The hook re-reads pinned_decks DIRECTLY inside togglePin, so it

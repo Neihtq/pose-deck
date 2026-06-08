@@ -137,6 +137,95 @@ describe("createSyncRuntime hook wiring", () => {
     expect(await db.outbox.count()).toBe(0);
   });
 
+  // Regression (CORR-1): a user edits a card AGAIN while that card's previous
+  // update is mid-send. The in-flight update's server echo carries the OLD
+  // client_updated_at; if reconcile force-writes the whole stale record it
+  // reverts the newer local edit (and every other field) to the old snapshot.
+  // The fix: when a pending outbox entry for the same record carries a strictly
+  // newer clock, reconcile writes ONLY server-canonical metadata
+  // (id/created/updated) and leaves the newer local field values intact.
+  it("does not clobber a newer local edit made during an in-flight update (CORR-1)", async () => {
+    const T1 = "2026-06-08T10:00:00.000Z"; // first edit (the in-flight send)
+    const T2 = "2026-06-08T10:00:05.000Z"; // second edit (made mid-send)
+
+    // The server echo of the FIRST update: it reflects the T1 PATCH (old title)
+    // and echoes back the T1 client clock, with its own canonical created/updated.
+    const serverEchoT1 = {
+      id: "cardA",
+      deck: "deck1",
+      position: 1000,
+      title: "Title-T1",
+      time_slot: "",
+      subjects: "",
+      direction: "",
+      notes: "",
+      deleted_at: "",
+      client_updated_at: T1,
+      created: "2026-06-08T09:00:00.000Z",
+      updated: "2026-06-08T10:00:01.000Z",
+    };
+
+    // The transport: the FIRST in-flight update returns the T1 echo. While that
+    // send is "in flight", interleave the user's SECOND edit — write the newer
+    // row to Dexie and enqueue a separate pending update carrying the T2 clock.
+    // The SECOND send (the T2 entry) is held off with a transient network error
+    // so the T2 entry stays queued: this exposes CORR-1's genuine data-loss tail
+    // (if reconcile reverted to T1 it would persist while T2 is undelivered),
+    // and lets us assert on the post-reconcile row deterministically.
+    let call = 0;
+    const update = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        await db.cards.put({
+          ...serverEchoT1,
+          title: "Title-T2",
+          client_updated_at: T2,
+          created: serverEchoT1.created,
+          updated: serverEchoT1.updated,
+        });
+        await enqueue(db, {
+          type: "update",
+          entity: "cards",
+          recordId: "cardA",
+          payload: { title: "Title-T2", client_updated_at: T2 },
+        });
+        return serverEchoT1;
+      }
+      // T2 send: transient failure → entry stays queued, never reconciled.
+      throw new ClientResponseError({ status: 0 });
+    });
+    const transport: MutationTransport = {
+      create: vi.fn(),
+      update,
+      delete: vi.fn(),
+    };
+    const { engine } = createSyncRuntime(db, { transport });
+
+    // Seed the optimistic row + queue the FIRST (T1) update.
+    await db.cards.put({ ...serverEchoT1, title: "Title-T1" });
+    await enqueue(db, {
+      type: "update",
+      entity: "cards",
+      recordId: "cardA",
+      payload: { title: "Title-T1", client_updated_at: T1 },
+    });
+
+    await engine.drain();
+
+    const row = await db.cards.get("cardA");
+    // The newer (T2) local edit must be preserved, NOT reverted to T1 by the
+    // T1 echo's reconcile (CORR-1). The T2 send is still failing/queued, so a
+    // bug here would be PERSISTENT data loss, not a transient thrash.
+    expect(row?.title).toBe("Title-T2");
+    expect(row?.client_updated_at).toBe(T2);
+    // Server-canonical created from the echo is still applied (metadata-only).
+    expect(row?.created).toBe(serverEchoT1.created);
+    // The T2 update remains queued (its send is transiently failing).
+    expect(await db.outbox.count()).toBe(1);
+    // The guard had a newer pending T2 entry to detect on the first reconcile.
+    expect(update).toHaveBeenCalledTimes(2);
+  });
+
   it("rolls back (removes) a dropped optimistic create on a 4xx", async () => {
     const err = new ClientResponseError({ status: 403, data: {} });
     const transport: MutationTransport = {

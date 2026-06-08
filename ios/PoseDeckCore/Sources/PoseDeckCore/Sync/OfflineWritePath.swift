@@ -137,7 +137,21 @@ public struct OfflineWritePath: Sendable {
     /// must not fabricate a future client clock for the children. Only the deck
     /// row is enqueued; the server-side cascade + realtime echo carry the rest.
     public func softDeleteDeck(_ deck: Deck) async throws {
-        let stamp = now()
+        // [CORR-IOS-1] Stamp at the SAME precision the server/realtime echo will
+        // carry. The wire format (`PocketBaseDate.wireFormat`, `.SSS`) is
+        // millisecond-resolution and `DateFormatter` *rounds* sub-millisecond
+        // fractions, so a raw in-memory `now()` and its wire round-trip differ by
+        // up to ~0.5ms. If we stamped the deck + children with the raw full-precision
+        // `now()` but the later deck-update echo upserts the deck row at the
+        // round-tripped (ms) precision, the deck's `deletedAt` would no longer equal
+        // the children's, and the restore cascade — which un-hides children whose
+        // `deletedAt` exactly equals the deck's prior `deletedAt` — would un-hide
+        // nothing, restoring the deck with all its cards still hidden. Round-tripping
+        // the stamp here makes the offline write already match the wire precision, so
+        // deck and child `deletedAt` stay equal regardless of which path last touched
+        // the deck row.
+        let raw = now()
+        let stamp = PocketBaseDate.date(from: PocketBaseDate.string(from: raw)) ?? raw
         var updated = deck
         updated.deletedAt = stamp
         updated.clientUpdatedAt = stamp

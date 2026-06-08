@@ -404,7 +404,7 @@ export async function liveTrashedDecks(
 ): Promise<Deck[]> {
   return (await db.decks.toArray())
     .filter((d) => d.deleted_at !== "" && d.owner === ownerId)
-    .sort((a, b) => (a.deleted_at < b.deleted_at ? 1 : -1));
+    .sort((a, b) => (a.deleted_at < b.deleted_at ? 1 : a.deleted_at > b.deleted_at ? -1 : 0));
 }
 
 /**

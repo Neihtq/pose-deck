@@ -35,6 +35,12 @@ final class CardImagesViewModel {
     private(set) var cardId: String?
     private let repository: ImageRepositing
     private let compressor: ImageCompressor
+    /// Awaits a just-created card becoming available server-side before staged
+    /// images upload onto it (the card create flushes via the outbox, but uploads
+    /// hit the server directly). Returns false if it isn't ready (offline/
+    /// transient). `nil` in previews/tests with a synchronous fake repo, where the
+    /// "card" exists immediately and no drain is needed.
+    private let awaitCardReady: (@Sendable (String) async -> Bool)?
 
     /// Images already persisted on the card, sorted by position.
     private(set) var images: [CardImage] = []
@@ -64,10 +70,16 @@ final class CardImagesViewModel {
     var atImageLimit: Bool { imageCount >= maxImagesPerCard }
     var remainingSlots: Int { max(0, maxImagesPerCard - imageCount) }
 
-    init(cardId: String?, repository: ImageRepositing, compressor: ImageCompressor = ImageCompressor()) {
+    init(
+        cardId: String?,
+        repository: ImageRepositing,
+        compressor: ImageCompressor = ImageCompressor(),
+        awaitCardReady: (@Sendable (String) async -> Bool)? = nil
+    ) {
         self.cardId = cardId
         self.repository = repository
         self.compressor = compressor
+        self.awaitCardReady = awaitCardReady
     }
 
     /// Load the card's images and resolve their display URLs. A no-op while the
@@ -193,6 +205,17 @@ final class CardImagesViewModel {
         isUploading = true
         errorMessage = nil
         defer { isUploading = false }
+        // The card was just created via the outbox (optimistic client-id) but its
+        // server `create` may not have flushed yet; image uploads hit the server
+        // directly, so wait for the card to actually exist server-side first —
+        // otherwise every upload 404s. If it never becomes ready (offline), keep
+        // the staged photos so the user can retry rather than losing them.
+        if let awaitCardReady {
+            guard await awaitCardReady(cardId) else {
+                errorMessage = "Couldn't reach the server to upload images. Your photos are kept — tap Save to try again."
+                return false
+            }
+        }
         // Snapshot so we can dequeue successes while iterating.
         let pending = stagedImages
         var position = (images.map(\.position).max() ?? 0)

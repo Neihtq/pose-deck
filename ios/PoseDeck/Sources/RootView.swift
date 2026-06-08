@@ -125,7 +125,10 @@ struct RootView: View {
                         deckId: deck.id,
                         cardId: card?.id,
                         cardRepo: cardRepo,
-                        imageRepo: imageRepo
+                        imageRepo: imageRepo,
+                        // Staged new-card images wait for the card's outbox create
+                        // to flush + exist server-side before uploading.
+                        awaitCardReady: { id in await sync.awaitCardReady(id) }
                     )
                 )
             },
@@ -159,6 +162,9 @@ private struct CardEditorHost: View {
     let cardId: String?
     let cardRepo: any CardRepositoring
     let imageRepo: MirrorImageRepository
+    /// Waits for a just-created card to exist server-side before staged images
+    /// upload onto it (the card create flushes via the outbox; uploads are direct).
+    let awaitCardReady: @Sendable (String) async -> Bool
 
     var body: some View {
         CardEditorView(
@@ -170,7 +176,8 @@ private struct CardEditorHost: View {
             makeImagesModel: { resolvedCardId in
                 CardImagesViewModel(
                     cardId: resolvedCardId,  // nil in create mode → stages picks until create
-                    repository: imageRepo
+                    repository: imageRepo,
+                    awaitCardReady: awaitCardReady
                 )
             },
             onClose: { dismiss() }

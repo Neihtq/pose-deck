@@ -461,6 +461,26 @@ final class SyncCoordinator {
         MirrorImageRepository(store: store, outbox: outbox, remote: ImageRepository(client: apiClient))
     }
 
+    /// Wait until a just-created card exists server-side, so a direct image
+    /// upload onto it won't 404.
+    ///
+    /// `createCard` returns an optimistic client-id immediately but only *enqueues*
+    /// the server `create` to the outbox; image uploads hit the server directly
+    /// (uploads aren't outbox-queued). When you stage photos on a brand-new card
+    /// and tap Create, the upload would race ahead of the card's create flush and
+    /// fail. This drains the outbox to idle (flushing the card create), then probes
+    /// the server for the card — the same drain+exists pattern duplicate-deck uses
+    /// for copied cards. Returns false if it still isn't there (offline/transient),
+    /// so the caller keeps the staged photos for a retry rather than 400-ing.
+    func awaitCardReady(_ cardId: String) async -> Bool {
+        await drainToIdle()
+        let filter = "id = \(PocketBaseFilter.quoted(cardId))"
+        let found = try? await apiClient.list(
+            Card.self, collection: "cards", perPage: 1, filter: filter
+        )
+        return found?.items.isEmpty == false
+    }
+
     func makeCardCompletionRepository() -> MirrorCardCompletionRepository {
         MirrorCardCompletionRepository(store: store, outbox: outbox)
     }

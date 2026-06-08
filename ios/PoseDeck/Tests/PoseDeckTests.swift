@@ -230,6 +230,40 @@ final class CardImageStagingTests: XCTestCase {
         XCTAssertEqual(model.images.count, 1)
     }
 
+    func testFlushWaitsForCardReadyBeforeUploading() async {
+        let repo = StagingImageRepo()
+        var readyCalls: [String] = []
+        let model = CardImagesViewModel(
+            cardId: nil,
+            repository: repo,
+            awaitCardReady: { id in readyCalls.append(id); return true }
+        )
+        await model.addImage(data: tinyImageData())
+
+        let ok = await model.flushStaged(cardId: "card-new")
+
+        XCTAssertTrue(ok)
+        XCTAssertEqual(readyCalls, ["card-new"], "flush must await the card existing server-side first")
+        XCTAssertEqual(repo.uploads.count, 1, "upload happens only after the card is ready")
+    }
+
+    func testFlushRetainsStagedWhenCardNeverReady() async {
+        let repo = StagingImageRepo()
+        let model = CardImagesViewModel(
+            cardId: nil,
+            repository: repo,
+            awaitCardReady: { _ in false }  // card never reaches the server (offline)
+        )
+        await model.addImage(data: tinyImageData())
+
+        let ok = await model.flushStaged(cardId: "card-new")
+
+        XCTAssertFalse(ok, "flush reports not-ready")
+        XCTAssertTrue(repo.uploads.isEmpty, "no upload attempted when the card isn't server-side yet (would 404)")
+        XCTAssertEqual(model.stagedImages.count, 1, "photos retained for retry — not lost, not 400-ed")
+        XCTAssertNotNil(model.errorMessage)
+    }
+
     func testFlushKeepsStagedOnUploadFailure() async {
         let repo = StagingImageRepo()
         repo.failUploads = true

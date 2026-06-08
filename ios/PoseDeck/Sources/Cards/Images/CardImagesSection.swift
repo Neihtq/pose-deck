@@ -228,31 +228,42 @@ struct CardImagesSection: View {
 
     private func thumbnail(for image: CardImage) -> some View {
         ZStack(alignment: .topTrailing) {
-            Group {
-                if let url = model.imageURLs[image.id] {
-                    // Protected token-bearing URL — load via the non-persisting
-                    // session so private bytes don't land in URLCache.shared (SEC-IOS-B).
-                    ProtectedAsyncImage(url: url) { phase in
-                        switch phase {
-                        case .success(let img):
-                            img.resizable().scaledToFill()
-                        case .failure:
-                            Color.secondary.opacity(0.15)
-                                .overlay(Image(systemName: "exclamationmark.triangle"))
-                                .task { await model.refreshURL(for: image) }
-                        case .empty:
-                            Color.secondary.opacity(0.1).overlay(ProgressView())
-                        @unknown default:
-                            Color.secondary.opacity(0.1)
+            // Establish a true square cell that FITS the grid column width, then
+            // overlay the image and hard-`.clipped()` it to those bounds. The old
+            // `.aspectRatio(1, contentMode: .fill)` on the image container could
+            // resolve to the image's full intrinsic size in a flexible grid column
+            // (the `.fill` mode + an unconstrained height is ambiguous), and
+            // `.clipShape` only clips drawing — not layout — so an oversized cell
+            // overflowed into its neighbors and the buttons below (item 1). A clear
+            // square spacer with `.fit` can never exceed the proposed width, so the
+            // cell is always a square that crops its image. (Mirrors the web grid's
+            // `aspect-square overflow-hidden`.)
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .frame(maxWidth: .infinity)
+                .overlay {
+                    if let url = model.imageURLs[image.id] {
+                        // Protected token-bearing URL — load via the non-persisting
+                        // session so private bytes don't land in URLCache.shared (SEC-IOS-B).
+                        ProtectedAsyncImage(url: url) { phase in
+                            switch phase {
+                            case .success(let img):
+                                img.resizable().scaledToFill()
+                            case .failure:
+                                Color.secondary.opacity(0.15)
+                                    .overlay(Image(systemName: "exclamationmark.triangle"))
+                                    .task { await model.refreshURL(for: image) }
+                            case .empty:
+                                Color.secondary.opacity(0.1).overlay(ProgressView())
+                            @unknown default:
+                                Color.secondary.opacity(0.1)
+                            }
                         }
+                    } else {
+                        Color.secondary.opacity(0.1).overlay(ProgressView())
                     }
-                } else {
-                    Color.secondary.opacity(0.1).overlay(ProgressView())
                 }
-            }
-            .aspectRatio(1, contentMode: .fill)
-            .frame(maxWidth: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
 
             Button {
                 Task { await model.deleteImage(image) }

@@ -16,14 +16,30 @@ import PoseDeckCore
 @MainActor
 @Observable
 final class CardImagesViewModel {
-    /// The card these images belong to. Images attach to a saved card record, so
-    /// the section is only usable once the card exists.
-    let cardId: String
+    /// A photo picked before the card exists: compressed bytes held locally with
+    /// a preview, uploaded by ``flushStaged(cardId:)`` once the card is created.
+    /// This lets the editor offer the image section *during* new-card creation
+    /// instead of forcing a "Create first" round-trip — `card_images.card` is a
+    /// required relation to a saved card, so we can't upload until the card has
+    /// an id, but we can stage the bytes immediately.
+    struct StagedImage: Identifiable {
+        let id: String
+        /// Already-compressed JPEG bytes (compressed at stage time, uploaded as-is).
+        let data: Data
+        /// In-memory preview for the thumbnail grid.
+        let preview: UIImage
+    }
+
+    /// The card these images belong to. `nil` while creating a new card (images
+    /// are staged); set once the card exists (edit mode, or after first save).
+    private(set) var cardId: String?
     private let repository: ImageRepositing
     private let compressor: ImageCompressor
 
-    /// Images currently on the card, sorted by position.
+    /// Images already persisted on the card, sorted by position.
     private(set) var images: [CardImage] = []
+    /// Photos picked before the card exists, awaiting upload on create.
+    private(set) var stagedImages: [StagedImage] = []
     /// Resolved (token-carrying) display URLs keyed by image id; populated async.
     private(set) var imageURLs: [String: URL] = [:]
     /// Per-image count of consecutive token re-mints in the current `.failure`
@@ -42,17 +58,23 @@ final class CardImagesViewModel {
     var errorMessage: String?
 
     var maxImagesPerCard: Int { repository.maxImagesPerCard }
-    var atImageLimit: Bool { images.count >= maxImagesPerCard }
-    var remainingSlots: Int { max(0, maxImagesPerCard - images.count) }
+    /// Total images counting toward the cap = persisted + staged (uploaded yet
+    /// or not, they all become real images on create).
+    var imageCount: Int { images.count + stagedImages.count }
+    var atImageLimit: Bool { imageCount >= maxImagesPerCard }
+    var remainingSlots: Int { max(0, maxImagesPerCard - imageCount) }
 
-    init(cardId: String, repository: ImageRepositing, compressor: ImageCompressor = ImageCompressor()) {
+    init(cardId: String?, repository: ImageRepositing, compressor: ImageCompressor = ImageCompressor()) {
         self.cardId = cardId
         self.repository = repository
         self.compressor = compressor
     }
 
-    /// Load the card's images and resolve their display URLs.
+    /// Load the card's images and resolve their display URLs. A no-op while the
+    /// card doesn't exist yet (new-card creation) — there's nothing to fetch and
+    /// staged images live purely in memory until create.
     func load() async {
+        guard let cardId else { return }
         isLoading = true
         errorMessage = nil
         do {
@@ -99,7 +121,8 @@ final class CardImagesViewModel {
         }
     }
 
-    /// Compress and upload a picked photo, enforcing the per-card cap.
+    /// Compress and either upload (card exists) or stage (new card, no id yet) a
+    /// picked photo, enforcing the per-card cap.
     func addImage(data: Data) async {
         // Synchronous gate run before the upload suspends. An upload suspends at
         // compress/upload before `images.append` lands, so `atImageLimit` (a
@@ -123,19 +146,81 @@ final class CardImagesViewModel {
         errorMessage = nil
         do {
             let compressed = try compressor.compress(data)
-            let position = (images.map(\.position).max() ?? 0) + 1
-            let uploaded = try await repository.uploadCardImage(
-                cardId: cardId,
-                data: compressed,
-                position: position
-            )
-            images.append(uploaded)
-            images.sort { $0.position < $1.position }
-            await resolveURLs()
+            if let cardId {
+                // Card exists → upload now. Position continues past staged ids too
+                // (defensive: staged should be empty once a card exists).
+                let position = nextPosition()
+                let uploaded = try await repository.uploadCardImage(
+                    cardId: cardId,
+                    data: compressed,
+                    position: position
+                )
+                images.append(uploaded)
+                images.sort { $0.position < $1.position }
+                await resolveURLs()
+            } else {
+                // New card with no id yet → stage the compressed bytes + a preview;
+                // they upload in `flushStaged(cardId:)` when the card is created.
+                guard let preview = UIImage(data: compressed) else {
+                    errorMessage = "Could not read the selected image."
+                    isUploading = false
+                    return
+                }
+                stagedImages.append(StagedImage(id: UUID().uuidString, data: compressed, preview: preview))
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
         isUploading = false
+    }
+
+    /// Next image position = one past the highest persisted OR staged position.
+    /// Staged images take provisional positions by their append order so the
+    /// final upload order matches what the user saw while picking.
+    private func nextPosition() -> Int {
+        (images.map(\.position).max() ?? 0) + 1
+    }
+
+    /// Upload every staged image against the now-created `cardId`, in pick order,
+    /// then clear the staging buffer. Called by the editor right after it creates
+    /// the card. Best-effort per image: a failure surfaces an error and leaves
+    /// the remaining staged images in place so the user can retry rather than
+    /// silently losing photos. Returns true if all staged images uploaded.
+    @discardableResult
+    func flushStaged(cardId: String) async -> Bool {
+        self.cardId = cardId
+        guard !stagedImages.isEmpty else { return true }
+        isUploading = true
+        errorMessage = nil
+        defer { isUploading = false }
+        // Snapshot so we can dequeue successes while iterating.
+        let pending = stagedImages
+        var position = (images.map(\.position).max() ?? 0)
+        for staged in pending {
+            position += 1
+            do {
+                let uploaded = try await repository.uploadCardImage(
+                    cardId: cardId,
+                    data: staged.data,
+                    position: position
+                )
+                images.append(uploaded)
+                stagedImages.removeAll { $0.id == staged.id }
+            } catch {
+                errorMessage = "Some images couldn't be uploaded. Please try again."
+                images.sort { $0.position < $1.position }
+                await resolveURLs()
+                return false
+            }
+        }
+        images.sort { $0.position < $1.position }
+        await resolveURLs()
+        return true
+    }
+
+    /// Remove a staged (not-yet-uploaded) image before the card is created.
+    func removeStaged(_ staged: StagedImage) {
+        stagedImages.removeAll { $0.id == staged.id }
     }
 
     /// Handle an image pasted from the system clipboard (item 1). Reuses
@@ -200,7 +285,7 @@ struct CardImagesSection: View {
                         .foregroundStyle(.secondary)
                 }
             } else {
-                if !model.images.isEmpty {
+                if !model.images.isEmpty || !model.stagedImages.isEmpty {
                     thumbnailGrid
                 }
                 addButton
@@ -223,7 +308,7 @@ struct CardImagesSection: View {
 
     private var header: some View {
         HStack {
-            Text("Images (\(model.images.count)/\(model.maxImagesPerCard))")
+            Text("Images (\(model.imageCount)/\(model.maxImagesPerCard))")
                 .font(.headline)
                 .accessibilityIdentifier("cardImages.count")
             Spacer()
@@ -242,6 +327,40 @@ struct CardImagesSection: View {
             ForEach(model.images) { image in
                 thumbnail(for: image)
             }
+            // Staged (not-yet-uploaded) images picked during new-card creation,
+            // rendered from their in-memory preview after the persisted ones.
+            ForEach(model.stagedImages) { staged in
+                stagedThumbnail(for: staged)
+            }
+        }
+    }
+
+    /// A staged image's thumbnail — same square cell as `thumbnail(for:)` but
+    /// sourced from the in-memory preview, with a "staged" tint so it reads as
+    /// pending until the card is created.
+    private func stagedThumbnail(for staged: CardImagesViewModel.StagedImage) -> some View {
+        ZStack(alignment: .topTrailing) {
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .frame(maxWidth: .infinity)
+                .overlay {
+                    Image(uiImage: staged.preview)
+                        .resizable()
+                        .scaledToFill()
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            Button {
+                model.removeStaged(staged)
+            } label: {
+                Image(systemName: "trash.fill")
+                    .font(.caption)
+                    .padding(6)
+                    .background(.thinMaterial, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(4)
+            .accessibilityLabel("Remove image")
         }
     }
 

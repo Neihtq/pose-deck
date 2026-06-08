@@ -148,6 +148,115 @@ final class ShootModeReshootTests: XCTestCase {
     }
 }
 
+// MARK: - New-card image staging (pick before save, upload on create)
+
+/// Records uploads and serves a canned image list, like RecordingImageRepository
+/// but minimal for the staging tests.
+@MainActor
+private final class StagingImageRepo: ImageRepositing {
+    nonisolated var maxImagesPerCard: Int { 5 }
+    private(set) var uploads: [(cardId: String, position: Int)] = []
+    var failUploads = false
+
+    func listCardImages(cardId: String) async throws -> [CardImage] { [] }
+    func fileURL(for image: CardImage) async throws -> URL {
+        URL(string: "https://example.invalid/\(image.id)")!
+    }
+    @discardableResult
+    func uploadCardImage(cardId: String, data: Data, position: Int) async throws -> CardImage {
+        if failUploads { throw URLError(.notConnectedToInternet) }
+        uploads.append((cardId: cardId, position: position))
+        return CardImage(id: "up-\(uploads.count)", card: cardId, position: position)
+    }
+    func deleteCardImage(id: String) async throws {}
+}
+
+/// `CardImagesViewModel` staging behaviour (UX: add images while creating a new
+/// card). With no card id yet, picks are staged in memory; `flushStaged` uploads
+/// them once the card exists. These run the real compressor on the simulator
+/// host (UIKit available), so they need a tiny valid image to compress.
+@MainActor
+final class CardImageStagingTests: XCTestCase {
+
+    /// A 2x2 PNG re-encoded as the bytes the picker would hand us. ImageIO can
+    /// decode this, so `compressor.compress` succeeds in `addImage`.
+    private func tinyImageData() -> Data {
+        let size = CGSize(width: 8, height: 8)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { ctx in
+            UIColor.systemTeal.setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+        }
+        return image.jpegData(compressionQuality: 0.9)!
+    }
+
+    func testPicksAreStagedWhenNoCardYet() async {
+        let repo = StagingImageRepo()
+        let model = CardImagesViewModel(cardId: nil, repository: repo)
+
+        await model.addImage(data: tinyImageData())
+
+        XCTAssertEqual(model.stagedImages.count, 1, "a pick with no card id stages locally")
+        XCTAssertTrue(model.images.isEmpty, "nothing is persisted yet")
+        XCTAssertEqual(model.imageCount, 1, "count reflects the staged image")
+        XCTAssertTrue(repo.uploads.isEmpty, "no upload happens before the card exists")
+    }
+
+    func testFlushStagedUploadsAllInOrder() async {
+        let repo = StagingImageRepo()
+        let model = CardImagesViewModel(cardId: nil, repository: repo)
+        await model.addImage(data: tinyImageData())
+        await model.addImage(data: tinyImageData())
+
+        let ok = await model.flushStaged(cardId: "card-new")
+
+        XCTAssertTrue(ok, "all staged images uploaded")
+        XCTAssertEqual(repo.uploads.count, 2, "both staged images uploaded on create")
+        XCTAssertEqual(repo.uploads.map(\.cardId), ["card-new", "card-new"])
+        XCTAssertEqual(repo.uploads.map(\.position), [1, 2], "uploaded in pick order")
+        XCTAssertEqual(model.stagedImages.count, 0, "staging buffer cleared on success")
+        XCTAssertEqual(model.images.count, 2, "uploaded images now persisted")
+        XCTAssertEqual(model.imageCount, 2)
+    }
+
+    func testCardWithIdUploadsImmediatelyNotStaged() async {
+        let repo = StagingImageRepo()
+        let model = CardImagesViewModel(cardId: "existing", repository: repo)
+
+        await model.addImage(data: tinyImageData())
+
+        XCTAssertEqual(repo.uploads.count, 1, "an existing card uploads immediately")
+        XCTAssertTrue(model.stagedImages.isEmpty, "nothing staged when the card already exists")
+        XCTAssertEqual(model.images.count, 1)
+    }
+
+    func testFlushKeepsStagedOnUploadFailure() async {
+        let repo = StagingImageRepo()
+        repo.failUploads = true
+        let model = CardImagesViewModel(cardId: nil, repository: repo)
+        await model.addImage(data: tinyImageData())
+
+        let ok = await model.flushStaged(cardId: "card-new")
+
+        XCTAssertFalse(ok, "flush reports failure")
+        XCTAssertEqual(model.stagedImages.count, 1, "staged image retained so the user can retry — not silently lost")
+        XCTAssertNotNil(model.errorMessage)
+    }
+
+    func testStagedImageRespectsCapAcrossStagedAndPersisted() async {
+        let repo = StagingImageRepo()
+        let model = CardImagesViewModel(cardId: nil, repository: repo)
+        for _ in 0..<5 { await model.addImage(data: tinyImageData()) }
+        XCTAssertEqual(model.stagedImages.count, 5)
+
+        await model.addImage(data: tinyImageData())  // 6th — over the cap
+
+        XCTAssertEqual(model.stagedImages.count, 5, "cap enforced on staged images")
+        XCTAssertTrue(model.atImageLimit)
+        XCTAssertNotNil(model.errorMessage)
+    }
+}
+
 // MARK: - Fix #4: duplicate-deck image copy (web parity)
 
 /// Records every `uploadCardImage` call so a test can assert images were copied

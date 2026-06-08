@@ -140,9 +140,10 @@ final class CardEditorViewModel {
 /// `NavigationStack` push and wiring `onClose`.
 struct CardEditorView: View {
     @State private var model: CardEditorViewModel
-    /// Builds the image section's model once the card has an id. Injected so the
-    /// host wires the real ``ImageRepository``; previews pass a fake.
-    private let makeImagesModel: (String) -> CardImagesViewModel
+    /// The image section's model — created up front (with the optional cardId, so
+    /// it stages photos during new-card creation) and reused for the editor's
+    /// lifetime, so picks survive the create transition.
+    @State private var imagesModel: CardImagesViewModel
     /// Called when the editor is finished (saved in edit mode, or deleted).
     private let onClose: () -> Void
 
@@ -150,11 +151,13 @@ struct CardEditorView: View {
 
     init(
         model: CardEditorViewModel,
-        makeImagesModel: @escaping (String) -> CardImagesViewModel,
+        makeImagesModel: (String?) -> CardImagesViewModel,
         onClose: @escaping () -> Void
     ) {
         _model = State(initialValue: model)
-        self.makeImagesModel = makeImagesModel
+        // Seed the image model with the current cardId (nil in create mode → it
+        // stages picks until the card is created and `flushStaged` runs).
+        _imagesModel = State(initialValue: makeImagesModel(model.cardId))
         self.onClose = onClose
     }
 
@@ -213,10 +216,22 @@ struct CardEditorView: View {
 
     private func handleSave() async {
         let outcome = await model.save()
-        // Edit-mode save returns to the deck. Create-mode save keeps the editor
-        // open (now in edit mode) so images can be attached.
-        if outcome == .saved {
+        switch outcome {
+        case .saved:
+            // Edit-mode save returns to the deck.
             onClose()
+        case .created:
+            // Create-mode: the card now has an id. Upload any photos staged while
+            // creating, then return to the deck. If an upload fails, stay open so
+            // the user sees the error and can retry rather than silently losing
+            // photos (the card itself is already created).
+            guard let newId = model.cardId else { onClose(); return }
+            let allUploaded = await imagesModel.flushStaged(cardId: newId)
+            if allUploaded {
+                onClose()
+            }
+        case .failed:
+            break
         }
     }
 
@@ -255,11 +270,10 @@ struct CardEditorView: View {
     @ViewBuilder
     private var imagesSection: some View {
         Section("Images") {
-            if let cardId = model.cardId {
-                CardImagesSection(model: makeImagesModel(cardId))
-                    .padding(.vertical, 4)
-            } else {
-                Text("Save the card first, then add up to 5 images.")
+            CardImagesSection(model: imagesModel)
+                .padding(.vertical, 4)
+            if !model.isEditMode {
+                Text("Photos are added when you tap Create.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

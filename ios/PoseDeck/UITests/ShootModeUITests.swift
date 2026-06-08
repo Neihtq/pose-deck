@@ -33,8 +33,8 @@ final class ShootModeUITests: PoseDeckUITestCase {
         title.tap(); title.typeText(cardTitle)
         waitFor("cardEditor.save").tap()
 
-        // Create-mode save stays in the editor (edit mode); go back to the deck.
-        navigateBack()
+        // Create returns straight to the deck (uploads staged images first, then
+        // closes) — no manual back-navigation needed.
         XCTAssertTrue(
             element("card.row.\(cardTitle)").waitForExistence(timeout: Self.timeout),
             "Card '\(cardTitle)' did not appear after add"

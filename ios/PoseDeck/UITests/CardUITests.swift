@@ -36,10 +36,8 @@ final class CardUITests: PoseDeckUITestCase {
 
         waitFor("cardEditor.save", "Card save button missing").tap()
 
-        // Create-mode save keeps the editor open in edit mode (so images can be
-        // added). Navigate back to the deck to confirm the card landed.
-        navigateBack()
-
+        // Create returns straight to the deck (uploads staged images first, then
+        // closes). The card should be present without a manual back-navigation.
         XCTAssertTrue(
             element("card.row.Golden hour portrait").waitForExistence(timeout: Self.timeout),
             "New card did not appear in the deck"
@@ -167,8 +165,8 @@ final class CardUITests: PoseDeckUITestCase {
         title.tap(); title.typeText(cardTitle)
         waitFor("cardEditor.save").tap()
 
-        // Create-mode save stays in the editor (edit mode); go back to the deck.
-        navigateBack()
+        // Create now returns straight to the deck (it uploads any staged images
+        // first, then closes — no more "stay open in edit mode" detour).
         XCTAssertTrue(
             element("card.row.\(cardTitle)").waitForExistence(timeout: Self.timeout),
             "Card '\(cardTitle)' did not appear after add"

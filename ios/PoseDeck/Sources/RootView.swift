@@ -169,7 +169,7 @@ private struct CardEditorHost: View {
             ),
             makeImagesModel: { resolvedCardId in
                 CardImagesViewModel(
-                    cardId: resolvedCardId,
+                    cardId: resolvedCardId,  // nil in create mode → stages picks until create
                     repository: imageRepo
                 )
             },

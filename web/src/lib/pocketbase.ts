@@ -27,8 +27,54 @@ import type {
   User,
 } from "./types";
 
-/** Resolve the API base URL from the Vite env, with a sane local default. */
+/**
+ * localStorage key holding a user-entered backend base URL. Unlike the auth
+ * token (which is tab-scoped sessionStorage for SEC-OBS-2), the backend URL is
+ * a non-secret deployment pointer the user types at login; persisting it
+ * durably so it survives tab/browser close is the desired UX (you pick your
+ * server once). Read by {@link resolveApiBaseUrl} ahead of the build-time env.
+ */
+export const BACKEND_URL_STORAGE_KEY = "pose-deck-backend-url";
+
+/** The durable backend URL the user entered at login, or null if none/unset. */
+export function readStoredBackendUrl(): string | null {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+  const stored = window.localStorage.getItem(BACKEND_URL_STORAGE_KEY);
+  return stored && stored.trim() !== "" ? stored.trim() : null;
+}
+
+/**
+ * Persist (or clear) the user-entered backend URL and point the shared client
+ * at it immediately. Clearing (empty/whitespace) falls the app back to the
+ * env/default on the next {@link resolveApiBaseUrl}. Setting also mutates the
+ * live singleton's `baseURL` so the current page uses the new server without a
+ * reload — every existing `pb` reference keeps working.
+ */
+export function setStoredBackendUrl(url: string): void {
+  const trimmed = url.trim();
+  if (typeof window !== "undefined" && window.localStorage) {
+    if (trimmed === "") {
+      window.localStorage.removeItem(BACKEND_URL_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(BACKEND_URL_STORAGE_KEY, trimmed);
+    }
+  }
+  pb.baseURL = trimmed !== "" ? trimmed : resolveApiBaseUrl();
+}
+
+/**
+ * Resolve the API base URL. Precedence: a user-entered URL persisted in
+ * localStorage (set at login) → the build-time `VITE_API_BASE_URL` env → a
+ * sane local default. The login override lets a single built bundle point at
+ * any deployment without rebaking the env (HANDOFF.md §3).
+ */
 export function resolveApiBaseUrl(): string {
+  const fromStorage = readStoredBackendUrl();
+  if (fromStorage !== null) {
+    return fromStorage;
+  }
   const fromEnv = import.meta.env?.VITE_API_BASE_URL;
   if (typeof fromEnv === "string" && fromEnv.trim() !== "") {
     return fromEnv.trim();

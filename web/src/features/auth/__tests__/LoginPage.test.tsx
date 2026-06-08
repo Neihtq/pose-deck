@@ -14,6 +14,9 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ThemeProvider } from "@/components/theme/ThemeProvider";
+import { BACKEND_URL_STORAGE_KEY } from "@/lib/pocketbase";
+
 const navigate = vi.fn();
 vi.mock("react-router-dom", async () => {
   const actual =
@@ -43,17 +46,22 @@ function deferred<T>() {
 
 function renderLogin(initialEntry: string | { pathname: string; state: unknown } = "/login") {
   return render(
-    <MemoryRouter initialEntries={[initialEntry]}>
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-      </Routes>
-    </MemoryRouter>,
+    <ThemeProvider>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+        </Routes>
+      </MemoryRouter>
+    </ThemeProvider>,
   );
 }
 
 beforeEach(() => {
   navigate.mockReset();
   signIn.mockReset();
+  // The login form persists a user-entered backend URL to localStorage; start
+  // each test from a clean slate so prefill/disclosure state is deterministic.
+  window.localStorage.clear();
 });
 
 describe("LoginPage", () => {
@@ -124,6 +132,57 @@ describe("LoginPage", () => {
     expect(navigate).not.toHaveBeenCalled();
     // The submit button is re-enabled so the user can retry.
     expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled();
+  });
+
+  it("persists an entered server URL on a successful sign-in", async () => {
+    signIn.mockResolvedValue(undefined);
+    renderLogin();
+
+    // The server field is collapsed by default; open it.
+    fireEvent.click(
+      screen.getByRole("button", { name: /use a different server/i }),
+    );
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "https://api.example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "a@b.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "pw" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    await waitFor(() =>
+      expect(window.localStorage.getItem(BACKEND_URL_STORAGE_KEY)).toBe(
+        "https://api.example.com",
+      ),
+    );
+    await waitFor(() => expect(navigate).toHaveBeenCalled());
+  });
+
+  it("rejects a malformed server URL before attempting sign-in", async () => {
+    signIn.mockResolvedValue(undefined);
+    renderLogin();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /use a different server/i }),
+    );
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "not a url" },
+    });
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "a@b.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "pw" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/valid server url/i);
+    expect(signIn).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("disables the form and shows a busy label while signing in", async () => {

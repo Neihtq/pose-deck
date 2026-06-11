@@ -33,12 +33,6 @@ short version:
   `swift test` in `ios/PoseDeckCore/` for the logic core. Configure the dev API
   base URL in `Config.xcconfig`.
 
-> **Dev environment note:** Docker Desktop is org-gated on this machine, so local
-> backend development uses the **bare PocketBase binary** rather than the
-> `compose.dev.yml` Docker stack. The compose files are still the source of truth
-> for production deployment on TrueNAS; they just are not used for day-to-day local
-> dev here. See `backend/README.md` for how to run the binary directly.
-
 ## Documentation
 
 - [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) — execution plan: repo structure,

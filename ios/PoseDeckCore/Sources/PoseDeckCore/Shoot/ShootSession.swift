@@ -95,15 +95,20 @@ public struct ShootSession: Sendable, Equatable {
         return nil
     }
 
-    /// `true` once every card has been acted on at least once (done *or* skipped).
+    /// `true` only once every card has been marked **done**.
     ///
-    /// `[FIX-M2b]`: completion is deliberately **not** "all done" — a card that is
-    /// never shootable could otherwise trap the user in an infinite skip loop.
-    /// Once every card has been swiped at least once, the session is complete
-    /// (the UI still offers an always-available exit independent of this, handled
-    /// in the app layer `[FIX-M2b-ui]`).
+    /// `[FIX-skip-resurface]`: a *skipped* card is not "finished" — skip means
+    /// "come back to this later", so a skipped-but-not-done card keeps the session
+    /// going and re-surfaces at the end of the working order (``skip()`` appends
+    /// it). The deck therefore loops back to skipped cards after the last card
+    /// instead of declaring completion early. The user is never trapped: the shoot
+    /// screen always offers an exit (top-right close), independent of this flag.
+    ///
+    /// (Supersedes the old `[FIX-M2b]` "acted-on = complete" rule, which ended the
+    /// shoot while skipped cards were still outstanding and so never re-surfaced
+    /// them — the reported skip bug.)
     public var isComplete: Bool {
-        workingOrder.allSatisfy { doneIds.contains($0) || skippedActiveIds.contains($0) }
+        workingOrder.allSatisfy { doneIds.contains($0) }
     }
 
     /// Number of cards skipped and not since marked done.

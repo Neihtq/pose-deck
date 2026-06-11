@@ -37,6 +37,15 @@ struct ShootModeView: View {
         .navigationBarBackButtonHidden(true)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .navigationBar)
+        // Re-centre the card whenever the shoot transitions into OR out of the
+        // complete state. `dragOffset` is parent `@State`; when the final card
+        // flies off (to ±700) and the session completes, `cardView` leaves the
+        // tree, so *its* `.onChange(of: currentCardId)` can't re-centre. Without
+        // this, "Shoot again" re-enters `cardView` with the stale ±700 offset and
+        // renders card 1 off-screen / blank until the next advance snaps it back
+        // (`[FIX-reshoot-blank]`). This modifier lives on the always-present ZStack
+        // so it fires across the complete↔active boundary in both directions.
+        .onChange(of: model.isComplete) { dragOffset = .zero }
         .task { await model.load() }
         // Tear down any in-flight persist / prefetch work when the screen goes
         // away so unstructured tasks can't outlive it ([FIX-swift-4]).
@@ -377,17 +386,23 @@ private struct CardDetailSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    // Full-bleed image carousel (item 2 follow-up: detail photos
+                    // were too small). The images sit edge-to-edge at the top of
+                    // the sheet; only the text below keeps the readable inset.
                     imageCarousel
-                    Text(card.title.isEmpty ? "Untitled card" : card.title)
-                        .font(.title3.weight(.semibold))
-                    if let direction = card.direction, !direction.isEmpty {
-                        labeled("Direction", direction)
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text(card.title.isEmpty ? "Untitled card" : card.title)
+                            .font(.title3.weight(.semibold))
+                        if let direction = card.direction, !direction.isEmpty {
+                            labeled("Direction", direction)
+                        }
+                        if let notes = card.notes, !notes.isEmpty {
+                            labeled("Notes", notes)
+                        }
                     }
-                    if let notes = card.notes, !notes.isEmpty {
-                        labeled("Notes", notes)
-                    }
+                    .padding(.horizontal)
+                    .padding(.bottom)
                 }
-                .padding()
             }
             .navigationTitle("Card details")
             .navigationBarTitleDisplayMode(.inline)
@@ -412,6 +427,8 @@ private struct CardDetailSheet: View {
             EmptyView()
         } else if imageURLs.count == 1 {
             carouselImage(imageURLs[0])
+                .frame(maxWidth: .infinity)
+                .frame(height: carouselHeight)
                 .accessibilityIdentifier("shoot.detail-carousel")
         } else {
             VStack(spacing: 8) {
@@ -422,13 +439,21 @@ private struct CardDetailSheet: View {
                 }
                 .tabViewStyle(.page(indexDisplayMode: .always))
                 .indexViewStyle(.page(backgroundDisplayMode: .always))
-                .frame(height: 360)
+                .frame(height: carouselHeight)
                 .accessibilityIdentifier("shoot.detail-carousel")
                 Text("\(imageURLs.count) photos — swipe to browse")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// Detail-sheet image height: ~55% of the screen so reference photos are
+    /// shown large (the previous fixed 360pt felt cramped). Clamped so it stays
+    /// reasonable on very short/tall devices.
+    private var carouselHeight: CGFloat {
+        let screen = UIScreen.main.bounds.height
+        return min(max(screen * 0.55, 360), 640)
     }
 
     private func carouselImage(_ url: URL) -> some View {

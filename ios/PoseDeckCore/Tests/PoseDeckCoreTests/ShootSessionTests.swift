@@ -57,13 +57,14 @@ final class ShootSessionTests: XCTestCase {
         s.skip()                       // [b, a], a skipped, current b
         s.markDone()                   // done b → a re-surfaces as current
         XCTAssertEqual(s.currentCardId, "a", "the skipped card re-surfaces and is still shootable")
-        // `[FIX-M2b]`: once acted-on (a was skipped, b done) the session reads
-        // complete — the skipped card stays available but never traps the user.
-        XCTAssertTrue(s.isComplete, "every card acted-on at least once")
+        // `[FIX-skip-resurface]`: a skipped-but-not-done card keeps the session
+        // going so it actually loops back — the shoot is NOT complete while a
+        // skipped card is still outstanding.
+        XCTAssertFalse(s.isComplete, "a skipped card still outstanding → not complete")
         XCTAssertEqual(s.skippedCount, 1, "a is still skipped (not yet done)")
         s.markDone()                   // now finish a for real
         XCTAssertNil(s.currentCardId)
-        XCTAssertTrue(s.isComplete)
+        XCTAssertTrue(s.isComplete, "every card now done → complete")
         XCTAssertEqual(s.skippedCount, 0, "a is now done, no longer counted as skipped")
     }
 
@@ -80,15 +81,17 @@ final class ShootSessionTests: XCTestCase {
 
     // MARK: - [FIX-M2b] isComplete no-infinite-skip-trap
 
-    func testAllSkippedIsComplete() {
+    func testAllSkippedKeepsLoopingNotComplete() {
         var s = session(["a", "b"])
         s.skip()   // [b, a], a skipped
         s.skip()   // [a, b], b skipped too
-        XCTAssertTrue(s.isComplete, "every card acted-on at least once → complete (no skip trap)")
+        // `[FIX-skip-resurface]`: skipped cards re-surface and keep the session
+        // going so the user can come back to them; the deck is not "complete"
+        // until they are actually marked done. The user is never trapped — the
+        // shoot screen always offers an explicit exit.
+        XCTAssertFalse(s.isComplete, "all-skipped keeps looping until done")
         XCTAssertEqual(s.skippedCount, 2)
-        // A current card is still available even when complete: the user may keep
-        // shooting the skipped cards; the UI surfaces an end state but never locks.
-        XCTAssertNotNil(s.currentCardId)
+        XCTAssertNotNil(s.currentCardId, "a skipped card is always re-presented to shoot")
     }
 
     // MARK: - undo (done) full reversal
@@ -160,7 +163,9 @@ final class ShootSessionTests: XCTestCase {
         s.skip()
         XCTAssertEqual(s.workingOrder, ["only"])
         XCTAssertEqual(s.currentCardId, "only", "the lone card re-surfaces")
-        XCTAssertTrue(s.isComplete, "it was acted on, so not a trap")
+        XCTAssertFalse(s.isComplete, "a skipped-not-done card keeps looping; exit is via the UI")
+        s.markDone()
+        XCTAssertTrue(s.isComplete, "done → complete")
     }
 
     func testEmptyDeckIsImmediatelyComplete() {

@@ -13,6 +13,14 @@
 #
 # The seed migration is gated on POSEDECK_DEV and is intentionally
 # NOT set here, so it never runs in production.
+#
+# The web image is BUILT FROM SOURCE on the host (TrueNAS / Finch) rather than
+# pulled from a registry — see `web.build` below and docs/DEPLOY.md. So this
+# stack is run from a full checkout of the repo (the build context is the
+# sibling `../web` directory). The web app's API base URL is baked in at build
+# time from $POSEDECK_API_URL (the public https URL your reverse proxy routes to
+# PocketBase); set it in a `.env` file next to this compose — copy
+# backend/.env.example to backend/.env and edit it.
 
 services:
   pocketbase:
@@ -36,7 +44,15 @@ services:
       retries: 5
 
   web:
-    image: ghcr.io/qthienng/posedeck-web:latest
+    # Built locally from the sibling web/ source (no registry / no Finch image
+    # transfer). VITE_API_BASE_URL is a BUILD-time arg baked into the static
+    # bundle, so a change to POSEDECK_API_URL requires a rebuild:
+    #   docker compose build web   (or: finch compose build web)
+    build:
+      context: ../web
+      args:
+        VITE_API_BASE_URL: ${POSEDECK_API_URL:?set POSEDECK_API_URL in backend/.env}
+    image: posedeck-web:local
     container_name: posedeck-web
     restart: unless-stopped
     depends_on:

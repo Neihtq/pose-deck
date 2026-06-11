@@ -1,0 +1,21 @@
+# Keep the Docker/Finch build context small and reproducible. node_modules is
+# reinstalled from the lockfile inside the build (npm ci); shipping the host's
+# copy would bloat the context and can mismatch the image's platform/arch.
+node_modules
+dist
+test-results
+playwright-report
+.env
+.env.*
+!.env.example
+
+# VCS / editor / OS noise.
+.git
+.gitignore
+*.log
+.DS_Store
+
+# Test + tooling artifacts not needed to build the production bundle.
+e2e
+*.tsbuildinfo
+coverage

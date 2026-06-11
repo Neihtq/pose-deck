@@ -4,6 +4,11 @@ pb_data/
 # Anisette server keychain/state.
 anisette/
 
+# Local compose env (deploy config; copy from .env.example). Never commit.
+.env
+.env.*
+!.env.example
+
 # Downloaded PocketBase binary (when running the bare binary locally).
 pocketbase
 pocketbase.exe

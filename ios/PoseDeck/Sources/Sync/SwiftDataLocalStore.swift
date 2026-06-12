@@ -172,6 +172,48 @@ actor SwiftDataLocalStore: LocalStore {
         }
     }
 
+    // MARK: - Image blob cache (read path)
+
+    /// The locally cached JPEG bytes for an image record, or `nil` if the row is
+    /// absent or not yet cached. Backs `ProtectedAsyncImage`'s cache-first read so
+    /// a repeat view / offline render serves bytes from the mirror instead of the
+    /// network. The blob is purged on sign-out with the rest of the mirror
+    /// (SEC-2), preserving the no-cross-user-remanence guarantee that the
+    /// ephemeral, URLCache-free image session provides (SEC-IOS-B).
+    func cachedImageBlob(recordId: String) async -> Data? {
+        let id = recordId
+        let row = try? context.fetch(
+            FetchDescriptor<LocalCardImage>(predicate: #Predicate { $0.id == id })
+        ).first
+        return row?.cachedBlob
+    }
+
+    /// Write image bytes back into the mirror after a network fetch so the next
+    /// render hits the cache. No-op if the image row isn't mirrored yet (an
+    /// un-mirrored image has no stable place to cache against; `listCardImages`
+    /// reconciliation inserts the row, after which the next fetch caches).
+    ///
+    /// `[GAUNTLET poisoned-cache]` Two guarantees:
+    ///  - **Decode-gated:** bytes that don't decode to a complete image are
+    ///    rejected, so an error body / truncated stream can never poison the
+    ///    cache and cause a permanent blank render.
+    ///  - **Overwrite-to-repair:** this DOES overwrite an already-cached blob
+    ///    (the prior `!row.isCached` guard is gone). `card_images` bytes are
+    ///    immutable per record id (insert/hard-delete only, invariant #3), so a
+    ///    re-write of a healthy row is byte-identical and harmless — but if a row
+    ///    was somehow cached with corrupt bytes (e.g. a pre-fix precache), a
+    ///    fresh decode-validated fetch now heals it instead of looping forever.
+    func cacheImageBlob(recordId: String, bytes: Data) async {
+        guard ImageCompressor.canDecode(bytes) else { return }
+        let id = recordId
+        guard let row = try? context.fetch(
+            FetchDescriptor<LocalCardImage>(predicate: #Predicate { $0.id == id })
+        ).first else { return }
+        row.blob = bytes
+        row.isCached = true
+        try? context.save()
+    }
+
     // MARK: - Card completions
 
     func upsertCardCompletion(_ completion: CardCompletion) async {

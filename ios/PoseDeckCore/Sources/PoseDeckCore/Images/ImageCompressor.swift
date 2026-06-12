@@ -1,8 +1,10 @@
 import Foundation
 import CryptoKit
+#if canImport(ImageIO)
+import ImageIO
+#endif
 #if canImport(UIKit)
 import UIKit
-import ImageIO
 import UniformTypeIdentifiers
 #endif
 
@@ -64,6 +66,38 @@ public struct ImageCompressor: Sendable {
     /// Instance convenience for ``sha256Hex(_:)``.
     public func sha256Hex(_ data: Data) -> String {
         Self.sha256Hex(data)
+    }
+
+    /// Whether `data` decodes to a complete, non-empty raster image — the single
+    /// source of truth for "are these bytes a renderable image" used to gate the
+    /// image blob cache so neither the read-path writeback nor the precache writer
+    /// can poison the mirror with empty/truncated/garbage bytes (gauntlet
+    /// findings: poisoned-cache silent failure). Backed by ImageIO's
+    /// `CGImageSource`, which is available on macOS too, so it is unit-testable
+    /// under `swift test` (unlike the UIKit-only `compress`).
+    ///
+    /// Validates more than "a source could be created": it requires the pixel
+    /// dimensions to be present and positive, which rejects a header-only or
+    /// mid-stream-truncated JPEG that `CGImageSourceCreateWithData` accepts but
+    /// cannot fully decode.
+    public static func canDecode(_ data: Data) -> Bool {
+        #if canImport(ImageIO)
+        guard !data.isEmpty,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        else { return false }
+        let width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
+        let height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
+        guard width > 0, height > 0 else { return false }
+        // Force a full decode: a truncated stream has valid header dimensions but
+        // fails to produce the actual image. `shouldCache` keeps it off the
+        // backing store; we only care whether the decode succeeds.
+        let decodeOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        return CGImageSourceCreateImageAtIndex(source, 0, decodeOptions as CFDictionary) != nil
+        #else
+        return false
+        #endif
     }
 
     // MARK: - Compression

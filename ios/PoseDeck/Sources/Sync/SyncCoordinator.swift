@@ -461,6 +461,12 @@ final class SyncCoordinator {
         MirrorImageRepository(store: store, outbox: outbox, remote: ImageRepository(client: apiClient))
     }
 
+    /// The SwiftData mirror exposed as the image blob cache, injected into the
+    /// view tree so `ProtectedAsyncImage` serves cached bytes before hitting the
+    /// network (and writes fetched bytes back). Same store the mirror repos use,
+    /// so it's purged on sign-out with everything else (SEC-2).
+    var imageBlobCache: any ImageBlobCaching { store }
+
     /// Wait until a just-created card exists server-side, so a direct image
     /// upload onto it won't 404.
     ///

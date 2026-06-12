@@ -146,6 +146,12 @@ actor PrecacheService {
     }
 
     private func setBlob(imageId: String, bytes: Data) {
+        // `[GAUNTLET poisoned-cache]` Reject bytes that don't decode to a complete
+        // image so a truncated download / error body can't poison the offline
+        // mirror (the same gate `SwiftDataLocalStore.cacheImageBlob` applies on
+        // the read-path writeback). Without this the precache was a second poison
+        // vector feeding ProtectedAsyncImage's cache-first read.
+        guard ImageCompressor.canDecode(bytes) else { return }
         let id = imageId
         guard let row = try? context.fetch(FetchDescriptor<LocalCardImage>(predicate: #Predicate { $0.id == id })).first else {
             return

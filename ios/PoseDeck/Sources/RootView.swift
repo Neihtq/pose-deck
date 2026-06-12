@@ -45,6 +45,10 @@ struct RootView: View {
                 LoginView(env: env)
             }
         }
+        // Read-through image blob cache for every ProtectedAsyncImage below: a
+        // repeat view / offline render serves bytes from the SwiftData mirror
+        // instead of re-fetching (purged on sign-out, SEC-2).
+        .environment(\.imageBlobCache, sync.imageBlobCache)
         .task {
             // Restore a persisted session (if any) before deciding what to show.
             if !didAttemptRestore {

@@ -1,142 +1,174 @@
-# Pose Deck — hosting on TrueNAS (Finch / build-from-source)
+# Pose Deck — hosting on TrueNAS
 
-This deploys the **web frontend**, the **PocketBase backend**, and the
-**anisette** server (for SideStore signing) as one compose stack, behind your
-existing reverse proxy. The web image is **built from source on the host** — no
-container registry and no image transfer from your Mac are required.
+Deploys the **PocketBase backend**, the **web frontend**, and (optionally) the
+**anisette** server as one compose stack. Validated on TrueNAS SCALE with
+**Nginx Proxy Manager (NPM)** in front.
 
-> **Finch note.** Everything here uses `docker compose`. If you build/validate
-> on a Mac with [Finch](https://github.com/runfinch/finch) instead of Docker,
-> the commands are identical with `finch compose` / `finch build` — Finch is a
-> drop-in. On TrueNAS itself you'll typically use the built-in Docker/`docker
-> compose`. The stack has been validated end-to-end with Finch (web image
-> builds, serves 200, SPA deep-links fall back to `index.html`, and the API URL
-> is correctly baked into the bundle).
+## Networking model
 
-The authoritative topology is **ARCHITECTURE.md §9**; this is the runbook.
+Each service **publishes a host port** (`ports:`), and a reverse proxy you run
+separately (NPM, Traefik, Caddy — here NPM on the same box) maps your domain to
+`<host-ip>:<published-port>` and terminates TLS:
 
-> **Why not the GHCR image?** The `web` GitHub Actions workflow
-> (`.github/workflows/web.yml`) builds and pushes a web image to GHCR, but it
-> builds **without** a `VITE_API_BASE_URL` build-arg — so that image bakes in the
-> `localhost` dev default and is a CI build-check, **not** a deployable prod
-> artifact (the backend URL must be known at build time). Building from source
-> here with `POSEDECK_API_URL` set is what produces a correct production bundle.
-
----
-
-## What runs
-
-| Service | Image | Port (in-network) | Reverse-proxy host |
-|---|---|---|---|
-| `posedeck-pb` (PocketBase) | `ghcr.io/muchobien/pocketbase` (pinned) | 8090 | `api.shotdeck.<domain>` |
-| `posedeck-web` (nginx + SPA) | **built from `web/`** | 80 | `app.shotdeck.<domain>` |
-| `posedeck-anisette` | `dadoum/anisette-v3-server` | 6969 | `anisette.shotdeck.<domain>` |
-
-All three only **expose** their ports to the external `reverse-proxy` Docker
-network — they never publish to the host. Your proxy terminates TLS and routes
-by hostname.
-
----
-
-## 1. Prerequisites on the host
-
-- A reverse proxy (Traefik / Nginx Proxy Manager / Caddy) already running and
-  attached to a Docker network named **`reverse-proxy`** (the stack joins it as
-  an `external` network). If yours has a different name, change it at the bottom
-  of `backend/docker-compose.yml`.
-- Three DNS records / proxy hosts pointing at the proxy:
-  `app.`, `api.`, `anisette.` `shotdeck.<your-domain>`.
-- Docker + `docker compose` (TrueNAS SCALE ships these; or Finch on a Mac).
-
-## 2. Get the source onto the host
-
-Because the web image builds from source, the stack runs from a full checkout
-(the compose file's build context is the sibling `../web` directory):
-
-```sh
-# On TrueNAS, ideally onto a ZFS dataset, e.g. /mnt/tank/shotdeck
-git clone https://github.com/Neihtq/pose-deck.git /mnt/tank/shotdeck
-cd /mnt/tank/shotdeck/backend
+```
+Internet → router (forward 443) → NPM → app.<domain> → <host-ip>:8080  (web)
+                                       → api.<domain> → <host-ip>:8090  (PocketBase)
+                                       → anisette.<domain> → <host-ip>:6969 (SideStore only)
 ```
 
-`pb_data/` (PocketBase data + uploads) and `anisette/` (signing keychain) are
-created here on first run — keep them on the ZFS dataset so snapshots/replication
-cover them. They are gitignored.
+There is **no shared external Docker network** — that model produced
+`network reverse-proxy ... could not be found` and isn't needed when the proxy
+routes by host IP:port.
 
-## 3. Configure the API URL (baked into the web bundle)
+| Service | Image | Host port (default) | Container port (fixed) |
+|---|---|---|---|
+| `posedeck-pb` (PocketBase) | `ghcr.io/muchobien/pocketbase` (pinned) | 8090 | 8090 |
+| `posedeck-web` (nginx + SPA) | **built from `web/`** | 8080 | 80 |
+| `posedeck-anisette` | `dadoum/anisette-v3-server` | 6969 | 6969 |
 
-`VITE_API_BASE_URL` is a **build-time** value compiled into the static bundle,
-so the web app needs to know the public PocketBase URL *before* it's built.
+Change a **host** port (left side of `ports:`, via the `*_PORT` env vars) to
+avoid clashes; the container side is fixed by the app.
+
+> **Why build from source (not the GHCR image)?** The `web` GitHub Actions
+> workflow pushes an image to GHCR, but it builds **without** a
+> `VITE_API_BASE_URL` arg — so that image bakes in the `localhost` dev default
+> and is a CI build-check, **not** a deployable artifact. `VITE_API_BASE_URL`
+> must be known at build time, so you build with it set.
+
+---
+
+## A. Deploy from a checkout (CLI `docker compose`)
+
+### 1. Get the source onto the host
+
+```sh
+# ideally onto a snapshotted dataset
+git clone https://github.com/Neihtq/pose-deck.git /mnt/pool/pose-deck
+cd /mnt/pool/pose-deck/backend
+```
+
+`pb_data/` (DB + uploaded photos) and `anisette/` (signing keychain) are created
+here on first run — keep them on a dataset your snapshots cover. They are
+gitignored.
+
+### 2. Configure (`.env` beside the compose)
 
 ```sh
 cp .env.example .env
-# edit .env → POSEDECK_API_URL=https://api.shotdeck.<your-domain>
+# edit .env:
+#   POSEDECK_API_URL = the PUBLIC https URL your proxy routes to PocketBase
+#   (optional) POSEDECK_PB_PORT / POSEDECK_WEB_PORT / POSEDECK_ANISETTE_PORT
 ```
 
-> Changing `POSEDECK_API_URL` later means **rebuilding** the web image
-> (`docker compose build web`), not just restarting it.
+`VITE_API_BASE_URL` is baked into the web bundle at **build time** from
+`POSEDECK_API_URL`. Changing it later means **rebuilding** the web image, not
+just restarting.
 
-## 4. Apply backend migrations note
-
-All migrations in `backend/pb_migrations/` apply automatically on PocketBase
-start. Two are load-bearing for sharing — confirm they're present in the
-checkout (they are committed):
-
-- `1700000008_*` — users email-lookup for sharing.
-- `1700000009_*` — guest-visibility back-relation fix (**without it, shared
-  decks 404**).
-
-The dev-seed migration is gated on `POSEDECK_DEV`, which this prod stack does
-**not** set, so no seed users/decks are created in production.
-
-## 5. Build and start
+### 3. Build and start
 
 ```sh
-cd /mnt/tank/shotdeck/backend
 docker compose build web        # builds posedeck-web:local from ../web
-docker compose up -d            # starts pb + web + anisette
+docker compose up -d            # pb + web + anisette
 docker compose ps               # all healthy/running
 ```
 
-(With Finch: `finch compose build web` / `finch compose up -d`. Finch runs
-compose inside its Linux VM, so configuration comes from the `.env` file beside
-the compose — an inline `VAR=… finch compose` shell export is **not** seen
-inside the VM.)
+### 4. Wire the reverse proxy (NPM)
 
-## 6. Wire the reverse proxy
+Create one Proxy Host per service. Forward Hostname/IP = the host's LAN IP;
+Forward Port = the **published host port** (8090 / 8080 / 6969 by default);
+request an SSL cert and force HTTPS:
 
-Point your proxy hosts at the in-network service names + ports:
-
-| Public host | Upstream |
+| Public host | Forward to |
 |---|---|
-| `app.shotdeck.<domain>` | `posedeck-web:80` |
-| `api.shotdeck.<domain>` | `posedeck-pb:8090` |
-| `anisette.shotdeck.<domain>` | `posedeck-anisette:6969` |
+| `app.<domain>` | `<host-ip>:8080` |
+| `api.<domain>` | `<host-ip>:8090` |
+| `anisette.<domain>` | `<host-ip>:6969` (SideStore only) |
 
-Then open `https://app.shotdeck.<domain>` and sign in. (First run: create the
-PocketBase admin at `https://api.shotdeck.<domain>/_/`.)
+For **remote access**, forward router port **443** (and **80** for Let's Encrypt
+challenges) to the NPM host. You do **not** forward 8090/8080/6969 — only NPM is
+internet-facing.
 
-## 7. First-run admin + a real user
+---
 
-1. `https://api.shotdeck.<domain>/_/` → create the superuser (admin) account.
-2. In the admin UI, create your photographer user in the `users` collection (or
-   enable signups if you prefer), then sign in on the web app.
+## B. Deploy via the TrueNAS GUI ("Custom App", paste YAML)
 
-## 8. iOS app
+The GUI can't read a `.env` and doesn't run from the repo directory, so two
+adjustments to the committed compose are required when pasting:
 
-The phone talks to the **same** `api.` URL. You can either bake it into the
-build (`ios/PoseDeck/Config/Config.xcconfig` → `API_BASE_URL`) or — easier —
-enter it at the sign-in screen via **"Use a different server"** (persisted).
-SideStore signing uses the `anisette.` host — see `ios/SIDESTORE.md`.
+1. **Make every volume path absolute** — and point PocketBase at the dirs under
+   **`backend/`**, not the repo root:
+
+   ```yaml
+   volumes:
+     - /mnt/pool/pose-deck/backend/pb_data:/pb_data
+     - /mnt/pool/pose-deck/backend/pb_migrations:/pb_migrations:ro
+   # anisette:
+     - /mnt/pool/pose-deck/backend/anisette:/home/Alcoholic/.config/anisette-v3
+   ```
+
+   > ⚠️ **The #1 gotcha.** Mounting the repo *root* `pb_migrations` (which
+   > doesn't exist — migrations live under `backend/`) gives PocketBase an empty
+   > `/pb_migrations`, so **no collections are created**. Symptom: **login works**
+   > (auth is built in) but **every deck-save and image-upload fails** with API
+   > errors. Fix the path to `.../backend/pb_migrations` and redeploy.
+
+2. **Inline literal values** for `${...}` (no `.env` in the GUI): replace
+   `${POSEDECK_API_URL:?...}` with the actual URL, and the `${*_PORT:-...}`
+   mappings with literal `"8090:8090"` etc.
+
+3. **Building in the GUI is hit-or-miss.** If the Custom App won't run the
+   `build:` block, build the image once on the NAS CLI and reference it by name
+   instead:
+
+   ```sh
+   cd /mnt/pool/pose-deck/web
+   docker build --build-arg VITE_API_BASE_URL=https://api.<domain> -t posedeck-web:local .
+   ```
+
+   ```yaml
+   web:
+     image: posedeck-web:local   # drop the whole build: block
+   ```
+
+Then wire NPM exactly as in **A.4**.
+
+---
+
+## First-run admin + a real user
+
+1. Open the PocketBase admin at `http://<host-ip>:<pb-port>/_/` (or
+   `https://api.<domain>/_/`) → create the superuser.
+2. On first start, PocketBase applies `pb_migrations/` and creates the
+   collections — confirm `decks`, `cards`, `card_images`, `deck_guests`,
+   `card_completions` appear under **Collections**. `1700000008` (email lookup)
+   and `1700000009` (guest back-relation — without it shared decks 404) are
+   load-bearing for sharing. The dev-seed (`1700000010`) is gated on
+   `POSEDECK_DEV`, unset here, so no seed data in prod.
+3. Create your photographer user in the `users` collection (or enable signups),
+   then sign in on the web app.
+
+## iOS app
+
+The phone uses the **same** PocketBase URL.
+
+- **Same network (testing):** point the app at `http://<host-ip>:<pb-port>` via
+  the sign-in screen's **"Use a different server"** field.
+- **Remote / over the internet:** iOS requires **HTTPS**, so it must be the
+  proxied `https://api.<domain>` (a raw public `ip:port` is plaintext and iOS
+  blocks it). Enter that URL in the app, or bake it into
+  `ios/PoseDeck/Config/Config.xcconfig` → `API_BASE_URL`.
+
+SideStore signing uses the `anisette.` host — see `ios/SIDESTORE.md`. If you
+install via Xcode instead, you can drop the anisette service entirely.
 
 ---
 
 ## Updating after a code change
 
 ```sh
-cd /mnt/tank/shotdeck && git pull
+cd /mnt/pool/pose-deck && git pull
 cd backend
-docker compose build web        # rebuild the SPA (only if web/ or API URL changed)
+docker compose build web        # rebuild the SPA (if web/ or the API URL changed)
 docker compose up -d            # recreate changed containers
 ```
 
@@ -145,18 +177,22 @@ PocketBase updates: bump the pinned tag in `docker-compose.yml`, then
 
 ## Backups
 
-Snapshot/replicate the `pb_data/` and `anisette/` datasets (ARCHITECTURE.md
-§11). `pb_data/` holds the database **and** uploaded reference photos; anisette
+Snapshot/replicate the `backend/pb_data/` (and `backend/anisette/`) datasets.
+`pb_data/` holds the database **and** the uploaded reference photos; anisette
 holds the signing keychain (losing it just means re-pairing SideStore).
 
 ## Troubleshooting
 
-- **`required variable POSEDECK_API_URL is missing`** — you have no `backend/.env`
-  (or it lacks the var). Copy `.env.example` and set it.
-- **Shared decks 404** — migration `1700000009` didn't apply; confirm the file
-  is in `backend/pb_migrations/` and restart PocketBase.
-- **Web shows the wrong API URL** — it's baked in at build time; rebuild the web
-  image after changing `.env`.
-- **`network reverse-proxy not found`** — your proxy network has a different
-  name; update the `networks:` block at the bottom of the compose, or create it
-  (`docker network create reverse-proxy`).
+- **Login works but decks won't save / images won't upload** — the collections
+  weren't created: `/pb_migrations` is mounted from the wrong path. Point it at
+  `.../backend/pb_migrations` and redeploy.
+- **`network reverse-proxy ... could not be found`** — you're using an old
+  external-network compose; this stack publishes host ports instead and needs no
+  such network. Use the current `docker-compose.yml`.
+- **`required variable POSEDECK_API_URL is missing`** — no `backend/.env` (CLI),
+  or you pasted `${...}` into the GUI without inlining a literal value.
+- **Web calls the wrong backend** — `VITE_API_BASE_URL` is baked in at build
+  time; rebuild the web image after changing it.
+- **Port already in use** — change the host (left) side via `POSEDECK_*_PORT`.
+- **iOS can't connect remotely** — it must be `https://` via the proxy, not a
+  plaintext public `ip:port`.

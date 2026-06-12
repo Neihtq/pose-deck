@@ -60,7 +60,13 @@ npm run preview   # serve the built bundle locally
 ## Docker
 
 The production image is nginx-alpine serving the static `dist/` bundle
-(ARCHITECTURE.md §9, §10). The CI workflow builds and pushes it to GHCR.
+(ARCHITECTURE.md §9). `VITE_API_BASE_URL` is baked in at **build time**, so the
+backend URL must be passed as a build arg. In production this image is built
+from source by the compose stack (`backend/docker-compose.yml` → `web.build`);
+see the deploy runbook **[`../docs/DEPLOY.md`](../docs/DEPLOY.md)**. Finch is a
+drop-in for `docker` here (`finch build` / `finch run`).
+
+To build/run it standalone (e.g. a quick local check):
 
 ```bash
 docker build --build-arg VITE_API_BASE_URL=https://api.shotdeck.example.com \

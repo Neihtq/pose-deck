@@ -142,11 +142,17 @@ To grant a guest access to a specific deck, the owner uses the in-app
 
 ---
 
-## Production deployment (deferred to M-deploy)
+## Production deployment
 
 The production stack is [`docker-compose.yml`](./docker-compose.yml). It runs
-PocketBase + the web image + Anisette, all on a pre-existing **external**
+PocketBase + the web app + Anisette, all on a pre-existing **external**
 `reverse-proxy` Docker network, exposing (not publishing) ports so the
-TrueNAS reverse proxy can route to them. See ARCHITECTURE.md §9 for the
-TrueNAS layout and the proxy hostname routes. Do **not** deploy it from this
-environment — that is a developer step on the NAS.
+TrueNAS reverse proxy can route to them. The **web service is built from the
+sibling `../web` source** at deploy time (its `VITE_API_BASE_URL` is baked in
+from `$POSEDECK_API_URL`, set in a `.env` beside the compose — copy
+[`.env.example`](./.env.example)); no registry image is pulled.
+
+Full step-by-step runbook (TrueNAS + Finch, reverse-proxy routes, migrations,
+updates, backups): **[`../docs/DEPLOY.md`](../docs/DEPLOY.md)**. Design-level
+topology: ARCHITECTURE.md §9. Do **not** deploy from this dev environment —
+that is a developer step on the NAS.

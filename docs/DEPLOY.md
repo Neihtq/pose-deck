@@ -15,6 +15,13 @@ container registry and no image transfer from your Mac are required.
 
 The authoritative topology is **ARCHITECTURE.md §9**; this is the runbook.
 
+> **Why not the GHCR image?** The `web` GitHub Actions workflow
+> (`.github/workflows/web.yml`) builds and pushes a web image to GHCR, but it
+> builds **without** a `VITE_API_BASE_URL` build-arg — so that image bakes in the
+> `localhost` dev default and is a CI build-check, **not** a deployable prod
+> artifact (the backend URL must be known at build time). Building from source
+> here with `POSEDECK_API_URL` set is what produces a correct production bundle.
+
 ---
 
 ## What runs

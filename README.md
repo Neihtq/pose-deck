@@ -45,6 +45,7 @@ short version:
 ## Deployment
 
 Production runs as a Docker Compose stack on TrueNAS (PocketBase + web + anisette)
-behind an existing reverse proxy that terminates TLS. Web images are built by CI
-and pushed to GHCR; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §9–§10 and
-the workflows in [`.github/workflows/`](.github/workflows/).
+behind an existing reverse proxy that terminates TLS. The web image is **built
+from source on the host** (no registry needed); Finch works as a drop-in for
+Docker. The full runbook is **[`docs/DEPLOY.md`](docs/DEPLOY.md)**; the design-level
+topology is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §9–§10.
